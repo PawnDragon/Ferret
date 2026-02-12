@@ -10,6 +10,7 @@ from evaluations import *
 from optimizers.ferret_optimizer import FerretFramework
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
+from utils_data.model_loader import resolve_model_source
 
 
 def softmax(vec):
@@ -29,7 +30,8 @@ class Server(object):
         self.args = args
         self.eval_loader = eval_loader
         self.candidate_seeds = candidate_seeds
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        model_source = resolve_model_source(args.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
         self.log_dir = log_dir
         self.algo = getattr(args, 'algo', 'ferret')
 
@@ -46,7 +48,7 @@ class Server(object):
         self.tokenizer.add_special_tokens(special_tokens)
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            args.model,
+            model_source,
             device_map='cpu',
             torch_dtype=torch.float16,
             trust_remote_code=True,

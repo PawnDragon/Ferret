@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 from utils_data.default_tokens import DefaultToken
+from utils_data.model_loader import resolve_model_source
 from utils_data.partition_data import partition_idx_labeldir
 from collections import Counter
 
@@ -11,7 +12,8 @@ def get_loaders(args, only_eval=False):
     """
     Return: list of train_loaders, eval_loader
     """
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    model_source = resolve_model_source(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
     tokenizer.model_max_length = args.max_length
     special_tokens = dict()
     if tokenizer.pad_token is None:

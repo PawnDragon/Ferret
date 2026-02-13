@@ -1,0 +1,1 @@
+python main.py --algo fedsubmuon --model /root/autodl-tmp/llama-3.2-1B/ --dataset dolly --lr 0.001 --K 200 -m 0.5 --log --local_step 1 --slr_max 10 --anneal no --device 0 --momentum 0.0 --n_accum 1 --equal_weight --seed 494 --num_clients 10 --rank_r 24 --seed_refresh_F 40 --iid 0 --rounds 40

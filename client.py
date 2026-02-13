@@ -105,11 +105,8 @@ class Client(object):
         framework = FerretFramework(self.model, args=self.args, lr=lr, candidate_seeds=self.candidate_seeds)
         self.model.train()
         self.model.zero_grad()
-
-        if self.args.batch_or_epoch == 'batch':
-            loss_total_train = 0.0
-            num_trained = 0
-            progress_bar = tqdm(range(iter_steps))
+        loss_total_train = 0.0
+        num_trained = 0
 
         if self.args.batch_or_epoch == 'epoch':
             progress_bar = tqdm(range(iter_steps))
@@ -132,6 +129,7 @@ class Client(object):
                     f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                 )
         else:
+            progress_bar = tqdm(range(iter_steps))
             for cur_step in range(iter_steps):
                 batch = self._next_batch()
 

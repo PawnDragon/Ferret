@@ -82,6 +82,7 @@ if __name__ == '__main__':
 
     # FedSubMuon
     parser.add_argument('--rank_r', type=int, default=8)
+    parser.add_argument('--r', type=int, default=None, help='alias of rank_r; used by sweeps')
     parser.add_argument('--beta', type=float, default=0.95)
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
@@ -102,6 +103,8 @@ if __name__ == '__main__':
     # W&B
     parser.add_argument('--use_wandb', default=False, action='store_true')
     parser.add_argument('--wandb_project', type=str, default='ferret')
+    parser.add_argument('--wandb_entity', type=str, default='')
+    parser.add_argument('--wandb_name', type=str, default='')
     parser.add_argument('--wandb_run_name', type=str, default='')
 
     # Debug
@@ -109,6 +112,10 @@ if __name__ == '__main__':
 
     time_stamp = str(time.time())
     args = parser.parse_args()
+    if args.r is not None:
+        args.rank_r = int(args.r)
+    else:
+        args.r = int(args.rank_r)
 
     if args.algo == 'fedsubmuon':
         args.batch_or_epoch = 'batch'
@@ -129,6 +136,27 @@ if __name__ == '__main__':
         print('[warn] No CUDA GPU visible before training startup; running in CPU fallback mode')
 
     setup_seed(args.seed)
+
+    wandb_run = None
+    if args.use_wandb and wandb is None:
+        print('[warn] --use_wandb is set but wandb package is not installed; disable wandb logging.')
+        args.use_wandb = False
+    if args.use_wandb and wandb is not None:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=(args.wandb_entity if args.wandb_entity != '' else None),
+            name=(args.wandb_name or args.wandb_run_name or None),
+            config={
+                'lr': float(args.lr),
+                'r': int(args.rank_r),
+            },
+        )
+        if 'lr' in wandb.config:
+            args.lr = float(wandb.config.lr)
+        if 'r' in wandb.config:
+            args.rank_r = int(wandb.config.r)
+            args.r = int(wandb.config.r)
+
     list_train_loader, eval_loader, _ = get_loaders(args)
 
     if args.dataset == 'instruct':
@@ -170,16 +198,19 @@ if __name__ == '__main__':
         rel_err = relative_transport_error(x_old, old_seed, new_seed, out_dim, in_dim, args.rank_r)
         print(f'[debug] transport relative error @ {first_layer}: {rel_err:.6e}')
 
-    wandb_run = None
-    if args.use_wandb and wandb is not None:
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name if args.wandb_run_name else None,
-            config=vars(args),
-        )
-
     eval_result = server.eval(cur_round=0, eval_avg_acc=eval_avg_acc)
     eval_avg_acc.append(eval_result)
+    if wandb_run is not None:
+        init_log = {
+            'round': 0,
+            'train/loss_avg': float('nan'),
+            'eval/loss': float(eval_result),
+        }
+        if torch.cuda.is_available():
+            init_log['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+            init_log['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+            init_log['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+        wandb.log(init_log, step=0)
 
     if args.algo == 'fedsubmuon':
         server.save_best_submuon_ckpt(eval_result, 0)
@@ -190,13 +221,15 @@ if __name__ == '__main__':
 
     for r in range(1, args.rounds + 1):
         selected_client = [client_list[i] for i in client_indices_rounds[r - 1]]
+        train_losses = []
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         if args.algo == 'fedsubmuon':
             server.maybe_refresh_submuon_seeds(r)
             broadcast_state = server.get_submuon_broadcast_state()
 
             client_payloads = []
-            train_losses = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
                 client_payloads.append(payload)
@@ -217,7 +250,7 @@ if __name__ == '__main__':
             log_items = {
                 'round': r,
                 'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
-                'eval/metric': float(eval_result),
+                'eval/loss': float(eval_result),
                 'comm/bytes_up': float(bytes_up),
                 'comm/bytes_down': float(bytes_down),
                 'ckpt/improved': int(improved),
@@ -227,14 +260,13 @@ if __name__ == '__main__':
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
-            if wandb_run is not None:
-                wandb.log(log_items, step=r)
-
         else:
             for client in selected_client:
                 # server.model is pulled after aggregation of the previous round from the server perspective
                 # use a global pulling operation to deduplicate the pulling of all clients
-                client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r)
+                loss_val = client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r)
+                if loss_val is not None:
+                    train_losses.append(float(loss_val))
             server.aggregate_seed_pool(selected_client, cur_round=r)
 
             if args.anneal == 'linear':
@@ -249,6 +281,18 @@ if __name__ == '__main__':
             server.update_global_model_by_seed_pool()
             eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
             eval_avg_acc.append(eval_result)
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'eval/loss': float(eval_result),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        if wandb_run is not None:
+            wandb.log(log_items, step=r)
 
         if args.log:
             with open(os.path.join(log_dir, 'results.json'), 'w') as writer:

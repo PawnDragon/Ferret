@@ -64,7 +64,7 @@ class Client(object):
             return {
                 'x': x_local,
                 'm': m_local,
-                'loss': float(loss.item()),
+                'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 
         old_params = [(name, deepcopy(param.data)) for name, param in self.model.named_parameters() if param.requires_grad]
@@ -125,6 +125,7 @@ class Client(object):
         # save both CPU and GPU memory
         del old_params, framework
         self.model = None
+        return float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0
 
     def clear_model(self):
         # clear model to save memory

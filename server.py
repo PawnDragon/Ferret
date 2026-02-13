@@ -46,6 +46,8 @@ class Server(object):
         if self.tokenizer.unk_token is None:
             special_tokens['unk_token'] = DefaultToken.UNK_TOKEN.value
         self.tokenizer.add_special_tokens(special_tokens)
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_source,
@@ -268,8 +270,11 @@ class Server(object):
             for batch in self.eval_loader:
                 input_ids = batch['input_ids'].to(self.device)
                 label_ids = batch['labels'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
                 output_ids = self.model.generate(
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=self.tokenizer.pad_token_id,
                     max_new_tokens=128,
                     num_beams=1,
                 )

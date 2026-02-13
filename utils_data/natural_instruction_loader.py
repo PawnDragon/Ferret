@@ -109,10 +109,10 @@ class LLMDataCollator(object):
         )
         
 
-def _get_task_splits():
-    with open(os.path.join(os.path.expanduser('~'), '.datasets', 'natural-instructions-2.8', 'splits', 'default', 'train_tasks.txt'), 'r') as reader:
+def _get_task_splits(ni_root):
+    with open(os.path.join(ni_root, 'splits', 'default', 'train_tasks.txt'), 'r') as reader:
         train_set_names = [f'{content.strip()}.json' for content in reader.readlines()]
-    with open(os.path.join(os.path.expanduser('~'), '.datasets', 'natural-instructions-2.8', 'splits', 'default', 'test_tasks.txt'), 'r') as reader:
+    with open(os.path.join(ni_root, 'splits', 'default', 'test_tasks.txt'), 'r') as reader:
         eval_set_names = [f'{content.strip()}.json' for content in reader.readlines()]
     return train_set_names, eval_set_names
 
@@ -125,7 +125,8 @@ def get_instruction_dataset(args, tokenizer, only_eval=False):
     """
     only_eval: only effective with zeroshot set to `True`
     """
-    train_set_names, eval_set_names = _get_task_splits()
+    ni_root = os.path.expanduser(args.ni_root)
+    train_set_names, eval_set_names = _get_task_splits(ni_root)
     list_train_loader = []
     data_collator = LLMDataCollator(tokenizer=tokenizer)
     
@@ -133,7 +134,7 @@ def get_instruction_dataset(args, tokenizer, only_eval=False):
     if not only_eval:
         print('load train sets')
         for file_name in train_set_names:
-            with open(os.path.join(os.path.expanduser('~'), '.datasets', 'natural-instructions-2.8', 'tasks', file_name)) as reader:
+            with open(os.path.join(ni_root, 'tasks', file_name)) as reader:
                 raw_data = json.load(reader)
                 instances = _filter_out_over_length(raw_data['Instances'], max_length=args.max_length)
                 if len(instances) < 20:
@@ -152,7 +153,7 @@ def get_instruction_dataset(args, tokenizer, only_eval=False):
 
     list_eval_set = []
     for file_name in eval_set_names:
-        with open(os.path.join(os.path.expanduser('~'), '.datasets', 'natural-instructions-2.8', 'tasks', file_name)) as reader:
+        with open(os.path.join(ni_root, 'tasks', file_name)) as reader:
             raw_data = json.load(reader)
             instruct = raw_data['Definition'][0]
             instances = _filter_out_over_length(raw_data['Instances'], max_length=args.max_length)

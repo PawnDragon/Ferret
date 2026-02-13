@@ -56,7 +56,8 @@ class Client(object):
                         'labels': batch['labels'].to(self.device),
                         'attention_mask': batch['attention_mask'].to(self.device),
                     }
-                    _, loss = framework.step(batch, apply_optim_step=True)
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
                     if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
@@ -69,7 +70,8 @@ class Client(object):
                 progress_bar = tqdm(range(iter_steps))
                 for cur_step in range(iter_steps):
                     batch = self._next_batch()
-                    _, loss = framework.step(batch, apply_optim_step=True)
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
                     if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss

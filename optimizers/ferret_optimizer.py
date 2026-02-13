@@ -154,17 +154,18 @@ class FerretFramework(object):
         logits, loss = self.forward(batch)
 
         if self.algo == 'fedsubmuon':
-            loss.backward()
-            beta = self.args.beta
-            with torch.no_grad():
-                for layer_name, X in self.submuon_x.items():
-                    grad = X.grad
-                    if grad is None:
-                        continue
-                    self.submuon_m[layer_name].mul_(beta).add_((1.0 - beta) * grad)
-                    delta = zeropower_via_newtonschulz5(self.submuon_m[layer_name].float(), self.args.ns_steps)
-                    X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
-                    X.grad = None
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                beta = self.args.beta
+                with torch.no_grad():
+                    for layer_name, X in self.submuon_x.items():
+                        grad = X.grad
+                        if grad is None:
+                            continue
+                        self.submuon_m[layer_name].mul_(beta).add_((1.0 - beta) * grad)
+                        delta = zeropower_via_newtonschulz5(self.submuon_m[layer_name].float(), self.args.ns_steps)
+                        X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
+                        X.grad = None
             return logits.detach(), loss.detach()
 
         (loss / self.args.n_accum).backward()

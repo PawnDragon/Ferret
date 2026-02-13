@@ -119,7 +119,15 @@ if __name__ == '__main__':
     args.eval_metric = 'loss'
 
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.device)
+    requested_device = int(args.device)
+    cuda_count = torch.cuda.device_count()
+    if cuda_count > 0:
+        if requested_device < 0 or requested_device >= cuda_count:
+            print(f'[warn] --device {requested_device} is invalid for {cuda_count} visible GPU(s); fallback to 0')
+            requested_device = 0
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(requested_device)
+    else:
+        print('[warn] No CUDA GPU visible before training startup; running in CPU fallback mode')
 
     setup_seed(args.seed)
     list_train_loader, eval_loader, _ = get_loaders(args)
@@ -142,7 +150,7 @@ if __name__ == '__main__':
         with open(os.path.join(log_dir, 'config.yaml'), 'w') as writer:
             writer.write(config)
 
-    # since only CUDA device is available, load all models on device 0
+    # After CUDA_VISIBLE_DEVICES pinning, use local cuda:0 in process.
     args.device = 0
 
     client_indices_rounds = []

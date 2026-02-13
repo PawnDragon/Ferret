@@ -55,7 +55,10 @@ class Server(object):
         )
 
         self.seed_pool = {seed: 0.0 for seed in self.candidate_seeds}
-        self.device = torch.device(f'cuda:{self.args.device}')
+        if torch.cuda.is_available():
+            self.device = torch.device(f'cuda:{self.args.device}')
+        else:
+            self.device = torch.device('cpu')
 
         # FedSubMuon global states
         self.x_global = {}

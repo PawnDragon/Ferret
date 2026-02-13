@@ -12,7 +12,10 @@ class Client(object):
         self.train_iterator = iter(self.train_loader)
         self.model = None
 
-        self.device = torch.device(f'cuda:{args.device}')
+        if torch.cuda.is_available():
+            self.device = torch.device(f'cuda:{args.device}')
+        else:
+            self.device = torch.device('cpu')
         self.candidate_seeds = candidate_seeds
 
     def _next_batch(self):

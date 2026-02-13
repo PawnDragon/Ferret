@@ -83,7 +83,6 @@ if __name__ == '__main__':
 
     # FedSubMuon
     parser.add_argument('--rank_r', type=int, default=8)
-    parser.add_argument('--r', type=int, default=None, help='alias of rank_r; used by sweeps')
     parser.add_argument('--beta', type=float, default=0.95)
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
@@ -113,10 +112,6 @@ if __name__ == '__main__':
 
     time_stamp = str(time.time())
     args = parser.parse_args()
-    if args.r is not None:
-        args.rank_r = int(args.r)
-    else:
-        args.r = int(args.rank_r)
 
     eval_avg_acc = []
     previous_metric = args.eval_metric
@@ -146,14 +141,13 @@ if __name__ == '__main__':
             name=(args.wandb_name or args.wandb_run_name or None),
             config={
                 'lr': float(args.lr),
-                'r': int(args.rank_r),
+                'rank_r': int(args.rank_r),
             },
         )
         if 'lr' in wandb.config:
             args.lr = float(wandb.config.lr)
-        if 'r' in wandb.config:
-            args.rank_r = int(wandb.config.r)
-            args.r = int(wandb.config.r)
+        if 'rank_r' in wandb.config:
+            args.rank_r = int(wandb.config.rank_r)
 
     list_train_loader, eval_loader, _ = get_loaders(args)
 

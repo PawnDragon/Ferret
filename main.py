@@ -118,9 +118,6 @@ if __name__ == '__main__':
     else:
         args.r = int(args.rank_r)
 
-    if args.algo == 'fedsubmuon':
-        args.batch_or_epoch = 'batch'
-
     eval_avg_acc = []
     previous_metric = args.eval_metric
     args.eval_metric = 'loss'

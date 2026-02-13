@@ -43,21 +43,41 @@ class Client(object):
                 trainable=True,
             )
             self.model.train()
-            iter_steps = max(int(self.args.local_step), 1)
+
             loss_total_train = 0.0
             num_trained = 0
-            progress_bar = tqdm(range(iter_steps))
-            loss = None
-            for cur_step in range(iter_steps):
-                batch = self._next_batch()
-                _, loss = framework.step(batch, apply_optim_step=True)
-                progress_bar.update(1)
-                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
-                    loss_total_train += loss
-                    num_trained += len(batch['input_ids'])
-                progress_bar.set_description(
-                    f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
-                )
+
+            if self.args.batch_or_epoch == 'epoch':
+                iter_steps = len(self.train_loader)
+                progress_bar = tqdm(range(iter_steps))
+                for cur_step, batch in enumerate(self.train_loader):
+                    batch = {
+                        'input_ids': batch['input_ids'].to(self.device),
+                        'labels': batch['labels'].to(self.device),
+                        'attention_mask': batch['attention_mask'].to(self.device),
+                    }
+                    _, loss = framework.step(batch, apply_optim_step=True)
+                    progress_bar.update(1)
+                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+            else:
+                iter_steps = max(int(self.args.local_step), 1)
+                progress_bar = tqdm(range(iter_steps))
+                for cur_step in range(iter_steps):
+                    batch = self._next_batch()
+                    _, loss = framework.step(batch, apply_optim_step=True)
+                    progress_bar.update(1)
+                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+
             x_local, m_local = framework.export_submuon_state()
             framework.clear_submuon_state()
             self.model = None

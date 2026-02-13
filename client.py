@@ -97,8 +97,7 @@ class Client(object):
         lr = self.args.lr
 
         if self.args.batch_or_epoch == 'epoch':
-            iter_steps = self.args.local_step * len(self.train_loader)
-            print('iter_steps:', iter_steps)
+            iter_steps = len(self.train_loader)
         else:
             iter_steps = self.args.local_step
 
@@ -112,32 +111,41 @@ class Client(object):
             num_trained = 0
             progress_bar = tqdm(range(iter_steps))
 
-        for cur_step in range(iter_steps):
-            # init epoch progress bar
-            if self.args.batch_or_epoch == 'epoch':
-                if cur_step % len(self.train_loader) == 0:
-                    loss_total_train = 0.0
-                    num_trained = 0
-                    progress_bar = tqdm(range(len(self.train_loader)))
-
-            batch = self._next_batch()
-
-            if cur_step % self.args.n_accum == self.args.n_accum - 1:
-                apply_optim_step = True
-            else:
-                apply_optim_step = False
-
-            _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
-
-            progress_bar.update(1)
-            if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
-                loss_total_train += loss
-                num_trained += len(batch['input_ids'])
-            if self.args.batch_or_epoch == 'epoch':
+        if self.args.batch_or_epoch == 'epoch':
+            progress_bar = tqdm(range(iter_steps))
+            for cur_step, batch in enumerate(self.train_loader):
+                batch = {
+                    'input_ids': batch['input_ids'].to(self.device),
+                    'labels': batch['labels'].to(self.device),
+                    'attention_mask': batch['attention_mask'].to(self.device),
+                }
+                if cur_step % self.args.n_accum == self.args.n_accum - 1:
+                    apply_optim_step = True
+                else:
+                    apply_optim_step = False
+                _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                progress_bar.update(1)
+                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    loss_total_train += loss
+                    num_trained += len(batch['input_ids'])
                 progress_bar.set_description(
-                    f'client {self.idx} train at epoch {int(cur_step / len(self.train_loader)) + 1}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                 )
-            else:
+        else:
+            for cur_step in range(iter_steps):
+                batch = self._next_batch()
+
+                if cur_step % self.args.n_accum == self.args.n_accum - 1:
+                    apply_optim_step = True
+                else:
+                    apply_optim_step = False
+
+                _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+
+                progress_bar.update(1)
+                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    loss_total_train += loss
+                    num_trained += len(batch['input_ids'])
                 progress_bar.set_description(
                     f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                 )

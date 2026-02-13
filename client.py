@@ -43,8 +43,11 @@ class Client(object):
                 trainable=True,
             )
             self.model.train()
-            batch = self._next_batch()
-            _, loss = framework.step(batch, apply_optim_step=True)
+            iter_steps = max(int(self.args.local_step), 1)
+            loss = None
+            for _ in range(iter_steps):
+                batch = self._next_batch()
+                _, loss = framework.step(batch, apply_optim_step=True)
             x_local, m_local = framework.export_submuon_state()
             framework.clear_submuon_state()
             self.model = None

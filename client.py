@@ -44,10 +44,20 @@ class Client(object):
             )
             self.model.train()
             iter_steps = max(int(self.args.local_step), 1)
+            loss_total_train = 0.0
+            num_trained = 0
+            progress_bar = tqdm(range(iter_steps))
             loss = None
-            for _ in range(iter_steps):
+            for cur_step in range(iter_steps):
                 batch = self._next_batch()
                 _, loss = framework.step(batch, apply_optim_step=True)
+                progress_bar.update(1)
+                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    loss_total_train += loss
+                    num_trained += len(batch['input_ids'])
+                progress_bar.set_description(
+                    f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                )
             x_local, m_local = framework.export_submuon_state()
             framework.clear_submuon_state()
             self.model = None

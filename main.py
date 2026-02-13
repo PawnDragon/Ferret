@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import yaml
 from copy import deepcopy
-from tqdm import tqdm
 
 from client import Client
 from server import Server
@@ -198,14 +197,10 @@ if __name__ == '__main__':
 
             client_payloads = []
             train_losses = []
-            train_bar = tqdm(selected_client, desc=f'round {r} client train', leave=False)
-            for client in train_bar:
+            for client in selected_client:
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                train_bar.set_description(
-                    f'round {r} client train, loss_avg: {float(np.mean(train_losses)):.6f}'
-                )
 
             server.aggregate_submuon(client_payloads, selected_client)
 

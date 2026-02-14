@@ -65,13 +65,16 @@ class Server(object):
         # FedSubMuon global states
         self.x_global = {}
         self.m_global = {}
+        self.v_global = {}
         self.seeds = {}
         self.submuon_layer_dims = {}
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
 
-        if self.algo == 'fedsubmuon':
+        if self.algo in ['fedsubmuon', 'fedsubadam']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
+            if self.algo == 'fedsubadam':
+                self.v_global = {k: torch.zeros_like(v) for k, v in self.x_global.items()}
             name_to_module = dict(self.model.named_modules())
             for layer_name in self.seeds.keys():
                 module = name_to_module[layer_name]
@@ -81,11 +84,12 @@ class Server(object):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
             'm_global': {k: v.clone() for k, v in self.m_global.items()},
+            'v_global': {k: v.clone() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
             'seeds': dict(self.seeds),
         }
 
     def maybe_refresh_submuon_seeds(self, cur_round):
-        if self.algo != 'fedsubmuon':
+        if self.algo not in ['fedsubmuon', 'fedsubadam']:
             return
         if getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
             return
@@ -106,6 +110,7 @@ class Server(object):
             new_seeds=new_seeds,
             layer_dims=self.submuon_layer_dims,
             rank=self.args.rank_r,
+            v_global=self.v_global if self.algo == 'fedsubadam' else None,
         )
         self.seeds = new_seeds
 
@@ -119,15 +124,20 @@ class Server(object):
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
         new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()}
+        new_v = {name: torch.zeros_like(val) for name, val in self.v_global.items()} if self.algo == 'fedsubadam' else None
 
         for client_idx, payload in enumerate(client_payloads):
             w = float(weight_array[client_idx])
             for name in new_x.keys():
                 new_x[name] += payload['x'][name].to(dtype=new_x[name].dtype) * w
                 new_m[name] += payload['m'][name].to(dtype=new_m[name].dtype) * w
+                if self.algo == 'fedsubadam':
+                    new_v[name] += payload['v'][name].to(dtype=new_v[name].dtype) * w
 
         self.x_global = new_x
         self.m_global = new_m
+        if self.algo == 'fedsubadam':
+            self.v_global = new_v
 
     def aggregate_seed_pool(self, selected_client_list, cur_round=1):
         for seed in self.candidate_seeds:
@@ -163,7 +173,7 @@ class Server(object):
         self.model.to('cpu')
 
     def save_best_submuon_ckpt(self, metric, cur_round):
-        if self.algo != 'fedsubmuon' or not self.args.save:
+        if self.algo not in ['fedsubmuon', 'fedsubadam'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -178,6 +188,7 @@ class Server(object):
                 'backbone_state_dict': self.model.state_dict(),
                 'x_global': {k: v.cpu() for k, v in self.x_global.items()},
                 'm_global': {k: v.cpu() for k, v in self.m_global.items()},
+                'v_global': {k: v.cpu() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
                 'seeds': dict(self.seeds),
                 'round': int(cur_round),
                 'best_metric': float(metric),
@@ -185,6 +196,9 @@ class Server(object):
                     'algo': self.args.algo,
                     'rank_r': self.args.rank_r,
                     'beta': self.args.beta,
+                    'beta1': getattr(self.args, 'beta1', None),
+                    'beta2': getattr(self.args, 'beta2', None),
+                    'eps': getattr(self.args, 'eps', None),
                     'lr': self.args.lr,
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
@@ -222,9 +236,15 @@ class Server(object):
         self.model.eval()
 
         framework = None
-        if self.algo == 'fedsubmuon':
+        if self.algo in ['fedsubmuon', 'fedsubadam']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            framework.set_submuon_state(self.x_global, self.m_global, self.seeds, trainable=False)
+            framework.set_submuon_state(
+                self.x_global,
+                self.m_global,
+                self.seeds,
+                trainable=False,
+                v_state=self.v_global if self.algo == 'fedsubadam' else None,
+            )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         loss_total_eval = 0.0
@@ -260,9 +280,15 @@ class Server(object):
         self.model.eval()
 
         framework = None
-        if self.algo == 'fedsubmuon':
+        if self.algo in ['fedsubmuon', 'fedsubadam']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            framework.set_submuon_state(self.x_global, self.m_global, self.seeds, trainable=False)
+            framework.set_submuon_state(
+                self.x_global,
+                self.m_global,
+                self.seeds,
+                trainable=False,
+                v_state=self.v_global if self.algo == 'fedsubadam' else None,
+            )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         acc_total_eval = 0.0

@@ -23,12 +23,14 @@ class FerretFramework(object):
         # FedSubMuon runtime state
         self.submuon_x = {}
         self.submuon_m = {}
+        self.submuon_v = {}
         self.submuon_seeds = {}
+        self.subadam_step = 0
         self.target_linear_layers = []
         self._submuon_uv_cache = {}
         self._orig_linear_forward = {}
 
-        if self.algo == 'fedsubmuon':
+        if self.algo in ['fedsubmuon', 'fedsubadam']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(self.model, self.args.rank_r)
         else:
@@ -121,16 +123,19 @@ class FerretFramework(object):
         self._submuon_uv_cache = {}
         self.submuon_x = {}
         self.submuon_m = {}
+        self.submuon_v = {}
         self.submuon_seeds = {}
+        self.subadam_step = 0
 
-    def set_submuon_state(self, x_state, m_state, seeds, trainable=True):
-        if self.algo != 'fedsubmuon':
+    def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None):
+        if self.algo not in ['fedsubmuon', 'fedsubadam']:
             return
         self.clear_submuon_state()
 
         device = next(self.model.parameters()).device
         self.submuon_x = {}
         self.submuon_m = {}
+        self.submuon_v = {}
         self.submuon_seeds = dict(seeds)
 
         for layer_name in self.target_linear_layers:
@@ -139,12 +144,19 @@ class FerretFramework(object):
             x_tensor = x_state[layer_name].to(device=device, dtype=torch.float32)
             self.submuon_x[layer_name] = torch.nn.Parameter(x_tensor.clone().detach(), requires_grad=trainable)
             self.submuon_m[layer_name] = m_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
+            if v_state is not None and layer_name in v_state:
+                self.submuon_v[layer_name] = v_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
+            else:
+                self.submuon_v[layer_name] = torch.zeros_like(self.submuon_m[layer_name])
 
         self._install_submuon_forward()
 
-    def export_submuon_state(self):
+    def export_submuon_state(self, with_v=False):
         x_out = {k: v.detach().cpu().clone() for k, v in self.submuon_x.items()}
         m_out = {k: v.detach().cpu().clone() for k, v in self.submuon_m.items()}
+        if with_v:
+            v_out = {k: v.detach().cpu().clone() for k, v in self.submuon_v.items()}
+            return x_out, m_out, v_out
         return x_out, m_out
 
     def step(self, batch, apply_optim_step=False):
@@ -165,6 +177,26 @@ class FerretFramework(object):
                         self.submuon_m[layer_name].mul_(beta).add_((1.0 - beta) * grad)
                         delta = zeropower_via_newtonschulz5(self.submuon_m[layer_name].float(), self.args.ns_steps)
                         X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
+                        X.grad = None
+            return logits.detach(), loss.detach()
+
+        if self.algo == 'fedsubadam':
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                self.subadam_step += 1
+                beta1 = self.args.beta1
+                beta2 = self.args.beta2
+                eps = self.args.eps
+                with torch.no_grad():
+                    for layer_name, X in self.submuon_x.items():
+                        grad = X.grad
+                        if grad is None:
+                            continue
+                        self.submuon_m[layer_name].mul_(beta1).add_((1.0 - beta1) * grad)
+                        self.submuon_v[layer_name].mul_(beta2).add_((1.0 - beta2) * (grad * grad))
+                        m_hat = self.submuon_m[layer_name] / (1.0 - beta1 ** self.subadam_step)
+                        v_hat = self.submuon_v[layer_name] / (1.0 - beta2 ** self.subadam_step)
+                        X.data.sub_(self.lr * (m_hat / (torch.sqrt(v_hat) + eps)).to(dtype=X.data.dtype))
                         X.grad = None
             return logits.detach(), loss.detach()
 

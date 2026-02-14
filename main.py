@@ -42,7 +42,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=str, default='ferret', choices=['ferret', 'fedsubmuon'])
+    parser.add_argument('--algo', type=str, default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam'])
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -84,6 +84,9 @@ if __name__ == '__main__':
     # FedSubMuon
     parser.add_argument('--rank_r', type=int, default=8)
     parser.add_argument('--beta', type=float, default=0.95)
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.999)
+    parser.add_argument('--eps', type=float, default=1e-8)
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
@@ -206,7 +209,7 @@ if __name__ == '__main__':
             init_log['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
         wandb.log(init_log, step=0)
 
-    if args.algo == 'fedsubmuon':
+    if args.algo in ['fedsubmuon', 'fedsubadam']:
         server.save_best_submuon_ckpt(eval_result, 0)
 
     if args.log:
@@ -219,7 +222,7 @@ if __name__ == '__main__':
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
-        if args.algo == 'fedsubmuon':
+        if args.algo in ['fedsubmuon', 'fedsubadam']:
             server.maybe_refresh_submuon_seeds(r)
             broadcast_state = server.get_submuon_broadcast_state()
 
@@ -240,6 +243,7 @@ if __name__ == '__main__':
                 rank=args.rank_r,
                 num_clients=len(selected_client),
                 include_seed=True,
+                num_state_tensors=3 if args.algo == 'fedsubadam' else 2,
             )
             log_items = {
                 'round': r,
@@ -299,7 +303,7 @@ if __name__ == '__main__':
         _, eval_loader_final, _ = get_loaders(args, only_eval=True)
         server.eval_loader = eval_loader_final
         eval_result = server.eval(cur_round=args.rounds, eval_avg_acc=eval_avg_acc)
-        if args.algo == 'fedsubmuon':
+        if args.algo in ['fedsubmuon', 'fedsubadam']:
             server.save_best_submuon_ckpt(eval_result, args.rounds)
 
         if args.log:

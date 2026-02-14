@@ -34,13 +34,14 @@ class Client(object):
         self.model = pulled_model
         self.model.to(self.device)
 
-        if getattr(self.args, 'algo', 'ferret') == 'fedsubmuon':
+        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubadam']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 x_state=submuon_state['x_global'],
                 m_state=submuon_state['m_global'],
                 seeds=submuon_state['seeds'],
                 trainable=True,
+                v_state=submuon_state.get('v_global', None),
             )
             self.model.train()
 
@@ -80,14 +81,20 @@ class Client(object):
                         f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                     )
 
-            x_local, m_local = framework.export_submuon_state()
+            if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
+                x_local, m_local, v_local = framework.export_submuon_state(with_v=True)
+            else:
+                x_local, m_local = framework.export_submuon_state()
             framework.clear_submuon_state()
             self.model = None
-            return {
+            payload = {
                 'x': x_local,
                 'm': m_local,
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
+            if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
+                payload['v'] = v_local
+            return payload
 
         old_params = [(name, deepcopy(param.data)) for name, param in self.model.named_parameters() if param.requires_grad]
 

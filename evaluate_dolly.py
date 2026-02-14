@@ -43,20 +43,25 @@ def load_checkpoint_into_model(model, ckpt_path):
     ckpt_type = 'state_dict'
     x_global = None
     m_global = None
+    v_global = None
     seeds = None
+    saved_algo = None
 
     if isinstance(payload, dict) and 'backbone_state_dict' in payload:
         model.load_state_dict(payload['backbone_state_dict'], strict=True)
         x_global = payload.get('x_global', None)
         m_global = payload.get('m_global', None)
+        v_global = payload.get('v_global', None)
         seeds = payload.get('seeds', None)
+        hparams = payload.get('hparams', {})
+        saved_algo = hparams.get('algo', None) if isinstance(hparams, dict) else None
         ckpt_type = 'fedsubmuon_best'
     elif isinstance(payload, dict):
         model.load_state_dict(payload, strict=True)
     else:
         raise ValueError(f'Unsupported checkpoint format: {type(payload)}')
 
-    return ckpt_type, x_global, m_global, seeds
+    return ckpt_type, x_global, m_global, v_global, seeds, saved_algo
 
 
 def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
@@ -130,32 +135,37 @@ def main():
     ckpt_type = 'none'
     x_global = None
     m_global = None
+    v_global = None
     seeds = None
+    saved_algo = None
     if args.checkpoint:
-        ckpt_type, x_global, m_global, seeds = load_checkpoint_into_model(model, args.checkpoint)
+        ckpt_type, x_global, m_global, v_global, seeds, saved_algo = load_checkpoint_into_model(model, args.checkpoint)
         print(f'[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})')
 
     eval_algo = args.algo
     if eval_algo == 'auto':
-        eval_algo = 'fedsubmuon' if (x_global is not None and seeds is not None) else 'ferret'
+        if saved_algo in ['fedsubmuon', 'fedsubadam']:
+            eval_algo = saved_algo
+        else:
+            eval_algo = 'fedsubmuon' if (x_global is not None and seeds is not None) else 'ferret'
 
     model = model.to(device)
     model.eval()
 
     framework = None
-    if eval_algo == 'fedsubmuon':
+    if eval_algo in ['fedsubmuon', 'fedsubadam']:
         if x_global is None or m_global is None or seeds is None:
-            raise ValueError('FedSubMuon eval requires checkpoint with x_global, m_global, seeds')
+            raise ValueError('FedSub eval requires checkpoint with x_global, m_global, seeds')
         if len(x_global) == 0:
-            raise ValueError('FedSubMuon checkpoint contains empty x_global')
+            raise ValueError('FedSub checkpoint contains empty x_global')
         first_key = next(iter(x_global.keys()))
         ckpt_rank = int(x_global[first_key].shape[0])
         if int(args.rank_r) != ckpt_rank:
             print(f'[info] rank_r mismatch (args={args.rank_r}, ckpt={ckpt_rank}); override args.rank_r with ckpt rank')
             args.rank_r = ckpt_rank
-        args.algo = 'fedsubmuon'
+        args.algo = eval_algo
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
-        framework.set_submuon_state(x_global, m_global, seeds, trainable=False)
+        framework.set_submuon_state(x_global, m_global, seeds, trainable=False, v_state=v_global)
 
     result = None
     if args.eval_metric == 'loss':

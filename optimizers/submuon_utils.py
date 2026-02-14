@@ -73,7 +73,7 @@ def init_submuon_state(model, rank, base_seed):
     return x_global, m_global, seeds
 
 
-def transport_state(x_global, m_global, old_seeds, new_seeds, layer_dims, rank):
+def transport_state(x_global, m_global, old_seeds, new_seeds, layer_dims, rank, v_global=None):
     for name, (out_dim, in_dim) in layer_dims.items():
         U_old, V_old = make_uv(old_seeds[name], out_dim, in_dim, rank, device='cpu', dtype=torch.float32)
         U_new, V_new = make_uv(new_seeds[name], out_dim, in_dim, rank, device='cpu', dtype=torch.float32)
@@ -81,6 +81,8 @@ def transport_state(x_global, m_global, old_seeds, new_seeds, layer_dims, rank):
         R_v = V_new.t() @ V_old
         x_global[name] = R_u @ x_global[name] @ R_v.t()
         m_global[name] = R_u @ m_global[name] @ R_v.t()
+        if v_global is not None:
+            v_global[name] = R_u @ v_global[name] @ R_v.t()
 
 
 def relative_transport_error(X_old, old_seed, new_seed, out_dim, in_dim, rank):
@@ -97,10 +99,10 @@ def relative_transport_error(X_old, old_seed, new_seed, out_dim, in_dim, rank):
     return (torch.linalg.norm(W_old - W_new) / denom).item()
 
 
-def estimate_comm_bytes(num_layers, rank, num_clients, include_seed=True):
+def estimate_comm_bytes(num_layers, rank, num_clients, include_seed=True, num_state_tensors=2):
     per_layer_tensor = rank * rank * 4
-    per_client_up = num_layers * per_layer_tensor * 2
-    per_client_down = num_layers * per_layer_tensor * 2
+    per_client_up = num_layers * per_layer_tensor * num_state_tensors
+    per_client_down = num_layers * per_layer_tensor * num_state_tensors
     if include_seed:
         per_client_down += num_layers * 8
     return per_client_up * num_clients, per_client_down * num_clients

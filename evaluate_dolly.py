@@ -59,6 +59,22 @@ def load_checkpoint_into_model(model, ckpt_path):
     return ckpt_type, x_global, m_global, seeds
 
 
+def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
+    """
+    Convert right-padded batch tensors to left-padded layout for decoder-only generation.
+    """
+    bs, seq_len = input_ids.shape
+    left_input_ids = torch.full_like(input_ids, pad_token_id)
+    left_attention_mask = torch.zeros_like(attention_mask)
+    for i in range(bs):
+        valid_tokens = input_ids[i][attention_mask[i].bool()]
+        n = valid_tokens.numel()
+        if n > 0:
+            left_input_ids[i, seq_len - n:] = valid_tokens
+            left_attention_mask[i, seq_len - n:] = 1
+    return left_input_ids, left_attention_mask
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True)
@@ -109,6 +125,7 @@ def main():
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
 
     ckpt_type = 'none'
     x_global = None
@@ -166,6 +183,11 @@ def main():
                 input_ids = batch['input_ids'].to(device)
                 label_ids = batch['labels'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
+                input_ids, attention_mask = to_left_padded_inputs(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
                 output_ids = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -173,9 +195,16 @@ def main():
                     max_new_tokens=128,
                     num_beams=1,
                 )
-                metric_total += rouge_score(output_ids[0][len(input_ids[0]):], label_ids[0], tokenizer)
+                bs = input_ids.size(0)
+                for i in range(bs):
+                    prompt_len = int(attention_mask[i].sum().item())
+                    pred_ids = output_ids[i][prompt_len:]
+                    ref_ids = label_ids[i]
+                    if ref_ids.numel() > 0:
+                        ref_ids = ref_ids[ref_ids >= 0]
+                    metric_total += rouge_score(pred_ids, ref_ids, tokenizer)
                 pbar.update(1)
-                num_eval += len(batch['input_ids'])
+                num_eval += bs
                 if num_eval == 0:
                     num_eval = 1e-10
                 pbar.set_description(f'eval rouge: {metric_total / num_eval}')

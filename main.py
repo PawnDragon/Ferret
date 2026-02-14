@@ -86,6 +86,7 @@ if __name__ == '__main__':
     parser.add_argument('--beta', type=float, default=0.95)
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
+    parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')

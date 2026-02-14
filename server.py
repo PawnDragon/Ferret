@@ -87,6 +87,8 @@ class Server(object):
     def maybe_refresh_submuon_seeds(self, cur_round):
         if self.algo != 'fedsubmuon':
             return
+        if getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
+            return
         if self.args.seed_refresh_F <= 0:
             return
         if cur_round % self.args.seed_refresh_F != 0:

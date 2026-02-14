@@ -146,6 +146,13 @@ def main():
     if eval_algo == 'fedsubmuon':
         if x_global is None or m_global is None or seeds is None:
             raise ValueError('FedSubMuon eval requires checkpoint with x_global, m_global, seeds')
+        if len(x_global) == 0:
+            raise ValueError('FedSubMuon checkpoint contains empty x_global')
+        first_key = next(iter(x_global.keys()))
+        ckpt_rank = int(x_global[first_key].shape[0])
+        if int(args.rank_r) != ckpt_rank:
+            print(f'[info] rank_r mismatch (args={args.rank_r}, ckpt={ckpt_rank}); override args.rank_r with ckpt rank')
+            args.rank_r = ckpt_rank
         args.algo = 'fedsubmuon'
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
         framework.set_submuon_state(x_global, m_global, seeds, trainable=False)

@@ -183,22 +183,19 @@ def main():
                 input_ids = batch['input_ids'].to(device)
                 label_ids = batch['labels'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
-                input_ids, attention_mask = to_left_padded_inputs(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                output_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pad_token_id=tokenizer.pad_token_id,
-                    max_new_tokens=128,
-                    num_beams=1,
-                )
                 bs = input_ids.size(0)
                 for i in range(bs):
-                    prompt_len = int(attention_mask[i].sum().item())
-                    pred_ids = output_ids[i][prompt_len:]
+                    valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
+                    valid_mask = torch.ones_like(valid_input, device=device)
+                    output_ids = model.generate(
+                        input_ids=valid_input,
+                        attention_mask=valid_mask,
+                        pad_token_id=tokenizer.pad_token_id,
+                        max_new_tokens=128,
+                        num_beams=1,
+                    )
+                    prompt_len = int(valid_mask[0].sum().item())
+                    pred_ids = output_ids[0][prompt_len:]
                     ref_ids = label_ids[i]
                     if ref_ids.numel() > 0:
                         ref_ids = ref_ids[ref_ids >= 0]

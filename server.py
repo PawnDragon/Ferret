@@ -71,8 +71,10 @@ class Server(object):
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
 
-        if self.algo in ['fedsubmuon', 'fedsubadam']:
+        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
+            if self.algo == 'fedsubsgd':
+                self.m_global = {}
             if self.algo == 'fedsubadam':
                 self.v_global = {k: torch.zeros_like(v) for k, v in self.x_global.items()}
             name_to_module = dict(self.model.named_modules())
@@ -83,13 +85,13 @@ class Server(object):
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
-            'm_global': {k: v.clone() for k, v in self.m_global.items()},
+            'm_global': {k: v.clone() for k, v in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
             'v_global': {k: v.clone() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
             'seeds': dict(self.seeds),
         }
 
     def maybe_refresh_submuon_seeds(self, cur_round):
-        if self.algo not in ['fedsubmuon', 'fedsubadam']:
+        if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             return
         if getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
             return
@@ -105,7 +107,7 @@ class Server(object):
 
         transport_state(
             x_global=self.x_global,
-            m_global=self.m_global,
+            m_global=self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
             old_seeds=old_seeds,
             new_seeds=new_seeds,
             layer_dims=self.submuon_layer_dims,
@@ -123,19 +125,21 @@ class Server(object):
             weight_array /= float(np.sum(weight_array))
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
-        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()}
+        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None
         new_v = {name: torch.zeros_like(val) for name, val in self.v_global.items()} if self.algo == 'fedsubadam' else None
 
         for client_idx, payload in enumerate(client_payloads):
             w = float(weight_array[client_idx])
             for name in new_x.keys():
                 new_x[name] += payload['x'][name].to(dtype=new_x[name].dtype) * w
-                new_m[name] += payload['m'][name].to(dtype=new_m[name].dtype) * w
+                if self.algo in ['fedsubmuon', 'fedsubadam']:
+                    new_m[name] += payload['m'][name].to(dtype=new_m[name].dtype) * w
                 if self.algo == 'fedsubadam':
                     new_v[name] += payload['v'][name].to(dtype=new_v[name].dtype) * w
 
         self.x_global = new_x
-        self.m_global = new_m
+        if self.algo in ['fedsubmuon', 'fedsubadam']:
+            self.m_global = new_m
         if self.algo == 'fedsubadam':
             self.v_global = new_v
 
@@ -173,7 +177,7 @@ class Server(object):
         self.model.to('cpu')
 
     def save_best_submuon_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedsubmuon', 'fedsubadam'] or not self.args.save:
+        if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -187,7 +191,7 @@ class Server(object):
             {
                 'backbone_state_dict': self.model.state_dict(),
                 'x_global': {k: v.cpu() for k, v in self.x_global.items()},
-                'm_global': {k: v.cpu() for k, v in self.m_global.items()},
+                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
                 'v_global': {k: v.cpu() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
                 'seeds': dict(self.seeds),
                 'round': int(cur_round),
@@ -214,7 +218,7 @@ class Server(object):
         else:
             eval_metric = self.eval_generate(cur_round)
 
-        if self.args.save and self.algo != 'fedsubmuon' and cur_round > 0:
+        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] and cur_round > 0:
             save_dir = self.log_dir
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
@@ -236,11 +240,11 @@ class Server(object):
         self.model.eval()
 
         framework = None
-        if self.algo in ['fedsubmuon', 'fedsubadam']:
+        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global,
+                self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
                 self.seeds,
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,
@@ -280,11 +284,11 @@ class Server(object):
         self.model.eval()
 
         framework = None
-        if self.algo in ['fedsubmuon', 'fedsubadam']:
+        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global,
+                self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
                 self.seeds,
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,

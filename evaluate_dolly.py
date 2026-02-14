@@ -144,7 +144,7 @@ def main():
 
     eval_algo = args.algo
     if eval_algo == 'auto':
-        if saved_algo in ['fedsubmuon', 'fedsubadam']:
+        if saved_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             eval_algo = saved_algo
         else:
             eval_algo = 'fedsubmuon' if (x_global is not None and seeds is not None) else 'ferret'
@@ -153,9 +153,11 @@ def main():
     model.eval()
 
     framework = None
-    if eval_algo in ['fedsubmuon', 'fedsubadam']:
-        if x_global is None or m_global is None or seeds is None:
-            raise ValueError('FedSub eval requires checkpoint with x_global, m_global, seeds')
+    if eval_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if x_global is None or seeds is None:
+            raise ValueError('FedSub eval requires checkpoint with x_global and seeds')
+        if eval_algo in ['fedsubmuon', 'fedsubadam'] and m_global is None:
+            raise ValueError('FedSubMuon/FedSubAdam eval requires checkpoint with m_global')
         if len(x_global) == 0:
             raise ValueError('FedSub checkpoint contains empty x_global')
         first_key = next(iter(x_global.keys()))
@@ -165,7 +167,13 @@ def main():
             args.rank_r = ckpt_rank
         args.algo = eval_algo
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
-        framework.set_submuon_state(x_global, m_global, seeds, trainable=False, v_state=v_global)
+        framework.set_submuon_state(
+            x_global,
+            m_global if eval_algo in ['fedsubmuon', 'fedsubadam'] else None,
+            seeds,
+            trainable=False,
+            v_state=v_global if eval_algo == 'fedsubadam' else None,
+        )
 
     result = None
     if args.eval_metric == 'loss':

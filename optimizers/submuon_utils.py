@@ -80,7 +80,8 @@ def transport_state(x_global, m_global, old_seeds, new_seeds, layer_dims, rank, 
         R_u = U_new.t() @ U_old
         R_v = V_new.t() @ V_old
         x_global[name] = R_u @ x_global[name] @ R_v.t()
-        m_global[name] = R_u @ m_global[name] @ R_v.t()
+        if m_global is not None:
+            m_global[name] = R_u @ m_global[name] @ R_v.t()
         if v_global is not None:
             v_global[name] = R_u @ v_global[name] @ R_v.t()
 

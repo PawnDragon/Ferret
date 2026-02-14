@@ -94,8 +94,9 @@ def main():
     device, _ = resolve_runtime_device(args.device)
     setup_seed(args.seed)
 
-    # Keep exactly the same dolly eval split logic as main.py via get_loaders.
-    _, eval_loader, tokenizer = get_loaders(args, only_eval=False)
+    # Keep exactly the same final-eval path as main.py.
+    setup_seed(args.seed)
+    _, eval_loader, tokenizer = get_loaders(args, only_eval=True)
     print(f'[info] Dolly zerotask eval | zerotask={args.zerotask}, eval_samples={len(eval_loader.dataset)}')
 
     model_source = resolve_model_source(args.model)

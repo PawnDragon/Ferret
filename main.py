@@ -97,6 +97,7 @@ if __name__ == '__main__':
 
     # Evaluation
     parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss'], help='metric to evaluate global model in the last round')
+    parser.add_argument('--final_eval_false', default=False, action='store_true', help='if true, skip final evaluation after training rounds')
 
     # Checkpoints
     parser.add_argument('--save', default=False, action='store_true', help='if `true`, the checkpoint of tuned models will be stored')
@@ -291,19 +292,20 @@ if __name__ == '__main__':
             with open(os.path.join(log_dir, 'results.json'), 'w') as writer:
                 json.dump({'eval_avg_acc': eval_avg_acc}, writer)
 
-    # reset seed to have an eval_loader with the same data samples
-    args.eval_metric = previous_metric
-    setup_seed(args.seed)
-    _, eval_loader_final, _ = get_loaders(args, only_eval=True)
-    server.eval_loader = eval_loader_final
-    eval_result = server.eval(cur_round=args.rounds, eval_avg_acc=eval_avg_acc)
-    if args.algo == 'fedsubmuon':
-        server.save_best_submuon_ckpt(eval_result, args.rounds)
+    if not args.final_eval_false:
+        # reset seed to have an eval_loader with the same data samples
+        args.eval_metric = previous_metric
+        setup_seed(args.seed)
+        _, eval_loader_final, _ = get_loaders(args, only_eval=True)
+        server.eval_loader = eval_loader_final
+        eval_result = server.eval(cur_round=args.rounds, eval_avg_acc=eval_avg_acc)
+        if args.algo == 'fedsubmuon':
+            server.save_best_submuon_ckpt(eval_result, args.rounds)
 
-    if args.log:
-        with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:
-            json.dump({f'final_eval_{args.eval_metric}': eval_result}, writer)
-    print(f'final round {args.eval_metric}: {eval_result}')
+        if args.log:
+            with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:
+                json.dump({f'final_eval_{args.eval_metric}': eval_result}, writer)
+        print(f'final round {args.eval_metric}: {eval_result}')
 
     if wandb_run is not None:
         wandb.finish()

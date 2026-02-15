@@ -84,7 +84,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, default='')
-    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon'])
+    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd'])
 
     # Data/eval args to keep dolly processing aligned with main.py
     parser.add_argument('--dataset', type=str, default='dolly', choices=['dolly'])

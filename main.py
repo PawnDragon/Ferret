@@ -42,7 +42,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=str, default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd'])
+    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'])
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -90,6 +90,13 @@ if __name__ == '__main__':
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
+
+    # LoRA (FedIT / FLoRA)
+    parser.add_argument('--lora_r', type=int, default=16)
+    parser.add_argument('--lora_alpha', type=float, default=16.0)
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    parser.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
+    parser.add_argument('--lora_bias', type=str, default='none', choices=['none', 'all', 'lora_only'])
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')
@@ -211,6 +218,8 @@ if __name__ == '__main__':
 
     if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
         server.save_best_submuon_ckpt(eval_result, 0)
+    elif args.algo in ['fedit', 'flora']:
+        server.save_best_lora_ckpt(eval_result, 0)
 
     if args.log:
         with open(os.path.join(log_dir, 'results.json'), 'w') as writer:
@@ -251,6 +260,30 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'comm/bytes_up': float(bytes_up),
                 'comm/bytes_down': float(bytes_down),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo in ['fedit', 'flora']:
+            broadcast_lora = server.get_fedit_broadcast_state() if args.algo == 'fedit' else None
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r, lora_state=broadcast_lora)
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+
+            server.aggregate_lora(client_payloads, selected_client)
+            eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+            eval_avg_acc.append(eval_result)
+            improved = server.save_best_lora_ckpt(eval_result, r)
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
             if torch.cuda.is_available():
@@ -305,6 +338,8 @@ if __name__ == '__main__':
         eval_result = server.eval(cur_round=args.rounds, eval_avg_acc=eval_avg_acc)
         if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             server.save_best_submuon_ckpt(eval_result, args.rounds)
+        elif args.algo in ['fedit', 'flora']:
+            server.save_best_lora_ckpt(eval_result, args.rounds)
 
         if args.log:
             with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:

@@ -29,6 +29,9 @@ class FerretFramework(object):
         self.target_linear_layers = []
         self._submuon_uv_cache = {}
         self._orig_linear_forward = {}
+        self._flora_delta = {}
+        self._flora_scaling = 1.0
+        self._orig_flora_forward = {}
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
@@ -126,6 +129,42 @@ class FerretFramework(object):
         self.submuon_v = {}
         self.submuon_seeds = {}
         self.subadam_step = 0
+
+    def clear_flora_delta_state(self):
+        for layer_name, orig_forward in self._orig_flora_forward.items():
+            module = self._resolve_module(layer_name)
+            module.forward = orig_forward
+        self._orig_flora_forward = {}
+        self._flora_delta = {}
+        self._flora_scaling = 1.0
+
+    def set_flora_delta_state(self, delta_state, scaling=1.0):
+        self.clear_flora_delta_state()
+        if delta_state is None:
+            return
+
+        self._flora_scaling = float(scaling)
+        for layer_name, delta in delta_state.items():
+            try:
+                module = self._resolve_module(layer_name)
+            except AttributeError:
+                continue
+            if layer_name in self._orig_flora_forward:
+                continue
+
+            self._orig_flora_forward[layer_name] = module.forward
+            self._flora_delta[layer_name] = delta.detach().clone().to(dtype=torch.float32)
+
+            def patched_forward(x, _module=module, _layer_name=layer_name):
+                input_shape = x.shape
+                x2 = x.reshape(-1, input_shape[-1])
+                y0 = F.linear(x2, _module.weight, _module.bias)
+                delta_tensor = self._flora_delta[_layer_name].to(device=x2.device, dtype=x2.dtype)
+                y1 = (x2 @ delta_tensor.t()) * self._flora_scaling
+                y = y0 + y1
+                return y.reshape(*input_shape[:-1], _module.out_features)
+
+            module.forward = patched_forward
 
     def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None):
         if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:

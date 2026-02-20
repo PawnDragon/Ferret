@@ -2,6 +2,7 @@ from tqdm import tqdm
 from copy import deepcopy
 
 from optimizers.ferret_optimizer import *
+from optimizers.lora_utils import build_lora_model, extract_lora_state, load_lora_state
 
 
 class Client(object):
@@ -30,7 +31,7 @@ class Client(object):
             'attention_mask': batch['attention_mask'].to(self.device),
         }
 
-    def local_train_with_seed_pool(self, pulled_model, cur_round, submuon_state=None):
+    def local_train_with_seed_pool(self, pulled_model, cur_round, submuon_state=None, lora_state=None):
         self.model = pulled_model
         self.model.to(self.device)
 
@@ -96,6 +97,58 @@ class Client(object):
             elif getattr(self.args, 'algo', 'ferret') == 'fedsubmuon':
                 payload['m'] = m_local
             return payload
+
+        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora']:
+            self.model = build_lora_model(self.model, self.args)
+            self.model.to(self.device)
+            if getattr(self.args, 'algo', 'ferret') == 'fedit':
+                load_lora_state(self.model, lora_state)
+
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            self.model.train()
+            self.model.zero_grad()
+
+            if self.args.batch_or_epoch == 'epoch':
+                iter_steps = len(self.train_loader)
+            else:
+                iter_steps = max(int(self.args.local_step), 1)
+
+            loss_total_train = 0.0
+            num_trained = 0
+            progress_bar = tqdm(range(iter_steps))
+
+            if self.args.batch_or_epoch == 'epoch':
+                for cur_step, batch in enumerate(self.train_loader):
+                    batch = {
+                        'input_ids': batch['input_ids'].to(self.device),
+                        'labels': batch['labels'].to(self.device),
+                        'attention_mask': batch['attention_mask'].to(self.device),
+                    }
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                    progress_bar.update(1)
+                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+            else:
+                for cur_step in range(iter_steps):
+                    batch = self._next_batch()
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                    progress_bar.update(1)
+                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+
+            local_lora_state = extract_lora_state(self.model)
+            self.model = None
+            return {'lora_state': local_lora_state, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
 
         old_params = [(name, deepcopy(param.data)) for name, param in self.model.named_parameters() if param.requires_grad]
 

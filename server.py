@@ -2,12 +2,21 @@ import os
 import math
 import numpy as np
 import torch
+from copy import deepcopy
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from evaluations import *
 from optimizers.ferret_optimizer import FerretFramework
+from optimizers.lora_utils import (
+    build_lora_model,
+    compute_deltaw_from_lora_state,
+    extract_lora_state,
+    load_lora_state,
+    lora_scaling,
+    resolve_layer_name_for_model,
+)
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import resolve_model_source
@@ -70,6 +79,9 @@ class Server(object):
         self.submuon_layer_dims = {}
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
+        self.global_lora_state = {}
+        self.global_deltaW_state = {}
+        self.flora_scaling = lora_scaling(self.args)
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
@@ -82,6 +94,11 @@ class Server(object):
                 module = name_to_module[layer_name]
                 self.submuon_layer_dims[layer_name] = (module.out_features, module.in_features)
 
+        if self.algo == 'fedit':
+            init_model = build_lora_model(deepcopy(self.model), self.args)
+            self.global_lora_state = extract_lora_state(init_model)
+            del init_model
+
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
@@ -89,6 +106,20 @@ class Server(object):
             'v_global': {k: v.clone() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
             'seeds': dict(self.seeds),
         }
+
+    def get_fedit_broadcast_state(self):
+        if self.algo != 'fedit':
+            return None
+        return {k: v.clone() for k, v in self.global_lora_state.items()}
+
+    def _get_client_weight_array(self, selected_client_list):
+        if self.args.equal_weight:
+            weight_array = np.array([1.0 for _ in selected_client_list], dtype=np.float64)
+            weight_array /= float(len(selected_client_list))
+        else:
+            weight_array = np.array([len(client.train_loader) for client in selected_client_list], dtype=np.float64)
+            weight_array /= float(np.sum(weight_array))
+        return weight_array
 
     def maybe_refresh_submuon_seeds(self, cur_round):
         if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
@@ -117,12 +148,7 @@ class Server(object):
         self.seeds = new_seeds
 
     def aggregate_submuon(self, client_payloads, selected_client_list):
-        if self.args.equal_weight:
-            weight_array = np.array([1.0 for _ in selected_client_list], dtype=np.float64)
-            weight_array /= float(len(selected_client_list))
-        else:
-            weight_array = np.array([len(client.train_loader) for client in selected_client_list], dtype=np.float64)
-            weight_array /= float(np.sum(weight_array))
+        weight_array = self._get_client_weight_array(selected_client_list)
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
         new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None
@@ -143,16 +169,43 @@ class Server(object):
         if self.algo == 'fedsubadam':
             self.v_global = new_v
 
+    def aggregate_lora(self, client_payloads, selected_client_list):
+        if len(client_payloads) == 0:
+            return
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+
+        if self.algo == 'fedit':
+            state_keys = list(client_payloads[0]['lora_state'].keys())
+            new_global_lora = {key: torch.zeros_like(client_payloads[0]['lora_state'][key], dtype=torch.float32) for key in state_keys}
+
+            for client_idx, payload in enumerate(client_payloads):
+                w = float(weight_array[client_idx])
+                local_state = payload['lora_state']
+                for key in state_keys:
+                    new_global_lora[key] += local_state[key].to(dtype=torch.float32) * w
+            self.global_lora_state = {k: v.cpu() for k, v in new_global_lora.items()}
+            return
+
+        if self.algo == 'flora':
+            new_global_delta = {}
+            for client_idx, payload in enumerate(client_payloads):
+                w = float(weight_array[client_idx])
+                local_delta = compute_deltaw_from_lora_state(payload['lora_state'])
+                for layer_name, delta in local_delta.items():
+                    resolved_layer = resolve_layer_name_for_model(layer_name, self.model)
+                    if resolved_layer not in new_global_delta:
+                        new_global_delta[resolved_layer] = torch.zeros_like(delta, dtype=torch.float32)
+                    new_global_delta[resolved_layer] += delta.to(dtype=torch.float32) * w
+
+            self.global_deltaW_state = {k: v.cpu() for k, v in new_global_delta.items()}
+            return
+
     def aggregate_seed_pool(self, selected_client_list, cur_round=1):
         for seed in self.candidate_seeds:
             self.seed_pool[seed] *= self.args.momentum
 
-        if self.args.equal_weight:
-            weight_array = np.array([1.0 for _ in selected_client_list], dtype=np.float64)
-            weight_array /= float(len(selected_client_list))
-        else:
-            weight_array = np.array([len(client.train_loader) for client in selected_client_list], dtype=np.float64)
-            weight_array /= float(np.sum(weight_array))
+        weight_array = self._get_client_weight_array(selected_client_list)
         for client_idx in range(len(selected_client_list)):
             local_seed_pool = selected_client_list[client_idx].local_seed_pool
             for seed, grad in local_seed_pool.items():
@@ -212,13 +265,48 @@ class Server(object):
         )
         return True
 
+    def save_best_lora_ckpt(self, metric, cur_round):
+        if self.algo not in ['fedit', 'flora'] or not self.args.save:
+            return False
+
+        improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
+        if improved:
+            self.best_metric = metric
+
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        ckpt_payload = {
+            'algo': self.algo,
+            'backbone_state_dict': self.model.state_dict(),
+            'round': int(cur_round),
+            'best_metric': float(self.best_metric),
+            'metric': float(metric),
+            'lora_hparams': {
+                'lora_r': int(getattr(self.args, 'lora_r', 16)),
+                'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
+                'lora_dropout': float(getattr(self.args, 'lora_dropout', 0.0)),
+                'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                'lora_bias': getattr(self.args, 'lora_bias', 'none'),
+                'scaling': float(self.flora_scaling),
+            },
+        }
+
+        if self.algo == 'fedit':
+            ckpt_payload['global_lora_state'] = {k: v.cpu() for k, v in self.global_lora_state.items()}
+        else:
+            ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
+
+        torch.save(ckpt_payload, os.path.join(self.args.output_dir, 'final.pt'))
+        if improved:
+            torch.save(ckpt_payload, os.path.join(self.args.output_dir, 'best.pt'))
+        return improved
+
     def eval(self, cur_round, eval_avg_acc):
         if self.args.eval_metric == 'loss':
             eval_metric = self.eval_loss(cur_round)
         else:
             eval_metric = self.eval_generate(cur_round)
 
-        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] and cur_round > 0:
+        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'] and cur_round > 0:
             save_dir = self.log_dir
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
@@ -236,10 +324,19 @@ class Server(object):
         return eval_metric
 
     def eval_loss(self, cur_round):
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
+        eval_model = None
         framework = None
+        temp_eval_model = False
+        if self.algo == 'fedit':
+            eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
+            load_lora_state(eval_model, self.global_lora_state)
+            eval_model.eval()
+            temp_eval_model = True
+        else:
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            eval_model = self.model
+
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
@@ -249,6 +346,9 @@ class Server(object):
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,
             )
+        elif self.algo == 'flora':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_flora_delta_state(self.global_deltaW_state, scaling=self.flora_scaling)
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         loss_total_eval = 0.0
@@ -261,7 +361,7 @@ class Server(object):
                     'labels': batch['labels'].to(self.device),
                     'attention_mask': batch['attention_mask'].to(self.device),
                 }
-                outputs = self.model(**batch)
+                outputs = eval_model(**batch)
                 loss = outputs.loss
                 progress_bar_eval.update(1)
                 if torch.isnan(loss):
@@ -276,14 +376,27 @@ class Server(object):
 
         if framework is not None:
             framework.clear_submuon_state()
+            framework.clear_flora_delta_state()
+        if temp_eval_model:
+            eval_model = eval_model.cpu()
+            del eval_model
         self.model = self.model.cpu()
         return (loss_total_eval / num_eval).item()
 
     def eval_generate(self, cur_round):
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
+        eval_model = None
         framework = None
+        temp_eval_model = False
+        if self.algo == 'fedit':
+            eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
+            load_lora_state(eval_model, self.global_lora_state)
+            eval_model.eval()
+            temp_eval_model = True
+        else:
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            eval_model = self.model
+
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
@@ -293,6 +406,9 @@ class Server(object):
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,
             )
+        elif self.algo == 'flora':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_flora_delta_state(self.global_deltaW_state, scaling=self.flora_scaling)
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         acc_total_eval = 0.0
@@ -303,7 +419,7 @@ class Server(object):
                 input_ids = batch['input_ids'].to(self.device)
                 label_ids = batch['labels'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                output_ids = self.model.generate(
+                output_ids = eval_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -321,5 +437,9 @@ class Server(object):
 
         if framework is not None:
             framework.clear_submuon_state()
+            framework.clear_flora_delta_state()
+        if temp_eval_model:
+            eval_model = eval_model.cpu()
+            del eval_model
         self.model = self.model.cpu()
         return acc_total_eval / num_eval

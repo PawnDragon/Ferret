@@ -99,6 +99,10 @@ class Server(object):
             self.global_lora_state = extract_lora_state(init_model)
             del init_model
 
+    def _get_ckpt_dir(self):
+        os.makedirs(self.log_dir, exist_ok=True)
+        return self.log_dir
+
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
@@ -254,8 +258,7 @@ class Server(object):
             return False
 
         self.best_metric = metric
-        os.makedirs(self.args.output_dir, exist_ok=True)
-        ckpt_path = os.path.join(self.args.output_dir, 'best.pt')
+        ckpt_path = os.path.join(self._get_ckpt_dir(), 'best.pt')
         torch.save(
             {
                 'backbone_state_dict': self.model.state_dict(),
@@ -279,6 +282,7 @@ class Server(object):
             },
             ckpt_path,
         )
+        print(f'[ckpt] saved to: {ckpt_path}')
         return True
 
     def save_best_lora_ckpt(self, metric, cur_round):
@@ -289,7 +293,7 @@ class Server(object):
         if improved:
             self.best_metric = metric
 
-        os.makedirs(self.args.output_dir, exist_ok=True)
+        ckpt_dir = self._get_ckpt_dir()
         ckpt_payload = {
             'algo': self.algo,
             'backbone_state_dict': self.model.state_dict(),
@@ -311,9 +315,13 @@ class Server(object):
         else:
             ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
 
-        torch.save(ckpt_payload, os.path.join(self.args.output_dir, 'final.pt'))
+        final_ckpt_path = os.path.join(ckpt_dir, 'final.pt')
+        torch.save(ckpt_payload, final_ckpt_path)
+        print(f'[ckpt] saved to: {final_ckpt_path}')
         if improved:
-            torch.save(ckpt_payload, os.path.join(self.args.output_dir, 'best.pt'))
+            best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
+            torch.save(ckpt_payload, best_ckpt_path)
+            print(f'[ckpt] saved to: {best_ckpt_path}')
         return improved
 
     def eval(self, cur_round, eval_avg_acc):

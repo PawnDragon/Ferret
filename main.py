@@ -104,6 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--log', default=False, action='store_true', help='if `true`, running logs will be recorded in files')
     parser.add_argument('--log_root', default='logs', help='root path of log files')
     parser.add_argument('--seed', default=42, type=int, help='global seed, for reproducibility')
+    # Backward-compatible only; checkpoints are now saved under log_dir.
     parser.add_argument('--output_dir', type=str, default='outputs')
 
     # Evaluation
@@ -172,6 +173,7 @@ if __name__ == '__main__':
         log_dir = os.path.join(args.log_root, log_dir)
     if args.log:
         os.makedirs(log_dir, exist_ok=True)
+    args.ckpt_dir = log_dir
 
     config = yaml.dump(args, None)
     config = '\n'.join(config.split('\n')[1:])

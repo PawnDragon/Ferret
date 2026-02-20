@@ -107,6 +107,22 @@ class Server(object):
             'seeds': dict(self.seeds),
         }
 
+    def get_broadcast_state(self):
+        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+            return self.get_submuon_broadcast_state()
+        if self.algo == 'fedit':
+            return {
+                'backbone_state_dict': self.model.state_dict(),
+                'global_lora_state': self.get_fedit_broadcast_state(),
+            }
+        if self.algo == 'flora':
+            return {
+                'backbone_state_dict': self.model.state_dict(),
+            }
+        return {
+            'backbone_state_dict': self.model.state_dict(),
+        }
+
     def get_fedit_broadcast_state(self):
         if self.algo != 'fedit':
             return None

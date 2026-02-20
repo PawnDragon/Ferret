@@ -11,8 +11,9 @@ from copy import deepcopy
 
 from client import Client
 from server import Server
+from optimizers.submuon_utils import relative_transport_error
+from utils_data.comm_utils import compute_comm_size
 from utils_data.load_data import get_loaders
-from optimizers.submuon_utils import estimate_comm_bytes, relative_transport_error
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -208,6 +209,10 @@ if __name__ == '__main__':
         init_log = {
             'round': 0,
             'train/loss_avg': float('nan'),
+            'train/wall_clock_time': float('nan'),
+            'train/peak_gpu_mem': float('nan'),
+            'train/comm_up_bytes': float('nan'),
+            'train/comm_down_bytes': float('nan'),
             'eval/loss': float(eval_result),
         }
         if torch.cuda.is_available():
@@ -228,38 +233,42 @@ if __name__ == '__main__':
     for r in range(1, args.rounds + 1):
         selected_client = [client_list[i] for i in client_indices_rounds[r - 1]]
         train_losses = []
+        total_comm_up_bytes = 0
+        total_comm_down_bytes = 0
+        round_start_time = time.time()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
         if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             server.maybe_refresh_submuon_seeds(r)
             broadcast_state = server.get_submuon_broadcast_state()
+            total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
 
             client_payloads = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size({k: v for k, v in payload.items() if k in ['x', 'm', 'v']})
 
             server.aggregate_submuon(client_payloads, selected_client)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
 
             eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
             eval_avg_acc.append(eval_result)
             improved = server.save_best_submuon_ckpt(eval_result, r)
 
-            bytes_up, bytes_down = estimate_comm_bytes(
-                num_layers=len(server.seeds),
-                rank=args.rank_r,
-                num_clients=len(selected_client),
-                include_seed=True,
-                num_state_tensors=3 if args.algo == 'fedsubadam' else (2 if args.algo == 'fedsubmuon' else 1),
-            )
             log_items = {
                 'round': r,
                 'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
                 'eval/loss': float(eval_result),
-                'comm/bytes_up': float(bytes_up),
-                'comm/bytes_down': float(bytes_down),
                 'ckpt/improved': int(improved),
             }
             if torch.cuda.is_available():
@@ -269,13 +278,17 @@ if __name__ == '__main__':
 
         elif args.algo in ['fedit', 'flora']:
             broadcast_lora = server.get_fedit_broadcast_state() if args.algo == 'fedit' else None
+            total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             client_payloads = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r, lora_state=broadcast_lora)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size(payload.get('lora_state', {}))
 
             server.aggregate_lora(client_payloads, selected_client)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
             eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
             eval_avg_acc.append(eval_result)
             improved = server.save_best_lora_ckpt(eval_result, r)
@@ -283,6 +296,12 @@ if __name__ == '__main__':
             log_items = {
                 'round': r,
                 'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
@@ -292,12 +311,14 @@ if __name__ == '__main__':
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
         else:
+            total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             for client in selected_client:
                 # server.model is pulled after aggregation of the previous round from the server perspective
                 # use a global pulling operation to deduplicate the pulling of all clients
                 loss_val = client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r)
                 if loss_val is not None:
                     train_losses.append(float(loss_val))
+                total_comm_up_bytes += compute_comm_size(getattr(client, 'local_seed_pool', {}))
             server.aggregate_seed_pool(selected_client, cur_round=r)
 
             if args.anneal == 'linear':
@@ -310,17 +331,33 @@ if __name__ == '__main__':
 
             # server gets the latest global model from the accumulated scalar gradients
             server.update_global_model_by_seed_pool()
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
             eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
             eval_avg_acc.append(eval_result)
             log_items = {
                 'round': r,
                 'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
                 'eval/loss': float(eval_result),
             }
             if torch.cuda.is_available():
                 log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        print(
+            f'Round {r}: wall_clock_time = {log_items["train/wall_clock_time"]:.2f} s, '
+            f'peak_gpu_mem = {log_items["train/peak_gpu_mem"]:.2f} MB, '
+            f'comm_up_bytes = {int(log_items["train/comm_up_bytes"])}, '
+            f'comm_down_bytes = {int(log_items["train/comm_down_bytes"])}, '
+            f'eval/loss = {log_items["eval/loss"]:.6f}'
+        )
 
         if wandb_run is not None:
             wandb.log(log_items, step=r)

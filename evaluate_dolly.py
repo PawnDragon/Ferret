@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM
 
 from evaluations import rouge_score
 from optimizers.ferret_optimizer import FerretFramework
+from optimizers.lora_utils import build_lora_model, load_lora_state
 from utils_data.load_data import get_loaders
 from utils_data.model_loader import resolve_model_source
 
@@ -46,6 +47,9 @@ def load_checkpoint_into_model(model, ckpt_path):
     v_global = None
     seeds = None
     saved_algo = None
+    global_lora_state = None
+    global_deltaW_state = None
+    lora_hparams = {}
 
     if isinstance(payload, dict) and 'backbone_state_dict' in payload:
         model.load_state_dict(payload['backbone_state_dict'], strict=True)
@@ -53,15 +57,24 @@ def load_checkpoint_into_model(model, ckpt_path):
         m_global = payload.get('m_global', None)
         v_global = payload.get('v_global', None)
         seeds = payload.get('seeds', None)
-        hparams = payload.get('hparams', {})
-        saved_algo = hparams.get('algo', None) if isinstance(hparams, dict) else None
-        ckpt_type = 'fedsubmuon_best'
+        global_lora_state = payload.get('global_lora_state', None)
+        global_deltaW_state = payload.get('global_deltaW_state', None)
+        lora_hparams = payload.get('lora_hparams', {}) if isinstance(payload.get('lora_hparams', {}), dict) else {}
+        if isinstance(payload.get('hparams', {}), dict):
+            saved_algo = payload['hparams'].get('algo', None)
+        if saved_algo is None:
+            saved_algo = payload.get('algo', None)
+
+        if saved_algo in ['fedit', 'flora'] or global_lora_state is not None or global_deltaW_state is not None:
+            ckpt_type = 'lora_best'
+        else:
+            ckpt_type = 'fedsubmuon_best'
     elif isinstance(payload, dict):
         model.load_state_dict(payload, strict=True)
     else:
         raise ValueError(f'Unsupported checkpoint format: {type(payload)}')
 
-    return ckpt_type, x_global, m_global, v_global, seeds, saved_algo
+    return ckpt_type, x_global, m_global, v_global, seeds, saved_algo, global_lora_state, global_deltaW_state, lora_hparams
 
 
 def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
@@ -84,7 +97,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, default='')
-    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd'])
+    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'])
 
     # Data/eval args to keep dolly processing aligned with main.py
     parser.add_argument('--dataset', type=str, default='dolly', choices=['dolly'])
@@ -107,6 +120,11 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--n_accum', type=int, default=1)
     parser.add_argument('--grad_clip', type=float, default=-100.0)
+    parser.add_argument('--lora_r', type=int, default=16)
+    parser.add_argument('--lora_alpha', type=float, default=16.0)
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    parser.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
+    parser.add_argument('--lora_bias', type=str, default='none')
 
     parser.add_argument('--save_json', type=str, default='')
 
@@ -138,19 +156,41 @@ def main():
     v_global = None
     seeds = None
     saved_algo = None
+    global_lora_state = None
+    global_deltaW_state = None
+    lora_hparams = {}
     if args.checkpoint:
-        ckpt_type, x_global, m_global, v_global, seeds, saved_algo = load_checkpoint_into_model(model, args.checkpoint)
+        ckpt_type, x_global, m_global, v_global, seeds, saved_algo, global_lora_state, global_deltaW_state, lora_hparams = load_checkpoint_into_model(model, args.checkpoint)
         print(f'[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})')
 
     eval_algo = args.algo
     if eval_algo == 'auto':
-        if saved_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if saved_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora']:
             eval_algo = saved_algo
         else:
-            eval_algo = 'fedsubmuon' if (x_global is not None and seeds is not None) else 'ferret'
+            if global_lora_state is not None:
+                eval_algo = 'fedit'
+            elif global_deltaW_state is not None:
+                eval_algo = 'flora'
+            else:
+                eval_algo = 'fedsubmuon' if (x_global is not None and seeds is not None) else 'ferret'
+
+    # Align LoRA eval settings with saved checkpoint when available.
+    if isinstance(lora_hparams, dict) and len(lora_hparams) > 0:
+        if 'lora_r' in lora_hparams:
+            args.lora_r = int(lora_hparams['lora_r'])
+        if 'lora_alpha' in lora_hparams:
+            args.lora_alpha = float(lora_hparams['lora_alpha'])
+        if 'lora_dropout' in lora_hparams:
+            args.lora_dropout = float(lora_hparams['lora_dropout'])
+        if 'lora_target_modules' in lora_hparams:
+            args.lora_target_modules = lora_hparams['lora_target_modules']
+        if 'lora_bias' in lora_hparams:
+            args.lora_bias = lora_hparams['lora_bias']
 
     model = model.to(device)
     model.eval()
+    eval_model = model
 
     framework = None
     if eval_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
@@ -174,6 +214,17 @@ def main():
             trainable=False,
             v_state=v_global if eval_algo == 'fedsubadam' else None,
         )
+    elif eval_algo == 'fedit':
+        if global_lora_state is None:
+            raise ValueError('FedIT eval requires checkpoint with global_lora_state')
+        eval_model = build_lora_model(model, args)
+        load_lora_state(eval_model, global_lora_state)
+        eval_model = eval_model.to(device)
+        eval_model.eval()
+    elif eval_algo == 'flora':
+        # Flora checkpoints are evaluated from the saved backbone state.
+        # Current training already applies global delta to backbone each round.
+        eval_model = model
 
     result = None
     if args.eval_metric == 'loss':
@@ -187,7 +238,7 @@ def main():
                     'labels': batch['labels'].to(device),
                     'attention_mask': batch['attention_mask'].to(device),
                 }
-                outputs = model(**batch)
+                outputs = eval_model(**batch)
                 loss = outputs.loss
                 pbar.update(1)
                 if torch.isnan(loss):
@@ -212,7 +263,7 @@ def main():
                 for i in range(bs):
                     valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
                     valid_mask = torch.ones_like(valid_input, device=device)
-                    output_ids = model.generate(
+                    output_ids = eval_model.generate(
                         input_ids=valid_input,
                         attention_mask=valid_mask,
                         pad_token_id=tokenizer.pad_token_id,

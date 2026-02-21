@@ -103,6 +103,20 @@ class Server(object):
         os.makedirs(self.log_dir, exist_ok=True)
         return self.log_dir
 
+    def _apply_flora_delta_to_backbone(self):
+        if self.algo != 'flora' or len(self.global_deltaW_state) == 0:
+            return
+        name_to_module = dict(self.model.named_modules())
+        with torch.no_grad():
+            for layer_name, delta in self.global_deltaW_state.items():
+                module = name_to_module.get(layer_name, None)
+                if module is None or (not hasattr(module, 'weight')):
+                    continue
+                delta_tensor = delta.to(device=module.weight.device, dtype=module.weight.dtype)
+                if module.weight.shape != delta_tensor.shape:
+                    continue
+                module.weight.data.add_(delta_tensor * self.flora_scaling)
+
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
@@ -227,6 +241,7 @@ class Server(object):
                 module = module_map.get(layer_name, None)
                 target_dtype = module.weight.dtype if (module is not None and hasattr(module, 'weight')) else torch.float32
                 self.global_deltaW_state[layer_name] = delta.to(dtype=target_dtype).cpu()
+            self._apply_flora_delta_to_backbone()
             return
 
     def aggregate_seed_pool(self, selected_client_list, cur_round=1):
@@ -378,9 +393,6 @@ class Server(object):
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,
             )
-        elif self.algo == 'flora':
-            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            framework.set_flora_delta_state(self.global_deltaW_state, scaling=self.flora_scaling)
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         loss_total_eval = 0.0
@@ -408,7 +420,6 @@ class Server(object):
 
         if framework is not None:
             framework.clear_submuon_state()
-            framework.clear_flora_delta_state()
         if temp_eval_model:
             eval_model = eval_model.cpu()
             del eval_model
@@ -438,9 +449,6 @@ class Server(object):
                 trainable=False,
                 v_state=self.v_global if self.algo == 'fedsubadam' else None,
             )
-        elif self.algo == 'flora':
-            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            framework.set_flora_delta_state(self.global_deltaW_state, scaling=self.flora_scaling)
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         acc_total_eval = 0.0
@@ -469,7 +477,6 @@ class Server(object):
 
         if framework is not None:
             framework.clear_submuon_state()
-            framework.clear_flora_delta_state()
         if temp_eval_model:
             eval_model = eval_model.cpu()
             del eval_model

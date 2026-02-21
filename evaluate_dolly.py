@@ -60,8 +60,9 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_lora_state = payload.get('global_lora_state', None)
         global_deltaW_state = payload.get('global_deltaW_state', None)
         lora_hparams = payload.get('lora_hparams', {}) if isinstance(payload.get('lora_hparams', {}), dict) else {}
-        if isinstance(payload.get('hparams', {}), dict):
-            saved_algo = payload['hparams'].get('algo', None)
+        hparams = payload.get('hparams', None)
+        if isinstance(hparams, dict):
+            saved_algo = hparams.get('algo', None)
         if saved_algo is None:
             saved_algo = payload.get('algo', None)
 

@@ -209,16 +209,24 @@ class Server(object):
 
         if self.algo == 'flora':
             new_global_delta = {}
+            resolved_name_cache = {}
+            module_map = dict(self.model.named_modules())
             for client_idx, payload in enumerate(client_payloads):
                 w = float(weight_array[client_idx])
                 local_delta = compute_deltaw_from_lora_state(payload['lora_state'])
                 for layer_name, delta in local_delta.items():
-                    resolved_layer = resolve_layer_name_for_model(layer_name, self.model)
+                    if layer_name not in resolved_name_cache:
+                        resolved_name_cache[layer_name] = resolve_layer_name_for_model(layer_name, self.model)
+                    resolved_layer = resolved_name_cache[layer_name]
                     if resolved_layer not in new_global_delta:
                         new_global_delta[resolved_layer] = torch.zeros_like(delta, dtype=torch.float32)
                     new_global_delta[resolved_layer] += delta.to(dtype=torch.float32) * w
 
-            self.global_deltaW_state = {k: v.cpu() for k, v in new_global_delta.items()}
+            self.global_deltaW_state = {}
+            for layer_name, delta in new_global_delta.items():
+                module = module_map.get(layer_name, None)
+                target_dtype = module.weight.dtype if (module is not None and hasattr(module, 'weight')) else torch.float32
+                self.global_deltaW_state[layer_name] = delta.to(dtype=target_dtype).cpu()
             return
 
     def aggregate_seed_pool(self, selected_client_list, cur_round=1):

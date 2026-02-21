@@ -131,6 +131,15 @@ class FerretFramework(object):
         self.subadam_step = 0
 
     def clear_flora_delta_state(self):
+        with torch.no_grad():
+            for layer_name, delta_scaled in self._flora_delta.items():
+                try:
+                    module = self._resolve_module(layer_name)
+                except AttributeError:
+                    continue
+                if hasattr(module, 'weight') and module.weight.shape == delta_scaled.shape:
+                    module.weight.data.sub_(delta_scaled.to(device=module.weight.device, dtype=module.weight.dtype))
+
         for layer_name, orig_forward in self._orig_flora_forward.items():
             module = self._resolve_module(layer_name)
             module.forward = orig_forward
@@ -144,27 +153,24 @@ class FerretFramework(object):
             return
 
         self._flora_scaling = float(scaling)
-        for layer_name, delta in delta_state.items():
-            try:
-                module = self._resolve_module(layer_name)
-            except AttributeError:
-                continue
-            if layer_name in self._orig_flora_forward:
-                continue
+        with torch.no_grad():
+            for layer_name, delta in delta_state.items():
+                try:
+                    module = self._resolve_module(layer_name)
+                except AttributeError:
+                    continue
+                if not hasattr(module, 'weight'):
+                    continue
 
-            self._orig_flora_forward[layer_name] = module.forward
-            self._flora_delta[layer_name] = delta.detach().clone().to(dtype=torch.float32)
+                delta_scaled = (delta.detach().to(
+                    device=module.weight.device,
+                    dtype=module.weight.dtype,
+                ) * self._flora_scaling).contiguous()
 
-            def patched_forward(x, _module=module, _layer_name=layer_name):
-                input_shape = x.shape
-                x2 = x.reshape(-1, input_shape[-1])
-                y0 = F.linear(x2, _module.weight, _module.bias)
-                delta_tensor = self._flora_delta[_layer_name].to(device=x2.device, dtype=x2.dtype)
-                y1 = (x2 @ delta_tensor.t()) * self._flora_scaling
-                y = y0 + y1
-                return y.reshape(*input_shape[:-1], _module.out_features)
-
-            module.forward = patched_forward
+                if module.weight.shape != delta_scaled.shape:
+                    continue
+                module.weight.data.add_(delta_scaled)
+                self._flora_delta[layer_name] = delta_scaled
 
     def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None):
         if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:

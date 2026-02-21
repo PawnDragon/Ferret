@@ -109,6 +109,7 @@ if __name__ == '__main__':
 
     # Evaluation
     parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss'], help='metric to evaluate global model in the last round')
+    parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
     parser.add_argument('--final_eval_false', default=False, action='store_true', help='if true, skip final evaluation after training rounds')
 
     # Checkpoints
@@ -257,9 +258,13 @@ if __name__ == '__main__':
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
 
-            eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
-            eval_avg_acc.append(eval_result)
-            improved = server.save_best_submuon_ckpt(eval_result, r)
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = server.save_best_submuon_ckpt(eval_result, r)
 
             log_items = {
                 'round': r,
@@ -291,9 +296,13 @@ if __name__ == '__main__':
             server.aggregate_lora(client_payloads, selected_client)
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
-            eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
-            eval_avg_acc.append(eval_result)
-            improved = server.save_best_lora_ckpt(eval_result, r)
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = server.save_best_lora_ckpt(eval_result, r)
 
             log_items = {
                 'round': r,
@@ -335,8 +344,11 @@ if __name__ == '__main__':
             server.update_global_model_by_seed_pool()
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
-            eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
-            eval_avg_acc.append(eval_result)
+            if args.round_eval_false:
+                eval_result = float('nan')
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
             log_items = {
                 'round': r,
                 'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,

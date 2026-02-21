@@ -45,7 +45,12 @@ bash scripts/ferret.sh
 
 fedit-dolly
 ```
-python main.py --algo fedit --save --model /root/autodl-tmp/llama-3.2-1B/ --dataset dolly --lr 0.005 --log --device 0 --momentum 0.0 --n_accum 4 --equal_weight --seed 494 --lora_r 64 --lora_alpha 64 --rounds 60 --use_wandb --wandb_project ferret --wandb_run_name fedit_dolly --batch_or_epoch epoch
+python main.py --algo fedit --model /root/autodl-tmp/llama-3.2-1B/ --dataset dolly --lr 0.005 --log --device 0 --momentum 0.0 --n_accum 4 --equal_weight --seed 494 --lora_r 64 --lora_alpha 64 --rounds 60 --use_wandb --wandb_project ferret --wandb_run_name fedit_dolly --batch_or_epoch epoch --save
+```
+
+flora-dolly
+```
+python main.py --algo flora --model /root/autodl-tmp/llama-3.2-1B/ --dataset dolly --lr 0.005 --log --device 0 --momentum 0.0 --n_accum 4 --equal_weight --seed 494 --lora_r 64 --lora_alpha 64 --rounds 60 --use_wandb --wandb_project ferret --wandb_run_name flora_dolly --batch_or_epoch epoch --save
 ```
 
 ## BibTeX

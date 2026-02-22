@@ -82,6 +82,10 @@ class Server(object):
         self.global_lora_state = {}
         self.global_deltaW_state = {}
         self.flora_scaling = lora_scaling(self.args)
+        self.fedavg_weight_array = None
+        self.fedavg_accumulator = {}
+        self.fedavg_non_float_state = {}
+        self.fedavg_client_count = 0
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
@@ -133,7 +137,7 @@ class Server(object):
                 'backbone_state_dict': self.model.state_dict(),
                 'global_lora_state': self.get_fedit_broadcast_state(),
             }
-        if self.algo == 'flora':
+        if self.algo in ['flora', 'fedavg']:
             return {
                 'backbone_state_dict': self.model.state_dict(),
             }
@@ -145,6 +149,11 @@ class Server(object):
         if self.algo != 'fedit':
             return None
         return {k: v.clone() for k, v in self.global_lora_state.items()}
+
+    def get_fedavg_broadcast_state(self):
+        if self.algo != 'fedavg':
+            return None
+        return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
 
     def _get_client_weight_array(self, selected_client_list):
         if self.args.equal_weight:
@@ -243,6 +252,60 @@ class Server(object):
                 self.global_deltaW_state[layer_name] = delta.to(dtype=target_dtype).cpu()
             self._apply_flora_delta_to_backbone()
             return
+
+    def begin_fedavg_aggregation(self, selected_client_list):
+        self.fedavg_weight_array = self._get_client_weight_array(selected_client_list)
+        self.fedavg_accumulator = {}
+        self.fedavg_non_float_state = {}
+        self.fedavg_client_count = 0
+
+    def accumulate_fedavg_payload(self, payload, client_idx):
+        if self.algo != 'fedavg':
+            return
+        local_state = payload.get('model_state_dict', None)
+        if local_state is None:
+            return
+        weight = float(self.fedavg_weight_array[client_idx])
+        for key, tensor in local_state.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            tensor_cpu = tensor.detach().cpu()
+            if tensor_cpu.is_floating_point():
+                if key not in self.fedavg_accumulator:
+                    self.fedavg_accumulator[key] = torch.zeros_like(tensor_cpu, dtype=torch.float32)
+                self.fedavg_accumulator[key].add_(tensor_cpu.to(dtype=torch.float32), alpha=weight)
+            elif key not in self.fedavg_non_float_state:
+                self.fedavg_non_float_state[key] = tensor_cpu.clone()
+        self.fedavg_client_count += 1
+
+    def finalize_fedavg_aggregation(self):
+        if self.algo != 'fedavg' or self.fedavg_client_count == 0:
+            return
+
+        current_state = self.model.state_dict()
+        averaged_state = {}
+        for key, tensor in current_state.items():
+            if key in self.fedavg_accumulator:
+                averaged_state[key] = self.fedavg_accumulator[key].to(dtype=tensor.dtype)
+            elif key in self.fedavg_non_float_state:
+                averaged_state[key] = self.fedavg_non_float_state[key]
+            else:
+                averaged_state[key] = tensor.detach().cpu().clone()
+
+        self.model = self.model.cpu()
+        self.model.load_state_dict(averaged_state, strict=True)
+        self.fedavg_weight_array = None
+        self.fedavg_accumulator = {}
+        self.fedavg_non_float_state = {}
+        self.fedavg_client_count = 0
+
+    def aggregate_fedavg(self, client_payloads, selected_client_list):
+        if len(client_payloads) == 0:
+            return
+        self.begin_fedavg_aggregation(selected_client_list)
+        for client_idx, payload in enumerate(client_payloads):
+            self.accumulate_fedavg_payload(payload, client_idx)
+        self.finalize_fedavg_aggregation()
 
     def aggregate_seed_pool(self, selected_client_list, cur_round=1):
         for seed in self.candidate_seeds:
@@ -347,13 +410,44 @@ class Server(object):
             print(f'[ckpt] saved to: {best_ckpt_path}')
         return improved
 
+    def save_best_fedavg_ckpt(self, metric, cur_round):
+        if self.algo != 'fedavg' or not self.args.save:
+            return False
+
+        improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
+        if not improved:
+            return False
+
+        self.best_metric = metric
+        ckpt_path = os.path.join(self._get_ckpt_dir(), 'best.pt')
+        torch.save(
+            {
+                'algo': 'fedavg',
+                'backbone_state_dict': self.model.state_dict(),
+                'round': int(cur_round),
+                'best_metric': float(metric),
+                'hparams': {
+                    'lr': float(self.args.lr),
+                    'momentum': float(getattr(self.args, 'momentum', 0.0)),
+                    'weight_decay': float(getattr(self.args, 'weight_decay', 0.0)),
+                    'batch_or_epoch': self.args.batch_or_epoch,
+                    'local_step': int(getattr(self.args, 'local_step', 0)),
+                    'n_accum': int(getattr(self.args, 'n_accum', 1)),
+                    'max_grad_norm': float(getattr(self.args, 'max_grad_norm', -1.0)),
+                },
+            },
+            ckpt_path,
+        )
+        print(f'[ckpt] saved to: {ckpt_path}')
+        return True
+
     def eval(self, cur_round, eval_avg_acc):
         if self.args.eval_metric == 'loss':
             eval_metric = self.eval_loss(cur_round)
         else:
             eval_metric = self.eval_generate(cur_round)
 
-        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'] and cur_round > 0:
+        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedavg'] and cur_round > 0:
             save_dir = self.log_dir
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)

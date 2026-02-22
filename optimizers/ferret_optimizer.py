@@ -36,6 +36,13 @@ class FerretFramework(object):
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(self.model, self.args.rank_r)
+        elif self.algo == 'fedavg':
+            self.optim = torch.optim.SGD(
+                [p for _, p in self.named_parameters_to_optim],
+                lr=args.lr,
+                momentum=float(getattr(args, 'momentum', 0.0)),
+                weight_decay=args.weight_decay,
+            )
         else:
             self.optim = torch.optim.SGD(
                 [p for _, p in self.named_parameters_to_optim],
@@ -260,6 +267,20 @@ class FerretFramework(object):
                             continue
                         X.data.sub_(self.lr * grad.to(dtype=X.data.dtype))
                         X.grad = None
+            return logits.detach(), loss.detach()
+
+        if self.algo == 'fedavg':
+            (loss / self.args.n_accum).backward()
+
+            max_grad_norm = float(getattr(self.args, 'max_grad_norm', -1.0))
+            if max_grad_norm <= 0.0 and self.args.grad_clip > 0.0:
+                max_grad_norm = float(self.args.grad_clip)
+            if max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+            if apply_optim_step:
+                self.optim.step()
+                self.optim.zero_grad()
             return logits.detach(), loss.detach()
 
         (loss / self.args.n_accum).backward()

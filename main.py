@@ -43,7 +43,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'])
+    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedavg'])
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -73,6 +73,7 @@ if __name__ == '__main__':
     parser.add_argument('--momentum', type=float, default=0.9, help=r'momentum for SGD')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay in MeZO')
     parser.add_argument('--grad_clip', type=float, default=-100.0, help='clip the over large loss value, if < 0, disable this feature')
+    parser.add_argument('--max_grad_norm', type=float, default=-1.0, help='gradient clipping threshold for FedAvg; <=0 disables clipping')
 
     parser.add_argument('--K', type=int, default=4096, help='ratio of active clients in each round')
 
@@ -228,6 +229,8 @@ if __name__ == '__main__':
         server.save_best_submuon_ckpt(eval_result, 0)
     elif args.algo in ['fedit', 'flora']:
         server.save_best_lora_ckpt(eval_result, 0)
+    elif args.algo == 'fedavg':
+        server.save_best_fedavg_ckpt(eval_result, 0)
 
     if args.log:
         with open(os.path.join(log_dir, 'results.json'), 'w') as writer:
@@ -321,6 +324,44 @@ if __name__ == '__main__':
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
+        elif args.algo == 'fedavg':
+            broadcast_state = server.get_fedavg_broadcast_state()
+            total_comm_down_bytes = compute_comm_size({'backbone_state_dict': broadcast_state}) * len(selected_client)
+            server.begin_fedavg_aggregation(selected_client)
+            for client_idx, client in enumerate(selected_client):
+                payload = client.local_train_with_seed_pool(server.model, cur_round=r, fedavg_global_state=broadcast_state)
+                train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size(payload.get('model_state_dict', {}))
+                server.accumulate_fedavg_payload(payload, client_idx)
+
+            server.finalize_fedavg_aggregation()
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = server.save_best_fedavg_ckpt(eval_result, r)
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
         else:
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             for client in selected_client:
@@ -391,6 +432,8 @@ if __name__ == '__main__':
             server.save_best_submuon_ckpt(eval_result, args.rounds)
         elif args.algo in ['fedit', 'flora']:
             server.save_best_lora_ckpt(eval_result, args.rounds)
+        elif args.algo == 'fedavg':
+            server.save_best_fedavg_ckpt(eval_result, args.rounds)
 
         if args.log:
             with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:

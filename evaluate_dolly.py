@@ -68,6 +68,8 @@ def load_checkpoint_into_model(model, ckpt_path):
 
         if saved_algo in ['fedit', 'flora'] or global_lora_state is not None or global_deltaW_state is not None:
             ckpt_type = 'lora_best'
+        elif saved_algo == 'fedavg':
+            ckpt_type = 'fedavg_best'
         else:
             ckpt_type = 'fedsubmuon_best'
     elif isinstance(payload, dict):
@@ -98,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, default='')
-    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora'])
+    parser.add_argument('--algo', type=str, default='auto', choices=['auto', 'ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedavg'])
 
     # Data/eval args to keep dolly processing aligned with main.py
     parser.add_argument('--dataset', type=str, default='dolly', choices=['dolly'])
@@ -166,7 +168,7 @@ def main():
 
     eval_algo = args.algo
     if eval_algo == 'auto':
-        if saved_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora']:
+        if saved_algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedavg']:
             eval_algo = saved_algo
         else:
             if global_lora_state is not None:
@@ -225,6 +227,9 @@ def main():
     elif eval_algo == 'flora':
         # Flora checkpoints are evaluated from the saved backbone state.
         # Current training already applies global delta to backbone each round.
+        eval_model = model
+    elif eval_algo == 'fedavg':
+        # FedAvg checkpoints store the full global backbone state.
         eval_model = model
 
     result = None

@@ -127,6 +127,7 @@ if __name__ == '__main__':
 
     # Model
     parser.add_argument('--model', type=str, default='datajuicer/LLaMA-1B-dj-refine-150B')
+    parser.add_argument('--model_dtype', type=str, default='bf16', choices=['bf16', 'fp16', 'fp32'], help='model dtype for loading/training/eval')
 
     # Training
     parser.add_argument('--lr', type=float, default=0.001, help=r'learning rate \eta')
@@ -625,6 +626,7 @@ if __name__ == '__main__':
                 'beta': args.beta,
                 'ns_steps': args.ns_steps,
                 'weight_decay': args.weight_decay,
+                'model_dtype': args.model_dtype,
                 'n_accum': args.n_accum,
                 'grad_clip': args.grad_clip,
                 'lora_r': args.lora_r,

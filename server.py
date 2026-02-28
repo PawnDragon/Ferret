@@ -22,6 +22,7 @@ from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
     is_qwen3_model,
     maybe_print_qwen3_selfcheck,
+    resolve_torch_dtype,
     resolve_model_source,
 )
 
@@ -151,7 +152,7 @@ class Server(object):
         if is_qwen3:
             maybe_print_qwen3_selfcheck(self.tokenizer, model_source)
 
-        model_dtype = torch.float16
+        model_dtype = resolve_torch_dtype(getattr(self.args, 'model_dtype', 'bf16'))
         self.model = AutoModelForCausalLM.from_pretrained(
             model_source,
             device_map='cpu',

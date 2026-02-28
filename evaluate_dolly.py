@@ -12,7 +12,7 @@ from evaluations import rouge_score
 from optimizers.ferret_optimizer import FerretFramework
 from optimizers.lora_utils import build_lora_model, load_lora_state
 from utils_data.load_data import get_loaders
-from utils_data.model_loader import resolve_model_source
+from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
 
 def setup_seed(seed):
@@ -119,6 +119,12 @@ def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+    )
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument(
         "--algo",
@@ -192,10 +198,11 @@ def run_evaluate(args):
         )
 
     model_source = resolve_model_source(args.model)
+    model_dtype = resolve_torch_dtype(getattr(args, "model_dtype", "bf16"))
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         device_map="cpu",
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         trust_remote_code=True,
     )
 

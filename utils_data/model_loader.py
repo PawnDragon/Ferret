@@ -1,6 +1,7 @@
 import os
 import json
 from functools import lru_cache
+import torch
 
 _QWEN3_SELFCHECK_PRINTED = False
 
@@ -85,3 +86,21 @@ def maybe_print_qwen3_selfcheck(tokenizer, model_name_or_path):
         print(f'Qwen3 chat template preview: {preview[:200]}')
     except Exception as exc:
         print(f'[warn] Qwen3 chat template self-check failed: {exc}')
+
+
+def resolve_torch_dtype(model_dtype):
+    key = str(model_dtype).strip().lower()
+    mapping = {
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'fp16': torch.float16,
+        'float16': torch.float16,
+        'fp32': torch.float32,
+        'float32': torch.float32,
+    }
+    if key not in mapping:
+        raise ValueError(
+            f'Unsupported --model_dtype={model_dtype}. '
+            f'Use one of: bf16, fp16, fp32'
+        )
+    return mapping[key]

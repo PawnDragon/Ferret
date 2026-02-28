@@ -6,6 +6,85 @@ import torch.nn.functional as F
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
+def _to_python_int_step(step_value):
+    if isinstance(step_value, torch.Tensor):
+        if step_value.numel() == 0:
+            return 0
+        return int(step_value.item())
+    try:
+        return int(step_value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def export_named_adamw_state(model, optimizer):
+    named_state = {'state': {}}
+    if optimizer is None:
+        return named_state
+
+    id_to_name = {id(param): name for name, param in model.named_parameters()}
+    for param_obj, state in optimizer.state.items():
+        param_name = id_to_name.get(id(param_obj), None)
+        if param_name is None or (not isinstance(state, dict)):
+            continue
+
+        exp_avg = state.get('exp_avg', None)
+        exp_avg_sq = state.get('exp_avg_sq', None)
+        if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+            continue
+
+        state_entry = {
+            'step': _to_python_int_step(state.get('step', 0)),
+            'exp_avg': exp_avg.detach().cpu().clone(),
+            'exp_avg_sq': exp_avg_sq.detach().cpu().clone(),
+        }
+        max_exp_avg_sq = state.get('max_exp_avg_sq', None)
+        if isinstance(max_exp_avg_sq, torch.Tensor):
+            state_entry['max_exp_avg_sq'] = max_exp_avg_sq.detach().cpu().clone()
+
+        named_state['state'][param_name] = state_entry
+
+    return named_state
+
+
+def load_named_adamw_state(model, optimizer, named_state):
+    if optimizer is None or named_state is None:
+        return
+    if not isinstance(named_state, dict):
+        return
+    state_dict = named_state.get('state', {})
+    if not isinstance(state_dict, dict):
+        return
+
+    name_to_param = dict(model.named_parameters())
+    for param_name, state_entry in state_dict.items():
+        if not isinstance(state_entry, dict):
+            continue
+
+        param_obj = name_to_param.get(param_name, None)
+        if param_obj is None:
+            continue
+
+        exp_avg = state_entry.get('exp_avg', None)
+        exp_avg_sq = state_entry.get('exp_avg_sq', None)
+        if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+            continue
+
+        opt_state = optimizer.state[param_obj]
+        opt_state['exp_avg'] = exp_avg.detach().to(device=param_obj.device).clone()
+        opt_state['exp_avg_sq'] = exp_avg_sq.detach().to(device=param_obj.device).clone()
+        step_int = _to_python_int_step(state_entry.get('step', 0))
+        old_step = opt_state.get('step', None)
+        if isinstance(old_step, torch.Tensor):
+            opt_state['step'] = torch.tensor(step_int, device=old_step.device, dtype=old_step.dtype)
+        else:
+            opt_state['step'] = step_int
+
+        max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
+        if isinstance(max_exp_avg_sq, torch.Tensor):
+            opt_state['max_exp_avg_sq'] = max_exp_avg_sq.detach().to(device=param_obj.device).clone()
+
+
 class FerretFramework(object):
     def __init__(self, model, args, lr, candidate_seeds):
         self.args = args
@@ -37,11 +116,26 @@ class FerretFramework(object):
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(self.model, self.args.rank_r)
         elif self.algo == 'fedavg':
-            self.optim = torch.optim.SGD(
+            self.optim = torch.optim.AdamW(
                 [p for _, p in self.named_parameters_to_optim],
                 lr=args.lr,
-                momentum=float(getattr(args, 'momentum', 0.0)),
-                weight_decay=args.weight_decay,
+                betas=(
+                    float(getattr(args, 'adam_beta1', 0.9)),
+                    float(getattr(args, 'adam_beta2', 0.999)),
+                ),
+                eps=float(getattr(args, 'adam_eps', 1e-8)),
+                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
+            )
+        elif self.algo in ['fedit', 'flora']:
+            self.optim = torch.optim.AdamW(
+                [p for _, p in self.named_parameters_to_optim],
+                lr=args.lr,
+                betas=(
+                    float(getattr(args, 'adam_beta1', 0.9)),
+                    float(getattr(args, 'adam_beta2', 0.999)),
+                ),
+                eps=float(getattr(args, 'adam_eps', 1e-8)),
+                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
             )
         else:
             self.optim = torch.optim.SGD(
@@ -215,6 +309,12 @@ class FerretFramework(object):
             v_out = {k: v.detach().cpu().clone() for k, v in self.submuon_v.items()}
             return x_out, m_out, v_out
         return x_out, m_out
+
+    def get_named_optim_state(self):
+        return export_named_adamw_state(self.model, self.optim)
+
+    def load_named_optim_state(self, named_state):
+        load_named_adamw_state(self.model, self.optim, named_state)
 
     def step(self, batch, apply_optim_step=False):
         """

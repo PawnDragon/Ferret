@@ -132,6 +132,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.001, help=r'learning rate \eta')
     parser.add_argument('--momentum', type=float, default=0.9, help=r'momentum for SGD')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay in MeZO')
+    parser.add_argument('--adam_beta1', type=float, default=0.9, help='beta1 for AdamW in FedAvg/FedIT')
+    parser.add_argument('--adam_beta2', type=float, default=0.999, help='beta2 for AdamW in FedAvg/FedIT')
+    parser.add_argument('--adam_eps', type=float, default=1e-8, help='epsilon for AdamW in FedAvg/FedIT')
     parser.add_argument('--grad_clip', type=float, default=-100.0, help='clip the over large loss value, if < 0, disable this feature')
     parser.add_argument('--max_grad_norm', type=float, default=-1.0, help='gradient clipping threshold for FedAvg; <=0 disables clipping')
 
@@ -381,13 +384,27 @@ if __name__ == '__main__':
 
         elif args.algo in ['fedit', 'flora']:
             broadcast_lora = server.get_fedit_broadcast_state() if args.algo == 'fedit' else None
+            broadcast_named_optim_state = server.get_fedit_broadcast_optim_state() if args.algo == 'fedit' else None
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             client_payloads = []
             for client in selected_client:
-                payload = client.local_train_with_seed_pool(deepcopy(server.model), cur_round=r, lora_state=broadcast_lora)
+                payload = client.local_train_with_seed_pool(
+                    deepcopy(server.model),
+                    cur_round=r,
+                    lora_state=broadcast_lora,
+                    global_named_optim_state=broadcast_named_optim_state,
+                )
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                total_comm_up_bytes += compute_comm_size(payload.get('lora_state', {}))
+                if args.algo == 'fedit':
+                    total_comm_up_bytes += compute_comm_size(
+                        {
+                            'lora_state': payload.get('lora_state', {}),
+                            'named_optim_state': payload.get('named_optim_state', None),
+                        }
+                    )
+                else:
+                    total_comm_up_bytes += compute_comm_size(payload.get('lora_state', {}))
 
             server.aggregate_lora(client_payloads, selected_client)
             wall_clock = time.time() - round_start_time
@@ -428,12 +445,28 @@ if __name__ == '__main__':
 
         elif args.algo == 'fedavg':
             broadcast_state = server.get_fedavg_broadcast_state()
-            total_comm_down_bytes = compute_comm_size({'backbone_state_dict': broadcast_state}) * len(selected_client)
+            broadcast_named_optim_state = server.get_fedavg_broadcast_optim_state()
+            total_comm_down_bytes = compute_comm_size(
+                {
+                    'backbone_state_dict': broadcast_state,
+                    'global_named_optim_state': broadcast_named_optim_state,
+                }
+            ) * len(selected_client)
             server.begin_fedavg_aggregation(selected_client)
             for client_idx, client in enumerate(selected_client):
-                payload = client.local_train_with_seed_pool(server.model, cur_round=r, fedavg_global_state=broadcast_state)
+                payload = client.local_train_with_seed_pool(
+                    server.model,
+                    cur_round=r,
+                    fedavg_global_state=broadcast_state,
+                    global_named_optim_state=broadcast_named_optim_state,
+                )
                 train_losses.append(payload['loss'])
-                total_comm_up_bytes += compute_comm_size(payload.get('model_state_dict', {}))
+                total_comm_up_bytes += compute_comm_size(
+                    {
+                        'model_state_dict': payload.get('model_state_dict', {}),
+                        'named_optim_state': payload.get('named_optim_state', None),
+                    }
+                )
                 server.accumulate_fedavg_payload(payload, client_idx)
 
             server.finalize_fedavg_aggregation()

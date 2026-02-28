@@ -38,6 +38,83 @@ def min_max_norm(vec):
     return (vec - min_val) / (np.max(vec) + 1e-10 - min_val)
 
 
+def _as_python_int(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0
+        return int(value.item())
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def aggregate_named_adamw_states(named_states_list, weights):
+    aggregated_state = {}
+    weight_sums = {}
+    step_max = {}
+    max_exp_avg_sq_weight_sums = {}
+
+    for client_idx, named_state in enumerate(named_states_list):
+        if not isinstance(named_state, dict):
+            continue
+        state_dict = named_state.get('state', {})
+        if not isinstance(state_dict, dict):
+            continue
+        weight = float(weights[client_idx])
+        if weight <= 0.0:
+            continue
+
+        for param_name, state_entry in state_dict.items():
+            if not isinstance(state_entry, dict):
+                continue
+            exp_avg = state_entry.get('exp_avg', None)
+            exp_avg_sq = state_entry.get('exp_avg_sq', None)
+            if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+                continue
+
+            if param_name not in aggregated_state:
+                aggregated_state[param_name] = {
+                    'exp_avg': torch.zeros_like(exp_avg.detach().cpu(), dtype=torch.float32),
+                    'exp_avg_sq': torch.zeros_like(exp_avg_sq.detach().cpu(), dtype=torch.float32),
+                }
+                weight_sums[param_name] = 0.0
+                step_max[param_name] = 0
+
+            aggregated_state[param_name]['exp_avg'].add_(exp_avg.detach().cpu().to(dtype=torch.float32), alpha=weight)
+            aggregated_state[param_name]['exp_avg_sq'].add_(exp_avg_sq.detach().cpu().to(dtype=torch.float32), alpha=weight)
+            weight_sums[param_name] += weight
+            step_max[param_name] = max(step_max[param_name], _as_python_int(state_entry.get('step', 0)))
+
+            max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
+            if isinstance(max_exp_avg_sq, torch.Tensor):
+                if 'max_exp_avg_sq' not in aggregated_state[param_name]:
+                    aggregated_state[param_name]['max_exp_avg_sq'] = torch.zeros_like(
+                        max_exp_avg_sq.detach().cpu(),
+                        dtype=torch.float32,
+                    )
+                    max_exp_avg_sq_weight_sums[param_name] = 0.0
+                aggregated_state[param_name]['max_exp_avg_sq'].add_(
+                    max_exp_avg_sq.detach().cpu().to(dtype=torch.float32),
+                    alpha=weight,
+                )
+                max_exp_avg_sq_weight_sums[param_name] += weight
+
+    out_state = {'state': {}}
+    for param_name, state_entry in aggregated_state.items():
+        denom = max(float(weight_sums.get(param_name, 0.0)), 1e-12)
+        out_entry = {
+            'step': int(step_max.get(param_name, 0)),
+            'exp_avg': (state_entry['exp_avg'] / denom).contiguous(),
+            'exp_avg_sq': (state_entry['exp_avg_sq'] / denom).contiguous(),
+        }
+        if 'max_exp_avg_sq' in state_entry:
+            max_denom = max(float(max_exp_avg_sq_weight_sums.get(param_name, 0.0)), 1e-12)
+            out_entry['max_exp_avg_sq'] = (state_entry['max_exp_avg_sq'] / max_denom).contiguous()
+        out_state['state'][param_name] = out_entry
+    return out_state
+
+
 class Server(object):
     def __init__(self, args, eval_loader, candidate_seeds, log_dir):
         self.args = args
@@ -96,7 +173,13 @@ class Server(object):
         self.fedavg_weight_array = None
         self.fedavg_accumulator = {}
         self.fedavg_non_float_state = {}
+        self.fedavg_named_optim_accumulator = {}
+        self.fedavg_named_optim_weight_sums = {}
+        self.fedavg_named_optim_maxsq_weight_sums = {}
+        self.fedavg_named_optim_step_max = {}
         self.fedavg_client_count = 0
+        self.global_named_optim_state = {'state': {}}
+        self._optim_debug_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
@@ -132,6 +215,51 @@ class Server(object):
                     continue
                 module.weight.data.add_(delta_tensor * self.flora_scaling)
 
+    def _clone_named_optim_state(self):
+        out = {'state': {}}
+        if not isinstance(self.global_named_optim_state, dict):
+            return out
+        state_dict = self.global_named_optim_state.get('state', {})
+        if not isinstance(state_dict, dict):
+            return out
+        for name, state_entry in state_dict.items():
+            if not isinstance(state_entry, dict):
+                continue
+            exp_avg = state_entry.get('exp_avg', None)
+            exp_avg_sq = state_entry.get('exp_avg_sq', None)
+            if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+                continue
+            out_entry = {
+                'step': int(_as_python_int(state_entry.get('step', 0))),
+                'exp_avg': exp_avg.detach().cpu().clone(),
+                'exp_avg_sq': exp_avg_sq.detach().cpu().clone(),
+            }
+            max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
+            if isinstance(max_exp_avg_sq, torch.Tensor):
+                out_entry['max_exp_avg_sq'] = max_exp_avg_sq.detach().cpu().clone()
+            out['state'][name] = out_entry
+        return out
+
+    def _maybe_log_global_optim_state(self, tag):
+        if self._optim_debug_logged:
+            return
+        if not isinstance(self.global_named_optim_state, dict):
+            return
+        state_dict = self.global_named_optim_state.get('state', {})
+        if not isinstance(state_dict, dict) or len(state_dict) == 0:
+            return
+        sampled_name = sorted(state_dict.keys())[0]
+        sampled_entry = state_dict[sampled_name]
+        exp_avg = sampled_entry.get('exp_avg', None)
+        exp_avg_sq = sampled_entry.get('exp_avg_sq', None)
+        if isinstance(exp_avg, torch.Tensor) and isinstance(exp_avg_sq, torch.Tensor):
+            print(
+                f'[debug][server][{tag}] aggregated optim state @ {sampled_name}: '
+                f'exp_avg.norm={float(exp_avg.norm().item()):.6e}, '
+                f'exp_avg_sq.norm={float(exp_avg_sq.norm().item()):.6e}'
+            )
+            self._optim_debug_logged = True
+
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
@@ -147,8 +275,14 @@ class Server(object):
             return {
                 'backbone_state_dict': self.model.state_dict(),
                 'global_lora_state': self.get_fedit_broadcast_state(),
+                'global_named_optim_state': self.get_fedit_broadcast_optim_state(),
             }
-        if self.algo in ['flora', 'fedavg']:
+        if self.algo == 'fedavg':
+            return {
+                'backbone_state_dict': self.model.state_dict(),
+                'global_named_optim_state': self.get_fedavg_broadcast_optim_state(),
+            }
+        if self.algo == 'flora':
             return {
                 'backbone_state_dict': self.model.state_dict(),
             }
@@ -161,10 +295,20 @@ class Server(object):
             return None
         return {k: v.clone() for k, v in self.global_lora_state.items()}
 
+    def get_fedit_broadcast_optim_state(self):
+        if self.algo != 'fedit':
+            return None
+        return self._clone_named_optim_state()
+
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
             return None
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+
+    def get_fedavg_broadcast_optim_state(self):
+        if self.algo != 'fedavg':
+            return None
+        return self._clone_named_optim_state()
 
     def _get_client_weight_array(self, selected_client_list):
         if self.args.equal_weight:
@@ -239,6 +383,9 @@ class Server(object):
                 for key in state_keys:
                     new_global_lora[key] += local_state[key].to(dtype=torch.float32) * w
             self.global_lora_state = {k: v.cpu() for k, v in new_global_lora.items()}
+            client_named_states = [payload.get('named_optim_state', None) for payload in client_payloads]
+            self.global_named_optim_state = aggregate_named_adamw_states(client_named_states, weight_array)
+            self._maybe_log_global_optim_state(tag='fedit')
             return
 
         if self.algo == 'flora':
@@ -264,10 +411,65 @@ class Server(object):
             self._apply_flora_delta_to_backbone()
             return
 
+    def _accumulate_fedavg_named_optim_state(self, named_state, weight):
+        if not isinstance(named_state, dict):
+            return
+        state_dict = named_state.get('state', {})
+        if not isinstance(state_dict, dict):
+            return
+
+        for param_name, state_entry in state_dict.items():
+            if not isinstance(state_entry, dict):
+                continue
+            exp_avg = state_entry.get('exp_avg', None)
+            exp_avg_sq = state_entry.get('exp_avg_sq', None)
+            if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+                continue
+
+            if param_name not in self.fedavg_named_optim_accumulator:
+                self.fedavg_named_optim_accumulator[param_name] = {
+                    'exp_avg': torch.zeros_like(exp_avg.detach().cpu(), dtype=torch.float32),
+                    'exp_avg_sq': torch.zeros_like(exp_avg_sq.detach().cpu(), dtype=torch.float32),
+                }
+                self.fedavg_named_optim_weight_sums[param_name] = 0.0
+                self.fedavg_named_optim_step_max[param_name] = 0
+
+            self.fedavg_named_optim_accumulator[param_name]['exp_avg'].add_(
+                exp_avg.detach().cpu().to(dtype=torch.float32),
+                alpha=float(weight),
+            )
+            self.fedavg_named_optim_accumulator[param_name]['exp_avg_sq'].add_(
+                exp_avg_sq.detach().cpu().to(dtype=torch.float32),
+                alpha=float(weight),
+            )
+            self.fedavg_named_optim_weight_sums[param_name] += float(weight)
+            self.fedavg_named_optim_step_max[param_name] = max(
+                int(self.fedavg_named_optim_step_max[param_name]),
+                int(_as_python_int(state_entry.get('step', 0))),
+            )
+
+            max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
+            if isinstance(max_exp_avg_sq, torch.Tensor):
+                if 'max_exp_avg_sq' not in self.fedavg_named_optim_accumulator[param_name]:
+                    self.fedavg_named_optim_accumulator[param_name]['max_exp_avg_sq'] = torch.zeros_like(
+                        max_exp_avg_sq.detach().cpu(),
+                        dtype=torch.float32,
+                    )
+                    self.fedavg_named_optim_maxsq_weight_sums[param_name] = 0.0
+                self.fedavg_named_optim_accumulator[param_name]['max_exp_avg_sq'].add_(
+                    max_exp_avg_sq.detach().cpu().to(dtype=torch.float32),
+                    alpha=float(weight),
+                )
+                self.fedavg_named_optim_maxsq_weight_sums[param_name] += float(weight)
+
     def begin_fedavg_aggregation(self, selected_client_list):
         self.fedavg_weight_array = self._get_client_weight_array(selected_client_list)
         self.fedavg_accumulator = {}
         self.fedavg_non_float_state = {}
+        self.fedavg_named_optim_accumulator = {}
+        self.fedavg_named_optim_weight_sums = {}
+        self.fedavg_named_optim_maxsq_weight_sums = {}
+        self.fedavg_named_optim_step_max = {}
         self.fedavg_client_count = 0
 
     def accumulate_fedavg_payload(self, payload, client_idx):
@@ -287,6 +489,7 @@ class Server(object):
                 self.fedavg_accumulator[key].add_(tensor_cpu.to(dtype=torch.float32), alpha=weight)
             elif key not in self.fedavg_non_float_state:
                 self.fedavg_non_float_state[key] = tensor_cpu.clone()
+        self._accumulate_fedavg_named_optim_state(payload.get('named_optim_state', None), weight)
         self.fedavg_client_count += 1
 
     def finalize_fedavg_aggregation(self):
@@ -305,9 +508,27 @@ class Server(object):
 
         self.model = self.model.cpu()
         self.model.load_state_dict(averaged_state, strict=True)
+        global_named_state = {'state': {}}
+        for param_name, state_entry in self.fedavg_named_optim_accumulator.items():
+            denom = max(float(self.fedavg_named_optim_weight_sums.get(param_name, 0.0)), 1e-12)
+            out_entry = {
+                'step': int(self.fedavg_named_optim_step_max.get(param_name, 0)),
+                'exp_avg': (state_entry['exp_avg'] / denom).contiguous(),
+                'exp_avg_sq': (state_entry['exp_avg_sq'] / denom).contiguous(),
+            }
+            if 'max_exp_avg_sq' in state_entry:
+                max_denom = max(float(self.fedavg_named_optim_maxsq_weight_sums.get(param_name, 0.0)), 1e-12)
+                out_entry['max_exp_avg_sq'] = (state_entry['max_exp_avg_sq'] / max_denom).contiguous()
+            global_named_state['state'][param_name] = out_entry
+        self.global_named_optim_state = global_named_state
+        self._maybe_log_global_optim_state(tag='fedavg')
         self.fedavg_weight_array = None
         self.fedavg_accumulator = {}
         self.fedavg_non_float_state = {}
+        self.fedavg_named_optim_accumulator = {}
+        self.fedavg_named_optim_weight_sums = {}
+        self.fedavg_named_optim_maxsq_weight_sums = {}
+        self.fedavg_named_optim_step_max = {}
         self.fedavg_client_count = 0
 
     def aggregate_fedavg(self, client_payloads, selected_client_list):
@@ -439,7 +660,9 @@ class Server(object):
                 'best_metric': float(metric),
                 'hparams': {
                     'lr': float(self.args.lr),
-                    'momentum': float(getattr(self.args, 'momentum', 0.0)),
+                    'adam_beta1': float(getattr(self.args, 'adam_beta1', 0.9)),
+                    'adam_beta2': float(getattr(self.args, 'adam_beta2', 0.999)),
+                    'adam_eps': float(getattr(self.args, 'adam_eps', 1e-8)),
                     'weight_decay': float(getattr(self.args, 'weight_decay', 0.0)),
                     'batch_or_epoch': self.args.batch_or_epoch,
                     'local_step': int(getattr(self.args, 'local_step', 0)),

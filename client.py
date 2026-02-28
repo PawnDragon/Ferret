@@ -18,6 +18,7 @@ class Client(object):
         else:
             self.device = torch.device('cpu')
         self.candidate_seeds = candidate_seeds
+        self._optim_debug_logged = False
 
     def _next_batch(self):
         try:
@@ -31,7 +32,38 @@ class Client(object):
             'attention_mask': batch['attention_mask'].to(self.device),
         }
 
-    def local_train_with_seed_pool(self, pulled_model, cur_round, submuon_state=None, lora_state=None, fedavg_global_state=None):
+    def _maybe_log_loaded_named_state(self, framework, named_state, cur_round, tag):
+        if self._optim_debug_logged or self.idx != 0:
+            return
+        if not isinstance(named_state, dict):
+            return
+        state_dict = named_state.get('state', {})
+        if not isinstance(state_dict, dict) or len(state_dict) == 0:
+            return
+        sampled_name = sorted(state_dict.keys())[0]
+        param_obj = dict(framework.model.named_parameters()).get(sampled_name, None)
+        if param_obj is None:
+            return
+        opt_state = framework.optim.state.get(param_obj, {})
+        exp_avg = opt_state.get('exp_avg', None)
+        exp_avg_sq = opt_state.get('exp_avg_sq', None)
+        if isinstance(exp_avg, torch.Tensor) and isinstance(exp_avg_sq, torch.Tensor):
+            print(
+                f'[debug][client{self.idx}][{tag}] loaded optim state @ {sampled_name}: '
+                f'exp_avg.norm={float(exp_avg.norm().item()):.6e}, '
+                f'exp_avg_sq.norm={float(exp_avg_sq.norm().item()):.6e}'
+            )
+            self._optim_debug_logged = True
+
+    def local_train_with_seed_pool(
+        self,
+        pulled_model,
+        cur_round,
+        submuon_state=None,
+        lora_state=None,
+        fedavg_global_state=None,
+        global_named_optim_state=None,
+    ):
         self.model = pulled_model
         self.model.to(self.device)
 
@@ -105,6 +137,9 @@ class Client(object):
                 load_lora_state(self.model, lora_state)
 
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            if getattr(self.args, 'algo', 'ferret') == 'fedit' and global_named_optim_state is not None:
+                framework.load_named_optim_state(global_named_optim_state)
+                self._maybe_log_loaded_named_state(framework, global_named_optim_state, cur_round, tag='fedit')
             self.model.train()
             self.model.zero_grad()
 
@@ -147,14 +182,22 @@ class Client(object):
                     )
 
             local_lora_state = extract_lora_state(self.model)
+            named_optim_state = framework.get_named_optim_state() if getattr(self.args, 'algo', 'ferret') == 'fedit' else None
             self.model = None
-            return {'lora_state': local_lora_state, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
+            return {
+                'lora_state': local_lora_state,
+                'named_optim_state': named_optim_state,  # FLoRA keeps per-round re-init, no aligned optimizer state upload.
+                'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+            }
 
         if getattr(self.args, 'algo', 'ferret') == 'fedavg':
             if fedavg_global_state is not None:
                 self.model.load_state_dict(fedavg_global_state, strict=True)
 
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            if global_named_optim_state is not None:
+                framework.load_named_optim_state(global_named_optim_state)
+                self._maybe_log_loaded_named_state(framework, global_named_optim_state, cur_round, tag='fedavg')
             self.model.train()
             self.model.zero_grad()
 
@@ -200,8 +243,13 @@ class Client(object):
             for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, torch.Tensor):
                     local_state[name] = tensor.detach().cpu().clone()
+            named_optim_state = framework.get_named_optim_state()
             self.model = None
-            return {'model_state_dict': local_state, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
+            return {
+                'model_state_dict': local_state,
+                'named_optim_state': named_optim_state,
+                'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+            }
 
         old_params = [(name, deepcopy(param.data)) for name, param in self.model.named_parameters() if param.requires_grad]
 

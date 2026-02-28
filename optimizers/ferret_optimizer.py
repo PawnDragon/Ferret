@@ -1,4 +1,5 @@
 import random
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,10 @@ def _to_python_int_step(step_value):
         return 0
 
 
+def _is_finite_tensor(tensor):
+    return isinstance(tensor, torch.Tensor) and bool(torch.isfinite(tensor).all().item())
+
+
 def export_named_adamw_state(model, optimizer):
     named_state = {'state': {}}
     if optimizer is None:
@@ -31,6 +36,8 @@ def export_named_adamw_state(model, optimizer):
         exp_avg = state.get('exp_avg', None)
         exp_avg_sq = state.get('exp_avg_sq', None)
         if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+            continue
+        if (not _is_finite_tensor(exp_avg)) or (not _is_finite_tensor(exp_avg_sq)):
             continue
 
         state_entry = {
@@ -68,6 +75,8 @@ def load_named_adamw_state(model, optimizer, named_state):
         exp_avg = state_entry.get('exp_avg', None)
         exp_avg_sq = state_entry.get('exp_avg_sq', None)
         if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+            continue
+        if (not _is_finite_tensor(exp_avg)) or (not _is_finite_tensor(exp_avg_sq)):
             continue
 
         opt_state = optimizer.state[param_obj]
@@ -111,6 +120,13 @@ class FerretFramework(object):
         self._flora_delta = {}
         self._flora_scaling = 1.0
         self._orig_flora_forward = {}
+        self.runtime_client_idx = int(getattr(args, '_runtime_client_idx', -1))
+        self.runtime_round_idx = int(getattr(args, '_runtime_round_idx', -1))
+        self.debug_nan = bool(getattr(args, 'debug_nan', False))
+        self.debug_nan_first_steps = max(int(getattr(args, 'debug_nan_first_steps', 1)), 0)
+        self.debug_nan_client_idx = int(getattr(args, 'debug_nan_client_idx', 0))
+        self.debug_nan_skip_optim = bool(getattr(args, 'debug_nan_skip_optim', False))
+        self._local_step_counter = 0
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
@@ -316,11 +332,144 @@ class FerretFramework(object):
     def load_named_optim_state(self, named_state):
         load_named_adamw_state(self.model, self.optim, named_state)
 
+    def _debug_active_for_this_client(self):
+        if not self.debug_nan:
+            return False
+        if self.debug_nan_client_idx < 0:
+            return True
+        return self.runtime_client_idx == self.debug_nan_client_idx
+
+    def _should_trace_this_step(self):
+        if not self._debug_active_for_this_client():
+            return False
+        return self._local_step_counter <= self.debug_nan_first_steps
+
+    def _safe_tensor_stats(self, tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return {'shape': None, 'finite_ratio': float('nan'), 'abs_max': float('nan'), 'mean': float('nan')}
+        data = tensor.detach()
+        finite_mask = torch.isfinite(data)
+        finite_ratio = float(finite_mask.float().mean().item())
+        finite_vals = data[finite_mask]
+        if finite_vals.numel() == 0:
+            return {'shape': tuple(data.shape), 'finite_ratio': finite_ratio, 'abs_max': float('nan'), 'mean': float('nan')}
+        finite_vals = finite_vals.float()
+        return {
+            'shape': tuple(data.shape),
+            'finite_ratio': finite_ratio,
+            'abs_max': float(finite_vals.abs().max().item()),
+            'mean': float(finite_vals.mean().item()),
+        }
+
+    def _batch_debug_summary(self, batch):
+        labels = batch.get('labels', None)
+        input_ids = batch.get('input_ids', None)
+        attention_mask = batch.get('attention_mask', None)
+        vocab_size = int(getattr(getattr(self.model, 'config', None), 'vocab_size', -1))
+
+        valid_label_count = -1
+        valid_label_min = None
+        valid_label_max = None
+        if isinstance(labels, torch.Tensor):
+            valid_mask = labels.ne(-100)
+            valid_label_count = int(valid_mask.sum().item())
+            if valid_label_count > 0:
+                valid_vals = labels[valid_mask]
+                valid_label_min = int(valid_vals.min().item())
+                valid_label_max = int(valid_vals.max().item())
+
+        attention_tokens = int(attention_mask.sum().item()) if isinstance(attention_mask, torch.Tensor) else -1
+        input_min = int(input_ids.min().item()) if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0 else None
+        input_max = int(input_ids.max().item()) if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0 else None
+        oov_count = 0
+        if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0 and vocab_size > 0:
+            oov_mask = (input_ids < 0) | (input_ids >= vocab_size)
+            oov_count = int(oov_mask.sum().item())
+
+        return {
+            'input_shape': tuple(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None,
+            'labels_shape': tuple(labels.shape) if isinstance(labels, torch.Tensor) else None,
+            'attention_shape': tuple(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else None,
+            'attention_tokens': attention_tokens,
+            'input_min': input_min,
+            'input_max': input_max,
+            'valid_label_count': valid_label_count,
+            'valid_label_min': valid_label_min,
+            'valid_label_max': valid_label_max,
+            'vocab_size': vocab_size,
+            'oov_count': oov_count,
+        }
+
+    def _grad_debug_summary(self):
+        total_grad_params = 0
+        nonfinite_grad_names = []
+        total_sq = 0.0
+        max_abs = 0.0
+
+        for name, param in self.named_parameters_to_optim:
+            grad = param.grad
+            if grad is None:
+                continue
+            total_grad_params += 1
+            grad_data = grad.detach()
+            finite_mask = torch.isfinite(grad_data)
+            if not bool(finite_mask.all().item()):
+                if len(nonfinite_grad_names) < 8:
+                    nonfinite_grad_names.append(name)
+            finite_vals = grad_data[finite_mask]
+            if finite_vals.numel() > 0:
+                finite_vals = finite_vals.float()
+                total_sq += float((finite_vals * finite_vals).sum().item())
+                max_abs = max(max_abs, float(finite_vals.abs().max().item()))
+
+        grad_global_norm = math.sqrt(max(total_sq, 0.0))
+        return {
+            'total_grad_params': int(total_grad_params),
+            'nonfinite_grad_count': int(len(nonfinite_grad_names)),
+            'nonfinite_grad_names': nonfinite_grad_names,
+            'grad_global_norm': float(grad_global_norm),
+            'grad_abs_max': float(max_abs),
+        }
+
+    def _print_forward_debug(self, batch, logits, loss, stage):
+        batch_summary = self._batch_debug_summary(batch)
+        logits_stats = self._safe_tensor_stats(logits)
+        loss_val = float(loss.detach().item()) if isinstance(loss, torch.Tensor) and loss.numel() == 1 else float('nan')
+        print(
+            f'[nan-debug][{self.algo}] stage={stage} client={self.runtime_client_idx} round={self.runtime_round_idx} '
+            f'local_step={self._local_step_counter} loss={loss_val:.6e} '
+            f'logits_finite_ratio={logits_stats["finite_ratio"]:.6f} logits_abs_max={logits_stats["abs_max"]:.6e} '
+            f'valid_labels={batch_summary["valid_label_count"]} attention_tokens={batch_summary["attention_tokens"]} '
+            f'input_id_range=({batch_summary["input_min"]},{batch_summary["input_max"]}) '
+            f'oov_tokens={batch_summary["oov_count"]} vocab_size={batch_summary["vocab_size"]}'
+        )
+        if batch_summary['valid_label_count'] == 0:
+            print('[nan-debug] warning: valid_labels=0 (all labels are ignore_index=-100), CE loss can become NaN.')
+
+    def _print_grad_debug(self, grad_summary, stage):
+        print(
+            f'[nan-debug][{self.algo}] stage={stage} client={self.runtime_client_idx} round={self.runtime_round_idx} '
+            f'local_step={self._local_step_counter} grad_params={grad_summary["total_grad_params"]} '
+            f'grad_global_norm={grad_summary["grad_global_norm"]:.6e} grad_abs_max={grad_summary["grad_abs_max"]:.6e} '
+            f'nonfinite_grad_count={grad_summary["nonfinite_grad_count"]}'
+        )
+        if grad_summary['nonfinite_grad_count'] > 0:
+            print(f'[nan-debug] nonfinite_grad_names(head): {grad_summary["nonfinite_grad_names"]}')
+
     def step(self, batch, apply_optim_step=False):
         """
         Perform a training step.
         """
+        self._local_step_counter += 1
         logits, loss = self.forward(batch)
+        if self._should_trace_this_step():
+            self._print_forward_debug(batch, logits, loss, stage='forward_trace')
+        if (not torch.isfinite(loss).all().item()) and self._debug_active_for_this_client():
+            self._print_forward_debug(batch, logits, loss, stage='nonfinite_loss')
+            if self.debug_nan_skip_optim:
+                if self.optim is not None:
+                    self.optim.zero_grad()
+                return logits.detach(), loss.detach()
 
         if self.algo == 'fedsubmuon':
             (loss / self.args.n_accum).backward()
@@ -371,6 +520,15 @@ class FerretFramework(object):
 
         if self.algo == 'fedavg':
             (loss / self.args.n_accum).backward()
+            grad_summary = self._grad_debug_summary() if self._debug_active_for_this_client() else None
+            if grad_summary is not None and self._should_trace_this_step():
+                self._print_grad_debug(grad_summary, stage='grad_trace')
+            if grad_summary is not None and grad_summary['nonfinite_grad_count'] > 0 and (not self._should_trace_this_step()):
+                self._print_grad_debug(grad_summary, stage='nonfinite_grad')
+            if grad_summary is not None and grad_summary['nonfinite_grad_count'] > 0 and self.debug_nan_skip_optim:
+                if self.optim is not None:
+                    self.optim.zero_grad()
+                return logits.detach(), loss.detach()
 
             max_grad_norm = float(getattr(self.args, 'max_grad_norm', -1.0))
             if max_grad_norm <= 0.0 and self.args.grad_clip > 0.0:
@@ -384,6 +542,15 @@ class FerretFramework(object):
             return logits.detach(), loss.detach()
 
         (loss / self.args.n_accum).backward()
+        grad_summary = self._grad_debug_summary() if self._debug_active_for_this_client() else None
+        if grad_summary is not None and self._should_trace_this_step():
+            self._print_grad_debug(grad_summary, stage='grad_trace')
+        if grad_summary is not None and grad_summary['nonfinite_grad_count'] > 0 and (not self._should_trace_this_step()):
+            self._print_grad_debug(grad_summary, stage='nonfinite_grad')
+        if grad_summary is not None and grad_summary['nonfinite_grad_count'] > 0 and self.debug_nan_skip_optim:
+            if self.optim is not None:
+                self.optim.zero_grad()
+            return logits.detach(), loss.detach()
 
         if self.args.grad_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)

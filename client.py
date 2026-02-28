@@ -20,6 +20,11 @@ class Client(object):
         self.candidate_seeds = candidate_seeds
         self._optim_debug_logged = False
 
+    def _set_runtime_debug_context(self, cur_round):
+        # Shared args object carries lightweight runtime context for framework-level debug prints.
+        setattr(self.args, '_runtime_client_idx', int(self.idx))
+        setattr(self.args, '_runtime_round_idx', int(cur_round))
+
     def _next_batch(self):
         try:
             batch = next(self.train_iterator)
@@ -68,6 +73,7 @@ class Client(object):
         self.model.to(self.device)
 
         if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+            self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 x_state=submuon_state['x_global'],
@@ -93,7 +99,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -107,7 +113,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -136,6 +142,7 @@ class Client(object):
             if getattr(self.args, 'algo', 'ferret') == 'fedit':
                 load_lora_state(self.model, lora_state)
 
+            self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             if getattr(self.args, 'algo', 'ferret') == 'fedit' and global_named_optim_state is not None:
                 framework.load_named_optim_state(global_named_optim_state)
@@ -162,7 +169,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -174,7 +181,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -194,6 +201,7 @@ class Client(object):
             if fedavg_global_state is not None:
                 self.model.load_state_dict(fedavg_global_state, strict=True)
 
+            self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             if global_named_optim_state is not None:
                 framework.load_named_optim_state(global_named_optim_state)
@@ -220,7 +228,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -232,7 +240,7 @@ class Client(object):
                     apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
                     _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                     progress_bar.update(1)
-                    if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                         loss_total_train += loss
                         num_trained += len(batch['input_ids'])
                     progress_bar.set_description(
@@ -264,6 +272,7 @@ class Client(object):
             iter_steps = self.args.local_step
 
         # Ferret Framework
+        self._set_runtime_debug_context(cur_round)
         framework = FerretFramework(self.model, args=self.args, lr=lr, candidate_seeds=self.candidate_seeds)
         self.model.train()
         self.model.zero_grad()
@@ -284,7 +293,7 @@ class Client(object):
                     apply_optim_step = False
                 _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
                 progress_bar.update(1)
-                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                     loss_total_train += loss
                     num_trained += len(batch['input_ids'])
                 progress_bar.set_description(
@@ -303,7 +312,7 @@ class Client(object):
                 _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
 
                 progress_bar.update(1)
-                if (not torch.isnan(loss)) and (self.args.grad_clip <= 0 or loss != 0.0):
+                if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
                     loss_total_train += loss
                     num_trained += len(batch['input_ids'])
                 progress_bar.set_description(

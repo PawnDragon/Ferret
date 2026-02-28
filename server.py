@@ -49,6 +49,10 @@ def _as_python_int(value):
         return 0
 
 
+def _is_finite_tensor(tensor):
+    return isinstance(tensor, torch.Tensor) and bool(torch.isfinite(tensor).all().item())
+
+
 def aggregate_named_adamw_states(named_states_list, weights):
     aggregated_state = {}
     weight_sums = {}
@@ -71,6 +75,8 @@ def aggregate_named_adamw_states(named_states_list, weights):
             exp_avg = state_entry.get('exp_avg', None)
             exp_avg_sq = state_entry.get('exp_avg_sq', None)
             if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+                continue
+            if (not _is_finite_tensor(exp_avg)) or (not _is_finite_tensor(exp_avg_sq)):
                 continue
 
             if param_name not in aggregated_state:
@@ -228,6 +234,8 @@ class Server(object):
             exp_avg = state_entry.get('exp_avg', None)
             exp_avg_sq = state_entry.get('exp_avg_sq', None)
             if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+                continue
+            if (not _is_finite_tensor(exp_avg)) or (not _is_finite_tensor(exp_avg_sq)):
                 continue
             out_entry = {
                 'step': int(_as_python_int(state_entry.get('step', 0))),

@@ -192,6 +192,10 @@ if __name__ == '__main__':
 
     # Debug
     parser.add_argument('--debug_transport_check', default=False, action='store_true')
+    parser.add_argument('--debug_nan', default=False, action='store_true', help='enable NaN/Inf diagnostics during local training')
+    parser.add_argument('--debug_nan_first_steps', type=int, default=1, help='print debug snapshots for first N local steps on the target client')
+    parser.add_argument('--debug_nan_client_idx', type=int, default=0, help='only print NaN debug for this client index; <0 means all clients')
+    parser.add_argument('--debug_nan_skip_optim', default=False, action='store_true', help='skip optimizer step when non-finite loss/grad is detected')
 
     time_stamp = str(time.time())
     args = parser.parse_args()

@@ -22,6 +22,22 @@ def _is_finite_tensor(tensor):
     return isinstance(tensor, torch.Tensor) and bool(torch.isfinite(tensor).all().item())
 
 
+def _build_adamw_step_tensor(optimizer, param_obj, step_int, old_step=None):
+    if isinstance(old_step, torch.Tensor):
+        return torch.tensor(float(step_int), device=old_step.device, dtype=old_step.dtype)
+
+    step_device = torch.device('cpu')
+    for group in optimizer.param_groups:
+        params = group.get('params', [])
+        if any(p is param_obj for p in params):
+            capturable = bool(group.get('capturable', False))
+            fused = bool(group.get('fused', False))
+            if capturable or fused:
+                step_device = param_obj.device
+            break
+    return torch.tensor(float(step_int), device=step_device, dtype=torch.float32)
+
+
 def export_named_adamw_state(model, optimizer):
     named_state = {'state': {}}
     if optimizer is None:
@@ -84,10 +100,12 @@ def load_named_adamw_state(model, optimizer, named_state):
         opt_state['exp_avg_sq'] = exp_avg_sq.detach().to(device=param_obj.device).clone()
         step_int = _to_python_int_step(state_entry.get('step', 0))
         old_step = opt_state.get('step', None)
-        if isinstance(old_step, torch.Tensor):
-            opt_state['step'] = torch.tensor(step_int, device=old_step.device, dtype=old_step.dtype)
-        else:
-            opt_state['step'] = step_int
+        opt_state['step'] = _build_adamw_step_tensor(
+            optimizer=optimizer,
+            param_obj=param_obj,
+            step_int=step_int,
+            old_step=old_step,
+        )
 
         max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
         if isinstance(max_exp_avg_sq, torch.Tensor):

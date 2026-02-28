@@ -96,8 +96,10 @@ def load_named_adamw_state(model, optimizer, named_state):
             continue
 
         opt_state = optimizer.state[param_obj]
-        opt_state['exp_avg'] = exp_avg.detach().to(device=param_obj.device).clone()
-        opt_state['exp_avg_sq'] = exp_avg_sq.detach().to(device=param_obj.device).clone()
+        # Keep optimizer state dtype aligned with parameter/grad dtype so AdamW foreach path stays valid.
+        target_dtype = param_obj.dtype
+        opt_state['exp_avg'] = exp_avg.detach().to(device=param_obj.device, dtype=target_dtype).clone()
+        opt_state['exp_avg_sq'] = exp_avg_sq.detach().to(device=param_obj.device, dtype=target_dtype).clone()
         step_int = _to_python_int_step(state_entry.get('step', 0))
         old_step = opt_state.get('step', None)
         opt_state['step'] = _build_adamw_step_tensor(
@@ -109,7 +111,10 @@ def load_named_adamw_state(model, optimizer, named_state):
 
         max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
         if isinstance(max_exp_avg_sq, torch.Tensor):
-            opt_state['max_exp_avg_sq'] = max_exp_avg_sq.detach().to(device=param_obj.device).clone()
+            opt_state['max_exp_avg_sq'] = max_exp_avg_sq.detach().to(
+                device=param_obj.device,
+                dtype=target_dtype,
+            ).clone()
 
 
 class FerretFramework(object):

@@ -328,15 +328,15 @@ class Server(object):
             weight_array /= float(np.sum(weight_array))
         return weight_array
 
-    def maybe_refresh_submuon_seeds(self, cur_round):
+    def maybe_refresh_submuon_seeds(self, cur_round, force=False):
         if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            return
-        if getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
-            return
-        if self.args.seed_refresh_F <= 0:
-            return
-        if cur_round % self.args.seed_refresh_F != 0:
-            return
+            return False
+        if (not force) and getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
+            return False
+        if (not force) and self.args.seed_refresh_F <= 0:
+            return False
+        if (not force) and (cur_round % self.args.seed_refresh_F != 0):
+            return False
 
         old_seeds = dict(self.seeds)
         new_seeds = {}
@@ -353,6 +353,10 @@ class Server(object):
             v_global=self.v_global if self.algo == 'fedsubadam' else None,
         )
         self.seeds = new_seeds
+        return True
+
+    def trigger_rebase(self, cur_round):
+        return self.maybe_refresh_submuon_seeds(cur_round=cur_round, force=True)
 
     def aggregate_submuon(self, client_payloads, selected_client_list):
         weight_array = self._get_client_weight_array(selected_client_list)

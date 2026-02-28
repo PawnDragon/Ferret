@@ -15,6 +15,7 @@ from server import Server
 from optimizers.submuon_utils import relative_transport_error
 from utils_data.comm_utils import compute_comm_size
 from utils_data.load_data import get_loaders
+from utils_data.rebase_controller import AdaptiveRebaseController
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -156,6 +157,11 @@ if __name__ == '__main__':
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
+    parser.add_argument('--adaptive_rebase', default=False, action='store_true', help='enable adaptive restart-style rebase for FedSubMuon')
+    parser.add_argument('--rebase_patience', type=int, default=5, help='no-improve rounds before triggering rebase')
+    parser.add_argument('--rebase_cooldown', type=int, default=3, help='cooldown rounds after each rebase')
+    parser.add_argument('--max_rebase', type=int, default=2, help='maximum rebase count')
+    parser.add_argument('--rebase_min_delta', type=float, default=1e-4, help='minimum loss improvement threshold for rebase controller')
 
     # LoRA (FedIT / FLoRA)
     parser.add_argument('--lora_r', type=int, default=16)
@@ -177,7 +183,7 @@ if __name__ == '__main__':
     parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
     parser.add_argument('--final_eval_false', default=False, action='store_true', help='if true, skip final evaluation after training rounds')
     parser.add_argument('--early_stop', default=False, action='store_true', help='if true, stop training early when eval metric does not improve')
-    parser.add_argument('--early_stop_patience', type=int, default=5, help='number of rounds without significant improvement before stopping')
+    parser.add_argument('--early_stop_patience', type=int, default=8, help='number of rounds without significant improvement before stopping')
     parser.add_argument('--early_stop_min_delta', type=float, default=1e-4, help='minimum significant improvement in eval metric')
     parser.add_argument('--early_stop_metric', type=str, default='eval/loss', help='metric name used by early stopping (currently supports eval/loss)')
 
@@ -205,11 +211,24 @@ if __name__ == '__main__':
     previous_metric = args.eval_metric
     args.eval_metric = 'loss'
     early_stop_active = bool(args.early_stop)
+    adaptive_rebase_active = bool(args.algo == 'fedsubmuon' and args.adaptive_rebase)
     if early_stop_active and args.round_eval_false:
         print('[warn] --early_stop requires round evaluation; disable early stopping because --round_eval_false is set')
         early_stop_active = False
     if early_stop_active and args.early_stop_metric != 'eval/loss':
         print(f'[warn] unsupported --early_stop_metric={args.early_stop_metric}; fallback to eval/loss')
+    if args.adaptive_rebase and args.algo != 'fedsubmuon':
+        print(f'[warn] --adaptive_rebase is only used by fedsubmuon, but current algo={args.algo}; ignore adaptive rebase')
+        adaptive_rebase_active = False
+    if adaptive_rebase_active and args.round_eval_false:
+        print('[warn] --adaptive_rebase requires round evaluation; disable adaptive rebase because --round_eval_false is set')
+        adaptive_rebase_active = False
+    if adaptive_rebase_active and int(args.early_stop_patience) <= int(args.rebase_patience):
+        print(
+            f'[warn] recommended early_stop_patience({args.early_stop_patience}) > '
+            f'rebase_patience({args.rebase_patience})'
+        )
+    control_min_delta = float(getattr(args, 'early_stop_min_delta', getattr(args, 'rebase_min_delta', 1e-4)))
 
     final_eval_requires_best_ckpt = (not args.final_eval_false)
     if final_eval_requires_best_ckpt and (not args.save):
@@ -300,6 +319,10 @@ if __name__ == '__main__':
             'train/comm_up_bytes': float('nan'),
             'train/comm_down_bytes': float('nan'),
             'eval/loss': float(eval_result),
+            'ctrl/no_improve': 0,
+            'ctrl/rebase_count': 0,
+            'ctrl/cooldown_left': 0,
+            'ctrl/did_rebase': 0,
         }
         if torch.cuda.is_available():
             init_log['system/mem_alloc'] = float(torch.cuda.memory_allocated())
@@ -321,6 +344,19 @@ if __name__ == '__main__':
         'best_round': 0,
         'no_improve_count': 0,
     }
+    rebase_controller = None
+    if adaptive_rebase_active:
+        rebase_controller = AdaptiveRebaseController(
+            best_loss=early_state['best_val_loss'],
+            best_round=early_state['best_round'],
+            min_delta=control_min_delta,
+            rebase_patience=int(args.rebase_patience),
+            rebase_cooldown=int(args.rebase_cooldown),
+            max_rebase=int(args.max_rebase),
+            enable_rebase=True,
+            enable_early_stop=early_stop_active,
+            early_stop_patience=int(args.early_stop_patience),
+        )
     last_round = 0
     early_stopped = False
 
@@ -338,7 +374,8 @@ if __name__ == '__main__':
             torch.cuda.reset_peak_memory_stats()
 
         if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            server.maybe_refresh_submuon_seeds(r)
+            if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
+                server.maybe_refresh_submuon_seeds(r)
             broadcast_state = server.get_submuon_broadcast_state()
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
 
@@ -359,16 +396,19 @@ if __name__ == '__main__':
             else:
                 eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
                 eval_avg_acc.append(eval_result)
-                improved = int(
-                    maybe_save_best_ckpt(
-                        server=server,
-                        args=args,
-                        metric=eval_result,
-                        cur_round=r,
-                        log_dir=log_dir,
-                        force_save=final_eval_requires_best_ckpt,
+                if adaptive_rebase_active and args.algo == 'fedsubmuon':
+                    improved = 0
+                else:
+                    improved = int(
+                        maybe_save_best_ckpt(
+                            server=server,
+                            args=args,
+                            metric=eval_result,
+                            cur_round=r,
+                            log_dir=log_dir,
+                            force_save=final_eval_requires_best_ckpt,
+                        )
                     )
-                )
 
             log_items = {
                 'round': r,
@@ -567,6 +607,49 @@ if __name__ == '__main__':
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
+        pending_adaptive_early_stop = False
+        did_rebase = 0
+        if adaptive_rebase_active and args.algo == 'fedsubmuon' and rebase_controller is not None:
+            if (not args.round_eval_false) and is_finite_scalar(eval_result):
+                ctrl_result = rebase_controller.step(cur_round=r, curr_loss=float(eval_result))
+                if ctrl_result['improved']:
+                    improved = int(
+                        maybe_save_best_ckpt(
+                            server=server,
+                            args=args,
+                            metric=eval_result,
+                            cur_round=r,
+                            log_dir=log_dir,
+                            force_save=final_eval_requires_best_ckpt,
+                        )
+                    )
+                    log_items['ckpt/improved'] = int(improved)
+                if ctrl_result['did_rebase']:
+                    did_rebase = int(bool(server.trigger_rebase(cur_round=r)))
+                    print(
+                        f'Round {r}: REBASE triggered (count={ctrl_result["rebase_count"]}), '
+                        f'best_loss={ctrl_result["best_loss"]:.6f}, curr_loss={float(eval_result):.6f}, '
+                        f'cooldown={int(args.rebase_cooldown)}'
+                    )
+                pending_adaptive_early_stop = bool(ctrl_result['should_early_stop'])
+
+            ctrl_snapshot = rebase_controller.snapshot()
+            early_state['best_val_loss'] = float(ctrl_snapshot['best_loss'])
+            early_state['best_round'] = int(ctrl_snapshot['best_round'])
+            early_state['no_improve_count'] = int(ctrl_snapshot['no_improve'])
+            ctrl_no_improve = int(ctrl_snapshot['no_improve'])
+            ctrl_rebase_count = int(ctrl_snapshot['rebase_count'])
+            ctrl_cooldown_left = int(ctrl_snapshot['cooldown_left'])
+        else:
+            ctrl_no_improve = int(early_state['no_improve_count'])
+            ctrl_rebase_count = 0
+            ctrl_cooldown_left = 0
+
+        log_items['ctrl/no_improve'] = int(ctrl_no_improve)
+        log_items['ctrl/rebase_count'] = int(ctrl_rebase_count)
+        log_items['ctrl/cooldown_left'] = int(ctrl_cooldown_left)
+        log_items['ctrl/did_rebase'] = int(did_rebase)
+
         print(
             f'Round {r}: wall_clock_time = {log_items["train/wall_clock_time"]:.2f} s, '
             f'peak_gpu_mem = {log_items["train/peak_gpu_mem"]:.2f} MB, '
@@ -583,6 +666,19 @@ if __name__ == '__main__':
                 json.dump({'eval_avg_acc': eval_avg_acc}, writer)
 
         last_round = r
+        if adaptive_rebase_active and args.algo == 'fedsubmuon':
+            if pending_adaptive_early_stop:
+                early_stopped = True
+                print(
+                    '[early-stop] triggered at round '
+                    f"{r} | best_round={early_state['best_round']} "
+                    f"| best_loss={early_state['best_val_loss']:.6f} "
+                    f"| no_improve_count={early_state['no_improve_count']} "
+                    f"| rebase_count={rebase_controller.rebase_count if rebase_controller is not None else 0}"
+                )
+                break
+            continue
+
         if early_stop_active and (not args.round_eval_false) and is_finite_scalar(eval_result):
             apply_early_stop_state(
                 early_state=early_state,

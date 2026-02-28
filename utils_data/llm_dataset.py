@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 import transformers
 import pandas as pd
+from utils_data.model_loader import format_chat_text, is_qwen3_model
 
 
 def load_jsonl(file_path,
@@ -56,6 +57,14 @@ PROMPT_DICT = {
 }
 
 
+def _build_qwen3_user_content(instruction, input_text):
+    instruction = '' if instruction is None else str(instruction)
+    input_text = '' if input_text is None else str(input_text)
+    if input_text != '':
+        return f'{instruction}\n\nInput:\n{input_text}'
+    return instruction
+
+
 class LLMDataset(Dataset):
     def __init__(self,
                  dataset,
@@ -70,11 +79,31 @@ class LLMDataset(Dataset):
                                         input='context',
                                         output='response',
                                         category='category')
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != ""
-            else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
+        model_name = getattr(tokenizer, 'name_or_path', '')
+        if is_qwen3_model(model_name):
+            sources = []
+            for example in list_data_dict:
+                messages = [
+                    {
+                        'role': 'user',
+                        'content': _build_qwen3_user_content(example.get('instruction', ''), example.get('input', '')),
+                    }
+                ]
+                sources.append(
+                    format_chat_text(
+                        tokenizer=tokenizer,
+                        messages=messages,
+                        add_generation_prompt=True,
+                        model_name_or_path=model_name,
+                        enable_thinking=False,
+                    )
+                )
+        else:
+            sources = [
+                prompt_input.format_map(example) if example.get("input", "") != ""
+                else prompt_no_input.format_map(example)
+                for example in list_data_dict
+            ]
         targets = [
             f"{example['output']}{tokenizer.eos_token}"
             for example in list_data_dict

@@ -3,7 +3,11 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 from utils_data.default_tokens import DefaultToken
-from utils_data.model_loader import resolve_model_source
+from utils_data.model_loader import (
+    is_qwen3_model,
+    maybe_print_qwen3_selfcheck,
+    resolve_model_source,
+)
 from utils_data.partition_data import partition_idx_labeldir
 from collections import Counter
 
@@ -13,10 +17,14 @@ def get_loaders(args, only_eval=False):
     Return: list of train_loaders, eval_loader
     """
     model_source = resolve_model_source(args.model)
-    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
+    is_qwen3 = is_qwen3_model(model_source)
+    tokenizer_kwargs = {'use_fast': True}
+    if is_qwen3:
+        tokenizer_kwargs['trust_remote_code'] = True
+    tokenizer = AutoTokenizer.from_pretrained(model_source, **tokenizer_kwargs)
     tokenizer.model_max_length = args.max_length
     special_tokens = dict()
-    if tokenizer.pad_token is None:
+    if tokenizer.pad_token is None and (not is_qwen3):
         special_tokens["pad_token"] = DefaultToken.PAD_TOKEN.value
     if tokenizer.eos_token is None:
         special_tokens["eos_token"] = DefaultToken.EOS_TOKEN.value
@@ -25,6 +33,10 @@ def get_loaders(args, only_eval=False):
     if tokenizer.unk_token is None:
         special_tokens["unk_token"] = DefaultToken.UNK_TOKEN.value
     tokenizer.add_special_tokens(special_tokens)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if is_qwen3:
+        maybe_print_qwen3_selfcheck(tokenizer, model_source)
 
     # Generation task
     if args.dataset == 'dolly':

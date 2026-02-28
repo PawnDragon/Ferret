@@ -142,10 +142,11 @@ def main():
     print(f'[info] Dolly zerotask eval | zerotask={args.zerotask}, eval_samples={len(eval_loader.dataset)}')
 
     model_source = resolve_model_source(args.model)
+    model_dtype = torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         device_map='cpu',
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         trust_remote_code=True,
     )
 

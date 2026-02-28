@@ -6,9 +6,18 @@ import numpy as np
 from dataclasses import dataclass
 import transformers
 import torch
+from utils_data.model_loader import format_chat_text, is_qwen3_model
 
 
 IGNORE_INDEX = -100
+
+
+def _build_qwen3_user_content(instruction, input_text, use_prompts):
+    instruction = '' if instruction is None else str(instruction)
+    input_text = '' if input_text is None else str(input_text)
+    if use_prompts:
+        return f'{instruction}\n\nInput:\n{input_text}'
+    return f'{instruction}\n\nInput: {input_text}'
 
 
 class LLMDataset(Dataset):
@@ -18,12 +27,32 @@ class LLMDataset(Dataset):
                  use_prompts,
                  generation=False):
         super(LLMDataset, self).__init__()
-        
-        if use_prompts:
-            # prompt template from alpaca
-            sources = [f'Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{example[0]}\n\n### Input:\n{example[1]}\n\n### Response:' for example in data]
+
+        model_name = getattr(tokenizer, 'name_or_path', '')
+        if is_qwen3_model(model_name):
+            sources = []
+            for example in data:
+                messages = [
+                    {
+                        'role': 'user',
+                        'content': _build_qwen3_user_content(example[0], example[1], use_prompts),
+                    }
+                ]
+                sources.append(
+                    format_chat_text(
+                        tokenizer=tokenizer,
+                        messages=messages,
+                        add_generation_prompt=True,
+                        model_name_or_path=model_name,
+                        enable_thinking=False,
+                    )
+                )
         else:
-            sources = [f'{example[0]}\n\nInput: {example[1]}\n\nOutput:' for example in data]
+            if use_prompts:
+                # prompt template from alpaca
+                sources = [f'Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{example[0]}\n\n### Input:\n{example[1]}\n\n### Response:' for example in data]
+            else:
+                sources = [f'{example[0]}\n\nInput: {example[1]}\n\nOutput:' for example in data]
         targets = [f'{example[2]}{tokenizer.eos_token}' for example in data]
 
         data_dict = self.preprocess(sources, targets, tokenizer, generation)

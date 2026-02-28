@@ -19,7 +19,11 @@ from optimizers.lora_utils import (
 )
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
-from utils_data.model_loader import resolve_model_source
+from utils_data.model_loader import (
+    is_qwen3_model,
+    maybe_print_qwen3_selfcheck,
+    resolve_model_source,
+)
 
 
 def softmax(vec):
@@ -40,13 +44,17 @@ class Server(object):
         self.eval_loader = eval_loader
         self.candidate_seeds = candidate_seeds
         model_source = resolve_model_source(args.model)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
+        is_qwen3 = is_qwen3_model(model_source)
+        tokenizer_kwargs = {'use_fast': True}
+        if is_qwen3:
+            tokenizer_kwargs['trust_remote_code'] = True
+        self.tokenizer = AutoTokenizer.from_pretrained(model_source, **tokenizer_kwargs)
         self.log_dir = log_dir
         self.algo = getattr(args, 'algo', 'ferret')
 
         self.tokenizer.model_max_length = self.args.max_length
         special_tokens = dict()
-        if self.tokenizer.pad_token is None:
+        if self.tokenizer.pad_token is None and (not is_qwen3):
             special_tokens['pad_token'] = DefaultToken.PAD_TOKEN.value
         if self.tokenizer.eos_token is None:
             special_tokens['eos_token'] = DefaultToken.EOS_TOKEN.value
@@ -57,11 +65,14 @@ class Server(object):
         self.tokenizer.add_special_tokens(special_tokens)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        if is_qwen3:
+            maybe_print_qwen3_selfcheck(self.tokenizer, model_source)
 
+        model_dtype = torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             model_source,
             device_map='cpu',
-            torch_dtype=torch.float16,
+            torch_dtype=model_dtype,
             trust_remote_code=True,
         )
 

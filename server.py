@@ -621,8 +621,10 @@ class Server(object):
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
-        if improved:
-            self.best_metric = metric
+        if not improved:
+            return False
+
+        self.best_metric = metric
 
         ckpt_dir = self._get_ckpt_dir()
         ckpt_payload = {
@@ -646,14 +648,10 @@ class Server(object):
         else:
             ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
 
-        final_ckpt_path = os.path.join(ckpt_dir, 'final.pt')
-        torch.save(ckpt_payload, final_ckpt_path)
-        print(f'[ckpt] saved to: {final_ckpt_path}')
-        if improved:
-            best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
-            torch.save(ckpt_payload, best_ckpt_path)
-            print(f'[ckpt] saved to: {best_ckpt_path}')
-        return improved
+        best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
+        torch.save(ckpt_payload, best_ckpt_path)
+        print(f'[ckpt] saved to: {best_ckpt_path}')
+        return True
 
     def save_best_fedavg_ckpt(self, metric, cur_round):
         if self.algo != 'fedavg' or not self.args.save:
@@ -693,22 +691,6 @@ class Server(object):
             eval_metric = self.eval_loss(cur_round)
         else:
             eval_metric = self.eval_generate(cur_round)
-
-        if self.args.save and self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedavg'] and cur_round > 0:
-            save_dir = self.log_dir
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            if (self.args.eval_metric == 'loss' and eval_metric < np.min(eval_avg_acc)) or (
-                self.args.eval_metric != 'none' and eval_metric > np.max(eval_avg_acc)
-            ):
-                for file_name in os.listdir(save_dir):
-                    if 'best' in file_name:
-                        os.remove(os.path.join(save_dir, file_name))
-                torch.save(self.model.state_dict(), os.path.join(save_dir, f'model_state_dict_best_round{cur_round}.bin'))
-            for file_name in os.listdir(save_dir):
-                if 'final' in file_name:
-                    os.remove(os.path.join(save_dir, file_name))
-            torch.save(self.model.state_dict(), os.path.join(save_dir, f'model_state_dict_final_round{cur_round}.bin'))
         return eval_metric
 
     def eval_loss(self, cur_round):

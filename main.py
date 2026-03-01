@@ -48,44 +48,35 @@ def is_finite_scalar(value):
         return False
 
 
-def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir, force_save=False):
-    saved_flag = bool(getattr(args, 'save', False))
-    if force_save and (not saved_flag):
-        args.save = True
-    try:
-        if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            return server.save_best_submuon_ckpt(metric, cur_round)
-        if args.algo in ['fedit', 'flora']:
-            return server.save_best_lora_ckpt(metric, cur_round)
-        if args.algo == 'fedavg':
-            return server.save_best_fedavg_ckpt(metric, cur_round)
+def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
+    if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        return server.save_best_submuon_ckpt(metric, cur_round)
+    if args.algo in ['fedit', 'flora']:
+        return server.save_best_lora_ckpt(metric, cur_round)
+    if args.algo == 'fedavg':
+        return server.save_best_fedavg_ckpt(metric, cur_round)
 
-        if not getattr(args, 'save', False):
-            return False
-        improved = (metric < server.best_metric) if args.eval_metric == 'loss' else (metric > server.best_metric)
-        if not improved:
-            return False
+    improved = (metric < server.best_metric) if args.eval_metric == 'loss' else (metric > server.best_metric)
+    if not improved:
+        return False
 
-        server.best_metric = metric
-        ckpt_path = os.path.join(log_dir, 'best.pt')
-        torch.save(
-            {
+    server.best_metric = metric
+    ckpt_path = os.path.join(log_dir, 'best.pt')
+    torch.save(
+        {
+            'algo': args.algo,
+            'backbone_state_dict': server.model.state_dict(),
+            'round': int(cur_round),
+            'best_metric': float(metric),
+            'hparams': {
                 'algo': args.algo,
-                'backbone_state_dict': server.model.state_dict(),
-                'round': int(cur_round),
-                'best_metric': float(metric),
-                'hparams': {
-                    'algo': args.algo,
-                    'lr': float(args.lr),
-                },
+                'lr': float(args.lr),
             },
-            ckpt_path,
-        )
-        print(f'[ckpt] saved to: {ckpt_path}')
-        return True
-    finally:
-        if force_save and (not saved_flag):
-            args.save = saved_flag
+        },
+        ckpt_path,
+    )
+    print(f'[ckpt] saved to: {ckpt_path}')
+    return True
 
 
 def apply_early_stop_state(early_state, val_loss, cur_round, min_delta):
@@ -181,14 +172,13 @@ if __name__ == '__main__':
     # Evaluation
     parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss'], help='metric to evaluate global model in the last round')
     parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
-    parser.add_argument('--final_eval_false', default=False, action='store_true', help='if true, skip final evaluation after training rounds')
     parser.add_argument('--early_stop', default=False, action='store_true', help='if true, stop training early when eval metric does not improve')
     parser.add_argument('--early_stop_patience', type=int, default=8, help='number of rounds without significant improvement before stopping')
     parser.add_argument('--early_stop_min_delta', type=float, default=1e-4, help='minimum significant improvement in eval metric')
     parser.add_argument('--early_stop_metric', type=str, default='eval/loss', help='metric name used by early stopping (currently supports eval/loss)')
 
     # Checkpoints
-    parser.add_argument('--save', default=False, action='store_true', help='if `true`, the checkpoint of tuned models will be stored')
+    parser.add_argument('--save', default=False, action='store_true', help='if `true`, keep checkpoint files after run; otherwise remove them at run end')
 
     # W&B
     parser.add_argument('--use_wandb', default=False, action='store_true')
@@ -229,10 +219,12 @@ if __name__ == '__main__':
             f'rebase_patience({args.rebase_patience})'
         )
     control_min_delta = float(getattr(args, 'early_stop_min_delta', getattr(args, 'rebase_min_delta', 1e-4)))
-
-    final_eval_requires_best_ckpt = (not args.final_eval_false)
-    if final_eval_requires_best_ckpt and (not args.save):
-        print('[info] final eval from best checkpoint requires checkpoint saving; best checkpoint saving will be forced internally')
+    user_keep_ckpt = bool(args.save)
+    args.keep_ckpt = bool(user_keep_ckpt)
+    if not user_keep_ckpt:
+        print('[info] checkpoints will be saved during training for eval/early-stop, then removed at run end because --save is false')
+    # Always enable checkpoint writes during training.
+    args.save = True
 
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
     requested_device = int(args.device)
@@ -336,7 +328,6 @@ if __name__ == '__main__':
         metric=eval_result,
         cur_round=0,
         log_dir=log_dir,
-        force_save=final_eval_requires_best_ckpt,
     )
 
     early_state = {
@@ -406,7 +397,6 @@ if __name__ == '__main__':
                             metric=eval_result,
                             cur_round=r,
                             log_dir=log_dir,
-                            force_save=final_eval_requires_best_ckpt,
                         )
                     )
 
@@ -467,7 +457,6 @@ if __name__ == '__main__':
                         metric=eval_result,
                         cur_round=r,
                         log_dir=log_dir,
-                        force_save=final_eval_requires_best_ckpt,
                     )
                 )
 
@@ -530,7 +519,6 @@ if __name__ == '__main__':
                         metric=eval_result,
                         cur_round=r,
                         log_dir=log_dir,
-                        force_save=final_eval_requires_best_ckpt,
                     )
                 )
 
@@ -587,7 +575,6 @@ if __name__ == '__main__':
                         metric=eval_result,
                         cur_round=r,
                         log_dir=log_dir,
-                        force_save=final_eval_requires_best_ckpt,
                     )
                 )
             log_items = {
@@ -620,7 +607,6 @@ if __name__ == '__main__':
                             metric=eval_result,
                             cur_round=r,
                             log_dir=log_dir,
-                            force_save=final_eval_requires_best_ckpt,
                         )
                     )
                     log_items['ckpt/improved'] = int(improved)
@@ -696,78 +682,90 @@ if __name__ == '__main__':
                 )
                 break
 
-    if not args.final_eval_false:
-        best_ckpt_path = os.path.join(log_dir, 'best.pt')
-        final_round_idx = int(last_round if last_round > 0 else args.rounds)
-        if not os.path.exists(best_ckpt_path):
-            print(f'[warn] best checkpoint not found at {best_ckpt_path}; skip final eval')
-        else:
-            data_args = {
-                'dataset': args.dataset,
-                'zerotask': args.zerotask,
-                'dataset_subsample': args.dataset_subsample,
-                'iid': args.iid,
-                'num_clients': args.num_clients,
-                'batch_size': args.batch_size,
-                'max_length': args.max_length,
-                'use_prompts': args.use_prompts,
-                'ni_root': args.ni_root,
-            }
-            eval_args = {
-                'eval_metric': previous_metric,
-                'algo': 'auto',
-                'seed': args.seed,
-                'rank_r': args.rank_r,
-                'lr': args.lr,
-                'beta': args.beta,
-                'ns_steps': args.ns_steps,
-                'weight_decay': args.weight_decay,
-                'model_dtype': args.model_dtype,
-                'n_accum': args.n_accum,
-                'grad_clip': args.grad_clip,
-                'lora_r': args.lora_r,
-                'lora_alpha': args.lora_alpha,
-                'lora_dropout': args.lora_dropout,
-                'lora_target_modules': args.lora_target_modules,
-                'lora_bias': args.lora_bias,
-            }
-            final_eval = run_evaluate_from_checkpoint(
-                checkpoint_path=best_ckpt_path,
-                model_name_or_path=args.model,
-                tokenizer_name_or_path=args.model,
-                data_args=data_args,
-                eval_args=eval_args,
-                device=args.device,
-            )
-            final_metric_name = previous_metric
-            final_metric_val = float(final_eval['result'])
-            if args.log:
-                with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:
-                    json.dump(
-                        {
-                            f'final_eval_{final_metric_name}': final_metric_val,
-                            'checkpoint': best_ckpt_path,
-                            'round_end': final_round_idx,
-                            'early_stopped': bool(early_stopped),
-                            'early_stop_best_round': int(early_state['best_round']),
-                            'early_stop_best_loss': float(early_state['best_val_loss']),
-                        },
-                        writer,
-                    )
-            print(f'final round {final_metric_name} (best ckpt): {final_metric_val}')
-            if wandb_run is not None:
-                wandb.log(
+    best_ckpt_path = os.path.join(log_dir, 'best.pt')
+    final_round_idx = int(last_round if last_round > 0 else args.rounds)
+    if not os.path.exists(best_ckpt_path):
+        print(f'[warn] best checkpoint not found at {best_ckpt_path}; skip final eval')
+    else:
+        data_args = {
+            'dataset': args.dataset,
+            'zerotask': args.zerotask,
+            'dataset_subsample': args.dataset_subsample,
+            'iid': args.iid,
+            'num_clients': args.num_clients,
+            'batch_size': args.batch_size,
+            'max_length': args.max_length,
+            'use_prompts': args.use_prompts,
+            'ni_root': args.ni_root,
+        }
+        eval_args = {
+            'eval_metric': previous_metric,
+            'algo': 'auto',
+            'seed': args.seed,
+            'rank_r': args.rank_r,
+            'lr': args.lr,
+            'beta': args.beta,
+            'ns_steps': args.ns_steps,
+            'weight_decay': args.weight_decay,
+            'model_dtype': args.model_dtype,
+            'n_accum': args.n_accum,
+            'grad_clip': args.grad_clip,
+            'lora_r': args.lora_r,
+            'lora_alpha': args.lora_alpha,
+            'lora_dropout': args.lora_dropout,
+            'lora_target_modules': args.lora_target_modules,
+            'lora_bias': args.lora_bias,
+        }
+        final_eval = run_evaluate_from_checkpoint(
+            checkpoint_path=best_ckpt_path,
+            model_name_or_path=args.model,
+            tokenizer_name_or_path=args.model,
+            data_args=data_args,
+            eval_args=eval_args,
+            device=args.device,
+        )
+        final_metric_name = previous_metric
+        final_metric_val = float(final_eval['result'])
+        if args.log:
+            with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:
+                json.dump(
                     {
-                        f'final/{final_metric_name}': final_metric_val,
-                        'final/eval_samples': int(final_eval.get('eval_samples', 0)),
-                        'final/used_best_checkpoint': 1,
-                        'final/round_end': int(final_round_idx),
-                        'final/early_stopped': int(bool(early_stopped)),
-                        'final/early_stop_best_round': int(early_state['best_round']),
-                        'final/early_stop_best_loss': float(early_state['best_val_loss']),
+                        f'final_eval_{final_metric_name}': final_metric_val,
+                        'checkpoint': best_ckpt_path,
+                        'round_end': final_round_idx,
+                        'early_stopped': bool(early_stopped),
+                        'early_stop_best_round': int(early_state['best_round']),
+                        'early_stop_best_loss': float(early_state['best_val_loss']),
                     },
-                    step=final_round_idx,
+                    writer,
                 )
+        print(f'final round {final_metric_name} (best ckpt): {final_metric_val}')
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    f'final/{final_metric_name}': final_metric_val,
+                    'final/eval_samples': int(final_eval.get('eval_samples', 0)),
+                    'final/used_best_checkpoint': 1,
+                    'final/round_end': int(final_round_idx),
+                    'final/early_stopped': int(bool(early_stopped)),
+                    'final/early_stop_best_round': int(early_state['best_round']),
+                    'final/early_stop_best_loss': float(early_state['best_val_loss']),
+                },
+                step=final_round_idx,
+            )
+
+    if not user_keep_ckpt:
+        removed_ckpt = 0
+        if os.path.isdir(log_dir):
+            for file_name in os.listdir(log_dir):
+                file_path = os.path.join(log_dir, file_name)
+                if (not os.path.isfile(file_path)):
+                    continue
+                lower_name = file_name.lower()
+                if lower_name.endswith('.pt') or lower_name.endswith('.bin'):
+                    os.remove(file_path)
+                    removed_ckpt += 1
+        print(f'[ckpt] removed {removed_ckpt} checkpoint file(s) because --save is false')
 
     if wandb_run is not None:
         wandb.finish()

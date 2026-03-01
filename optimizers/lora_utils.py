@@ -3,6 +3,7 @@ import torch
 
 LORA_A_TOKEN = '.lora_A.'
 LORA_B_TOKEN = '.lora_B.'
+_SCALING_LOGGED = False
 
 
 def _parse_target_modules(raw_target_modules):
@@ -25,8 +26,29 @@ def _lora_trainable_key(name):
     return (LORA_A_TOKEN in name) or (LORA_B_TOKEN in name)
 
 
+def _lora_a_key(name):
+    return LORA_A_TOKEN in name
+
+
+def _lora_b_key(name):
+    return LORA_B_TOKEN in name
+
+
+def maybe_log_lora_scaling(args):
+    global _SCALING_LOGGED
+    if _SCALING_LOGGED:
+        return
+    rank = max(int(getattr(args, 'lora_r', 16)), 1)
+    alpha = float(getattr(args, 'lora_alpha', 16.0))
+    scaling = alpha / rank
+    print(f'[lora] lora_alpha={alpha}, lora_r={rank}, scaling(alpha/r)={scaling:.6f}')
+    _SCALING_LOGGED = True
+
+
 def build_lora_model(backbone_model, args):
     from peft import LoraConfig, TaskType, get_peft_model
+
+    maybe_log_lora_scaling(args)
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -54,6 +76,24 @@ def extract_lora_state(model):
     return lora_state
 
 
+def extract_lora_A_state(model):
+    lora_a_state = {}
+    for name, param in model.named_parameters():
+        if not _lora_a_key(name):
+            continue
+        lora_a_state[name] = param.detach().cpu().clone()
+    return lora_a_state
+
+
+def extract_lora_B_state(model):
+    lora_b_state = {}
+    for name, param in model.named_parameters():
+        if not _lora_b_key(name):
+            continue
+        lora_b_state[name] = param.detach().cpu().clone()
+    return lora_b_state
+
+
 def load_lora_state(model, lora_state):
     if lora_state is None:
         return
@@ -64,6 +104,32 @@ def load_lora_state(model, lora_state):
             if name not in lora_state:
                 continue
             src = lora_state[name].to(device=param.device, dtype=param.dtype)
+            param.copy_(src)
+
+
+def load_lora_A_state(model, lora_a_state):
+    if lora_a_state is None:
+        return
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not _lora_a_key(name):
+                continue
+            if name not in lora_a_state:
+                continue
+            src = lora_a_state[name].to(device=param.device, dtype=param.dtype)
+            param.copy_(src)
+
+
+def load_lora_B_state(model, lora_b_state):
+    if lora_b_state is None:
+        return
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not _lora_b_key(name):
+                continue
+            if name not in lora_b_state:
+                continue
+            src = lora_b_state[name].to(device=param.device, dtype=param.dtype)
             param.copy_(src)
 
 

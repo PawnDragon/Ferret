@@ -123,6 +123,10 @@ class FerretFramework(object):
         self.lr = lr
         self.model = model
         self.algo = getattr(args, 'algo', 'ferret')
+        if self.algo == 'fedsalora':
+            for name, param in self.model.named_parameters():
+                if 'lora_' not in name:
+                    param.requires_grad_(False)
         self.named_parameters_to_optim = [
             (name, param) for name, param in self.model.named_parameters() if param.requires_grad
         ]
@@ -174,6 +178,13 @@ class FerretFramework(object):
                     float(getattr(args, 'adam_beta2', 0.999)),
                 ),
                 eps=float(getattr(args, 'adam_eps', 1e-8)),
+                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
+            )
+        elif self.algo == 'fedsalora':
+            self.optim = torch.optim.SGD(
+                [p for _, p in self.named_parameters_to_optim],
+                lr=args.lr,
+                momentum=float(getattr(args, 'momentum', 0.0)),
                 weight_decay=float(getattr(args, 'weight_decay', 0.0)),
             )
         else:

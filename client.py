@@ -2,7 +2,15 @@ from tqdm import tqdm
 from copy import deepcopy
 
 from optimizers.ferret_optimizer import *
-from optimizers.lora_utils import build_lora_model, extract_lora_state, load_lora_state
+from optimizers.lora_utils import (
+    build_lora_model,
+    extract_lora_A_state,
+    extract_lora_B_state,
+    extract_lora_state,
+    load_lora_A_state,
+    load_lora_B_state,
+    load_lora_state,
+)
 
 
 class Client(object):
@@ -19,6 +27,8 @@ class Client(object):
             self.device = torch.device('cpu')
         self.candidate_seeds = candidate_seeds
         self._optim_debug_logged = False
+        self.local_lora_B_state = None
+        self.prev_round_lora_A_state = None
 
     def _set_runtime_debug_context(self, cur_round):
         # Shared args object carries lightweight runtime context for framework-level debug prints.
@@ -60,12 +70,38 @@ class Client(object):
             )
             self._optim_debug_logged = True
 
+    def _state_l2_norm(self, state_dict):
+        if not isinstance(state_dict, dict) or len(state_dict) == 0:
+            return 0.0
+        total = 0.0
+        for tensor in state_dict.values():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            total += float(torch.norm(tensor.float()).item())
+        return total
+
+    def _state_delta_l2_norm(self, state_a, state_b):
+        if not isinstance(state_a, dict) or not isinstance(state_b, dict):
+            return float('nan')
+        keys = sorted(set(state_a.keys()).intersection(set(state_b.keys())))
+        if len(keys) == 0:
+            return float('nan')
+        total = 0.0
+        for key in keys:
+            tensor_a = state_a[key]
+            tensor_b = state_b[key]
+            if (not isinstance(tensor_a, torch.Tensor)) or (not isinstance(tensor_b, torch.Tensor)):
+                continue
+            total += float(torch.norm(tensor_a.float() - tensor_b.float()).item())
+        return total
+
     def local_train_with_seed_pool(
         self,
         pulled_model,
         cur_round,
         submuon_state=None,
         lora_state=None,
+        lora_A_state=None,
         fedavg_global_state=None,
         global_named_optim_state=None,
     ):
@@ -136,11 +172,27 @@ class Client(object):
                 payload['m'] = m_local
             return payload
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora']:
             self.model = build_lora_model(self.model, self.args)
             self.model.to(self.device)
             if getattr(self.args, 'algo', 'ferret') == 'fedit':
                 load_lora_state(self.model, lora_state)
+            elif getattr(self.args, 'algo', 'ferret') == 'fedsalora':
+                load_lora_A_state(self.model, lora_A_state)
+                if self.local_lora_B_state is not None:
+                    load_lora_B_state(self.model, self.local_lora_B_state)
+                if self.idx == 0 and cur_round <= 2:
+                    loaded_a_state = extract_lora_A_state(self.model)
+                    loaded_b_state = extract_lora_B_state(self.model)
+                    loaded_a_norm = self._state_l2_norm(loaded_a_state)
+                    loaded_b_norm = self._state_l2_norm(loaded_b_state)
+                    a_shift = self._state_delta_l2_norm(loaded_a_state, self.prev_round_lora_A_state)
+                    b_recover_delta = self._state_delta_l2_norm(loaded_b_state, self.local_lora_B_state)
+                    print(
+                        f'[debug][fedsalora][client{self.idx}] round {cur_round} start: '
+                        f'loaded_A_norm={loaded_a_norm:.6e}, loaded_B_norm={loaded_b_norm:.6e}, '
+                        f'A_shift_from_prev={a_shift:.6e}, B_reload_delta={b_recover_delta:.6e}'
+                    )
 
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
@@ -189,6 +241,26 @@ class Client(object):
                     )
 
             local_lora_state = extract_lora_state(self.model)
+            if getattr(self.args, 'algo', 'ferret') == 'fedsalora':
+                local_lora_A_state = extract_lora_A_state(self.model)
+                local_lora_B_state = extract_lora_B_state(self.model)
+                if self.idx == 0 and cur_round <= 2:
+                    end_a_norm = self._state_l2_norm(local_lora_A_state)
+                    end_b_norm = self._state_l2_norm(local_lora_B_state)
+                    prev_b_delta = self._state_delta_l2_norm(local_lora_B_state, self.local_lora_B_state)
+                    print(
+                        f'[debug][fedsalora][client{self.idx}] round {cur_round} end: '
+                        f'A_norm={end_a_norm:.6e}, B_norm={end_b_norm:.6e}, '
+                        f'B_delta_from_prev={prev_b_delta:.6e}'
+                    )
+                self.prev_round_lora_A_state = {k: v.clone() for k, v in local_lora_A_state.items()}
+                self.local_lora_B_state = {k: v.clone() for k, v in local_lora_B_state.items()}
+                self.model = None
+                return {
+                    'lora_A_state': local_lora_A_state,
+                    'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+                }
+
             named_optim_state = framework.get_named_optim_state() if getattr(self.args, 'algo', 'ferret') == 'fedit' else None
             self.model = None
             return {

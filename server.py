@@ -12,6 +12,7 @@ from optimizers.ferret_optimizer import FerretFramework
 from optimizers.lora_utils import (
     build_lora_model,
     compute_deltaw_from_lora_state,
+    extract_lora_A_state,
     extract_lora_state,
     load_lora_state,
     lora_scaling,
@@ -176,6 +177,7 @@ class Server(object):
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
         self.global_lora_state = {}
+        self.global_lora_A_state = {}
         self.global_deltaW_state = {}
         self.flora_scaling = lora_scaling(self.args)
         self.fedavg_weight_array = None
@@ -203,6 +205,10 @@ class Server(object):
         if self.algo == 'fedit':
             init_model = build_lora_model(deepcopy(self.model), self.args)
             self.global_lora_state = extract_lora_state(init_model)
+            del init_model
+        if self.algo == 'fedsalora':
+            init_model = build_lora_model(deepcopy(self.model), self.args)
+            self.global_lora_A_state = extract_lora_A_state(init_model)
             del init_model
 
     def _get_ckpt_dir(self):
@@ -310,6 +316,11 @@ class Server(object):
             return {
                 'backbone_state_dict': self.model.state_dict(),
             }
+        if self.algo == 'fedsalora':
+            return {
+                'backbone_state_dict': self.model.state_dict(),
+                'global_lora_A_state': self.get_fedsalora_broadcast_state(),
+            }
         return {
             'backbone_state_dict': self.model.state_dict(),
         }
@@ -323,6 +334,11 @@ class Server(object):
         if self.algo != 'fedit':
             return None
         return self._clone_named_optim_state(comm_compress=True)
+
+    def get_fedsalora_broadcast_state(self):
+        if self.algo != 'fedsalora':
+            return None
+        return {k: v.clone() for k, v in self.global_lora_A_state.items()}
 
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
@@ -438,6 +454,24 @@ class Server(object):
                 self.global_deltaW_state[layer_name] = delta.to(dtype=target_dtype).cpu()
             self._apply_flora_delta_to_backbone()
             return
+
+    def aggregate_fedsalora(self, client_a_states, selected_client_list):
+        if len(client_a_states) == 0:
+            return
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+        state_keys = list(client_a_states[0].keys())
+        new_global_lora_a = {
+            key: torch.zeros_like(client_a_states[0][key], dtype=torch.float32)
+            for key in state_keys
+        }
+        for client_idx, local_a_state in enumerate(client_a_states):
+            weight = float(weight_array[client_idx])
+            for key in state_keys:
+                if key not in local_a_state:
+                    continue
+                new_global_lora_a[key] += local_a_state[key].to(dtype=torch.float32) * weight
+        self.global_lora_A_state = {k: v.cpu() for k, v in new_global_lora_a.items()}
 
     def _accumulate_fedavg_named_optim_state(self, named_state, weight):
         if not isinstance(named_state, dict):
@@ -632,7 +666,7 @@ class Server(object):
         return True
 
     def save_best_lora_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedit', 'flora'] or not self.args.save:
+        if self.algo not in ['fedit', 'flora', 'fedsalora'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -660,8 +694,10 @@ class Server(object):
 
         if self.algo == 'fedit':
             ckpt_payload['global_lora_state'] = {k: v.cpu() for k, v in self.global_lora_state.items()}
-        else:
+        elif self.algo == 'flora':
             ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
+        else:
+            ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
 
         best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
         torch.save(ckpt_payload, best_ckpt_path)

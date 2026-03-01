@@ -42,7 +42,16 @@ def main():
         description="Compute average wall-clock per round from W&B runs."
     )
     parser.add_argument("--project", required=True, help="W&B project name")
-    parser.add_argument("--run_name", required=True, help="W&B run display name")
+    parser.add_argument(
+        "--run_name",
+        default="",
+        help="W&B run display name (optional; can be used with --run_id)",
+    )
+    parser.add_argument(
+        "--run_id",
+        default="",
+        help="W&B run id (optional; can be used with --run_name)",
+    )
     parser.add_argument("--entity", default="", help="W&B entity/team (optional)")
     parser.add_argument(
         "--metric",
@@ -64,12 +73,32 @@ def main():
         )
 
     project_path = f"{entity}/{args.project}"
+    run_name = args.run_name.strip()
+    run_id = args.run_id.strip()
+
+    if not run_name and not run_id:
+        print(
+            "[error] Must provide at least one of --run_name or --run_id.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     all_runs = api.runs(project_path)
-    matched_runs = [run for run in all_runs if run.name == args.run_name]
+    matched_runs = list(all_runs)
+    if run_name:
+        matched_runs = [run for run in matched_runs if run.name == run_name]
+    if run_id:
+        matched_runs = [run for run in matched_runs if run.id == run_id]
 
     if len(matched_runs) == 0:
+        query_parts = []
+        if run_name:
+            query_parts.append(f"run_name={run_name}")
+        if run_id:
+            query_parts.append(f"run_id={run_id}")
+        query_desc = ", ".join(query_parts)
         print(
-            f"[error] No runs found for entity/project={project_path}, run_name={args.run_name}",
+            f"[error] No runs found for entity/project={project_path}, {query_desc}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -90,7 +119,10 @@ def main():
     avg_wall_clock_per_round = sum(all_round_values) / float(total_rounds)
 
     print(f"entity/project: {project_path}")
-    print(f"run_name: {args.run_name}")
+    if run_name:
+        print(f"run_name: {run_name}")
+    if run_id:
+        print(f"run_id: {run_id}")
     print(f"matched_runs: {len(matched_runs)}")
     print(f"metric: {args.metric}")
     print(f"total_rounds: {total_rounds}")

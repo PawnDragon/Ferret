@@ -153,6 +153,7 @@ class Server(object):
             maybe_print_qwen3_selfcheck(self.tokenizer, model_source)
 
         model_dtype = resolve_torch_dtype(getattr(self.args, 'model_dtype', 'bf16'))
+        self.model_dtype = model_dtype
         self.model = AutoModelForCausalLM.from_pretrained(
             model_source,
             device_map='cpu',
@@ -222,13 +223,19 @@ class Server(object):
                     continue
                 module.weight.data.add_(delta_tensor * self.flora_scaling)
 
-    def _clone_named_optim_state(self):
+    def _get_comm_optim_state_dtype(self):
+        if self.model_dtype in [torch.float16, torch.bfloat16]:
+            return self.model_dtype
+        return None
+
+    def _clone_named_optim_state(self, comm_compress=False):
         out = {'state': {}}
         if not isinstance(self.global_named_optim_state, dict):
             return out
         state_dict = self.global_named_optim_state.get('state', {})
         if not isinstance(state_dict, dict):
             return out
+        target_dtype = self._get_comm_optim_state_dtype() if comm_compress else None
         for name, state_entry in state_dict.items():
             if not isinstance(state_entry, dict):
                 continue
@@ -238,14 +245,22 @@ class Server(object):
                 continue
             if (not _is_finite_tensor(exp_avg)) or (not _is_finite_tensor(exp_avg_sq)):
                 continue
+            exp_avg_out = exp_avg.detach().cpu()
+            exp_avg_sq_out = exp_avg_sq.detach().cpu()
+            if target_dtype is not None:
+                exp_avg_out = exp_avg_out.to(dtype=target_dtype)
+                exp_avg_sq_out = exp_avg_sq_out.to(dtype=target_dtype)
             out_entry = {
                 'step': int(_as_python_int(state_entry.get('step', 0))),
-                'exp_avg': exp_avg.detach().cpu().clone(),
-                'exp_avg_sq': exp_avg_sq.detach().cpu().clone(),
+                'exp_avg': exp_avg_out.clone(),
+                'exp_avg_sq': exp_avg_sq_out.clone(),
             }
             max_exp_avg_sq = state_entry.get('max_exp_avg_sq', None)
             if isinstance(max_exp_avg_sq, torch.Tensor):
-                out_entry['max_exp_avg_sq'] = max_exp_avg_sq.detach().cpu().clone()
+                max_exp_avg_sq_out = max_exp_avg_sq.detach().cpu()
+                if target_dtype is not None:
+                    max_exp_avg_sq_out = max_exp_avg_sq_out.to(dtype=target_dtype)
+                out_entry['max_exp_avg_sq'] = max_exp_avg_sq_out.clone()
             out['state'][name] = out_entry
         return out
 
@@ -307,7 +322,7 @@ class Server(object):
     def get_fedit_broadcast_optim_state(self):
         if self.algo != 'fedit':
             return None
-        return self._clone_named_optim_state()
+        return self._clone_named_optim_state(comm_compress=True)
 
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
@@ -317,7 +332,7 @@ class Server(object):
     def get_fedavg_broadcast_optim_state(self):
         if self.algo != 'fedavg':
             return None
-        return self._clone_named_optim_state()
+        return self._clone_named_optim_state(comm_compress=True)
 
     def _get_client_weight_array(self, selected_client_list):
         if self.args.equal_weight:

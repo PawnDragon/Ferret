@@ -665,14 +665,15 @@ if __name__ == '__main__':
                 break
             continue
 
-        if early_stop_active and (not args.round_eval_false) and is_finite_scalar(eval_result):
+        if (not args.round_eval_false) and is_finite_scalar(eval_result):
+            # Keep best-round / best-loss tracking always-on for final report consistency.
             apply_early_stop_state(
                 early_state=early_state,
                 val_loss=eval_result,
                 cur_round=r,
                 min_delta=args.early_stop_min_delta,
             )
-            if early_state['no_improve_count'] >= int(args.early_stop_patience):
+            if early_stop_active and early_state['no_improve_count'] >= int(args.early_stop_patience):
                 early_stopped = True
                 print(
                     '[early-stop] triggered at round '

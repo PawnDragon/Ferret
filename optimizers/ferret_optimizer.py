@@ -166,47 +166,42 @@ class FerretFramework(object):
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(self.model, self.args.rank_r)
-        elif self.algo == 'fedavg':
-            self.optim = torch.optim.AdamW(
-                [p for _, p in self.named_parameters_to_optim],
-                lr=args.lr,
-                betas=(
-                    float(getattr(args, 'adam_beta1', 0.9)),
-                    float(getattr(args, 'adam_beta2', 0.999)),
-                ),
-                eps=float(getattr(args, 'adam_eps', 1e-8)),
-                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            )
-        elif self.algo in ['fedit', 'flora', 'fedexlora']:
-            self.optim = torch.optim.AdamW(
-                [p for _, p in self.named_parameters_to_optim],
-                lr=args.lr,
-                betas=(
-                    float(getattr(args, 'adam_beta1', 0.9)),
-                    float(getattr(args, 'adam_beta2', 0.999)),
-                ),
-                eps=float(getattr(args, 'adam_eps', 1e-8)),
-                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            )
-        elif self.algo == 'fedsalora':
-            self.optim = torch.optim.SGD(
-                [p for _, p in self.named_parameters_to_optim],
-                lr=args.lr,
-                momentum=float(getattr(args, 'momentum', 0.0)),
-                weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            )
         else:
-            self.optim = torch.optim.SGD(
-                [p for _, p in self.named_parameters_to_optim],
-                lr=args.lr,
-                momentum=0.0,
-                weight_decay=args.weight_decay,
-            )
+            self.optim = self._build_local_optimizer([p for _, p in self.named_parameters_to_optim])
+            # Ferret still needs grouped params for random-seed projection.
             self.param_groups = self._group_parameters()
 
     def _freeze_backbone_for_submuon(self):
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+    def _resolve_optimizer_name(self):
+        name = str(getattr(self.args, 'optimizer', 'adamw')).lower()
+        if name not in ['adamw', 'sgd']:
+            return 'adamw'
+        return name
+
+    def _build_local_optimizer(self, params):
+        params = list(params)
+        if len(params) == 0:
+            return None
+        if self._resolve_optimizer_name() == 'adamw':
+            return torch.optim.AdamW(
+                params,
+                lr=self.args.lr,
+                betas=(
+                    float(getattr(self.args, 'adam_beta1', 0.9)),
+                    float(getattr(self.args, 'adam_beta2', 0.999)),
+                ),
+                eps=float(getattr(self.args, 'adam_eps', 1e-8)),
+                weight_decay=float(getattr(self.args, 'weight_decay', 0.0)),
+            )
+        return torch.optim.SGD(
+            params,
+            lr=self.args.lr,
+            momentum=float(getattr(self.args, 'momentum', 0.0)),
+            weight_decay=float(getattr(self.args, 'weight_decay', 0.0)),
+        )
 
     def _group_parameters(self):
         # Group parameters with similar dimensions
@@ -288,6 +283,8 @@ class FerretFramework(object):
         self.submuon_v = {}
         self.submuon_seeds = {}
         self.subadam_step = 0
+        if self.algo in ['fedsubadam', 'fedsubsgd']:
+            self.optim = None
 
     def clear_flora_delta_state(self):
         with torch.no_grad():
@@ -347,16 +344,20 @@ class FerretFramework(object):
                 continue
             x_tensor = x_state[layer_name].to(device=device, dtype=torch.float32)
             self.submuon_x[layer_name] = torch.nn.Parameter(x_tensor.clone().detach(), requires_grad=trainable)
-            if m_state is not None and layer_name in m_state:
+            if self.algo == 'fedsubmuon' and m_state is not None and layer_name in m_state:
                 self.submuon_m[layer_name] = m_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
             else:
                 self.submuon_m[layer_name] = torch.zeros_like(self.submuon_x[layer_name], device=device, dtype=torch.float32)
-            if v_state is not None and layer_name in v_state:
+            if self.algo == 'fedsubmuon' and v_state is not None and layer_name in v_state:
                 self.submuon_v[layer_name] = v_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
             else:
                 self.submuon_v[layer_name] = torch.zeros_like(self.submuon_m[layer_name])
 
         self._install_submuon_forward()
+        if self.algo in ['fedsubadam', 'fedsubsgd'] and trainable:
+            self.optim = self._build_local_optimizer(self.submuon_x.values())
+            if self.optim is not None:
+                self.optim.zero_grad()
 
     def export_submuon_state(self, with_v=False, with_m=True):
         x_out = {k: v.detach().cpu().clone() for k, v in self.submuon_x.items()}
@@ -528,36 +529,12 @@ class FerretFramework(object):
                         X.grad = None
             return logits.detach(), loss.detach()
 
-        if self.algo == 'fedsubadam':
+        if self.algo in ['fedsubadam', 'fedsubsgd']:
             (loss / self.args.n_accum).backward()
             if apply_optim_step:
-                self.subadam_step += 1
-                beta1 = self.args.beta1
-                beta2 = self.args.beta2
-                eps = self.args.eps
-                with torch.no_grad():
-                    for layer_name, X in self.submuon_x.items():
-                        grad = X.grad
-                        if grad is None:
-                            continue
-                        self.submuon_m[layer_name].mul_(beta1).add_((1.0 - beta1) * grad)
-                        self.submuon_v[layer_name].mul_(beta2).add_((1.0 - beta2) * (grad * grad))
-                        m_hat = self.submuon_m[layer_name] / (1.0 - beta1 ** self.subadam_step)
-                        v_hat = self.submuon_v[layer_name] / (1.0 - beta2 ** self.subadam_step)
-                        X.data.sub_(self.lr * (m_hat / (torch.sqrt(v_hat) + eps)).to(dtype=X.data.dtype))
-                        X.grad = None
-            return logits.detach(), loss.detach()
-
-        if self.algo == 'fedsubsgd':
-            (loss / self.args.n_accum).backward()
-            if apply_optim_step:
-                with torch.no_grad():
-                    for _, X in self.submuon_x.items():
-                        grad = X.grad
-                        if grad is None:
-                            continue
-                        X.data.sub_(self.lr * grad.to(dtype=X.data.dtype))
-                        X.grad = None
+                if self.optim is not None:
+                    self.optim.step()
+                    self.optim.zero_grad()
             return logits.detach(), loss.detach()
 
         if self.algo == 'fedavg':

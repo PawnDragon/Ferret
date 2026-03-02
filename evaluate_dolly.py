@@ -186,6 +186,12 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank_r", type=int, default=8)
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument(
+        "--optimizer",
+        type=lambda x: x.lower(),
+        default="adamw",
+        choices=["adamw", "sgd"],
+    )
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument("--ns_steps", type=int, default=5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -313,10 +319,8 @@ def run_evaluate(args):
     if eval_algo in ["fedsubmuon", "fedsubadam", "fedsubsgd"]:
         if x_global is None or seeds is None:
             raise ValueError("FedSub eval requires checkpoint with x_global and seeds")
-        if eval_algo in ["fedsubmuon", "fedsubadam"] and m_global is None:
-            raise ValueError(
-                "FedSubMuon/FedSubAdam eval requires checkpoint with m_global"
-            )
+        if eval_algo == "fedsubmuon" and m_global is None:
+            raise ValueError("FedSubMuon eval requires checkpoint with m_global")
         if len(x_global) == 0:
             raise ValueError("FedSub checkpoint contains empty x_global")
         first_key = next(iter(x_global.keys()))
@@ -330,10 +334,10 @@ def run_evaluate(args):
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
         framework.set_submuon_state(
             x_global,
-            m_global if eval_algo in ["fedsubmuon", "fedsubadam"] else None,
+            m_global if eval_algo == "fedsubmuon" else None,
             seeds,
             trainable=False,
-            v_state=v_global if eval_algo == "fedsubadam" else None,
+            v_state=None,
         )
     elif eval_algo == "fedit":
         if global_lora_state is None:

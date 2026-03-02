@@ -162,7 +162,7 @@ class Client(object):
                     )
 
             if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
-                x_local, m_local, v_local = framework.export_submuon_state(with_v=True)
+                x_local = framework.export_submuon_state(with_m=False)
             elif getattr(self.args, 'algo', 'ferret') == 'fedsubsgd':
                 x_local = framework.export_submuon_state(with_m=False)
             else:
@@ -170,10 +170,7 @@ class Client(object):
             framework.clear_submuon_state()
             self.model = None
             payload = {'x': x_local, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
-            if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
-                payload['m'] = m_local
-                payload['v'] = v_local
-            elif getattr(self.args, 'algo', 'ferret') == 'fedsubmuon':
+            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuon':
                 payload['m'] = m_local
             return payload
 
@@ -205,9 +202,6 @@ class Client(object):
 
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            if getattr(self.args, 'algo', 'ferret') == 'fedit' and global_named_optim_state is not None:
-                framework.load_named_optim_state(global_named_optim_state)
-                self._maybe_log_loaded_named_state(framework, global_named_optim_state, cur_round, tag='fedit')
             if (
                 getattr(self.args, 'algo', 'ferret') == 'fedexlora'
                 and int(cur_round) == 1
@@ -291,11 +285,9 @@ class Client(object):
                     'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
                 }
 
-            named_optim_state = framework.get_named_optim_state() if getattr(self.args, 'algo', 'ferret') == 'fedit' else None
             self.model = None
             return {
                 'lora_state': local_lora_state,
-                'named_optim_state': named_optim_state,  # FLoRA keeps per-round re-init, no aligned optimizer state upload.
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 
@@ -305,9 +297,6 @@ class Client(object):
 
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            if global_named_optim_state is not None:
-                framework.load_named_optim_state(global_named_optim_state)
-                self._maybe_log_loaded_named_state(framework, global_named_optim_state, cur_round, tag='fedavg')
             self.model.train()
             self.model.zero_grad()
 
@@ -353,11 +342,9 @@ class Client(object):
             for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, torch.Tensor):
                     local_state[name] = tensor.detach().cpu().clone()
-            named_optim_state = framework.get_named_optim_state()
             self.model = None
             return {
                 'model_state_dict': local_state,
-                'named_optim_state': named_optim_state,
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 

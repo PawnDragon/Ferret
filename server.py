@@ -202,10 +202,9 @@ class Server(object):
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
-            if self.algo == 'fedsubsgd':
+            if self.algo != 'fedsubmuon':
                 self.m_global = {}
-            if self.algo == 'fedsubadam':
-                self.v_global = {k: torch.zeros_like(v) for k, v in self.x_global.items()}
+                self.v_global = {}
             name_to_module = dict(self.model.named_modules())
             for layer_name in self.seeds.keys():
                 module = name_to_module[layer_name]
@@ -309,8 +308,8 @@ class Server(object):
     def get_submuon_broadcast_state(self):
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
-            'm_global': {k: v.clone() for k, v in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
-            'v_global': {k: v.clone() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
+            'm_global': {k: v.clone() for k, v in self.m_global.items()} if self.algo == 'fedsubmuon' else None,
+            'v_global': None,
             'seeds': dict(self.seeds),
         }
 
@@ -321,12 +320,10 @@ class Server(object):
             return {
                 'backbone_state_dict': self.model.state_dict(),
                 'global_lora_state': self.get_fedit_broadcast_state(),
-                'global_named_optim_state': self.get_fedit_broadcast_optim_state(),
             }
         if self.algo == 'fedavg':
             return {
                 'backbone_state_dict': self.model.state_dict(),
-                'global_named_optim_state': self.get_fedavg_broadcast_optim_state(),
             }
         if self.algo == 'flora':
             return {
@@ -404,12 +401,12 @@ class Server(object):
 
         transport_state(
             x_global=self.x_global,
-            m_global=self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
+            m_global=self.m_global if self.algo == 'fedsubmuon' else None,
             old_seeds=old_seeds,
             new_seeds=new_seeds,
             layer_dims=self.submuon_layer_dims,
             rank=self.args.rank_r,
-            v_global=self.v_global if self.algo == 'fedsubadam' else None,
+            v_global=None,
         )
         self.seeds = new_seeds
         return True
@@ -421,23 +418,18 @@ class Server(object):
         weight_array = self._get_client_weight_array(selected_client_list)
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
-        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None
-        new_v = {name: torch.zeros_like(val) for name, val in self.v_global.items()} if self.algo == 'fedsubadam' else None
+        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if self.algo == 'fedsubmuon' else None
 
         for client_idx, payload in enumerate(client_payloads):
             w = float(weight_array[client_idx])
             for name in new_x.keys():
                 new_x[name] += payload['x'][name].to(dtype=new_x[name].dtype) * w
-                if self.algo in ['fedsubmuon', 'fedsubadam']:
+                if self.algo == 'fedsubmuon':
                     new_m[name] += payload['m'][name].to(dtype=new_m[name].dtype) * w
-                if self.algo == 'fedsubadam':
-                    new_v[name] += payload['v'][name].to(dtype=new_v[name].dtype) * w
 
         self.x_global = new_x
-        if self.algo in ['fedsubmuon', 'fedsubadam']:
+        if self.algo == 'fedsubmuon':
             self.m_global = new_m
-        if self.algo == 'fedsubadam':
-            self.v_global = new_v
 
     def aggregate_lora(self, client_payloads, selected_client_list):
         if len(client_payloads) == 0:
@@ -455,9 +447,6 @@ class Server(object):
                 for key in state_keys:
                     new_global_lora[key] += local_state[key].to(dtype=torch.float32) * w
             self.global_lora_state = {k: v.cpu() for k, v in new_global_lora.items()}
-            client_named_states = [payload.get('named_optim_state', None) for payload in client_payloads]
-            self.global_named_optim_state = aggregate_named_adamw_states(client_named_states, weight_array)
-            self._maybe_log_global_optim_state(tag='fedit')
             return
 
         if self.algo == 'flora':
@@ -691,10 +680,6 @@ class Server(object):
         self.fedavg_weight_array = self._get_client_weight_array(selected_client_list)
         self.fedavg_accumulator = {}
         self.fedavg_non_float_state = {}
-        self.fedavg_named_optim_accumulator = {}
-        self.fedavg_named_optim_weight_sums = {}
-        self.fedavg_named_optim_maxsq_weight_sums = {}
-        self.fedavg_named_optim_step_max = {}
         self.fedavg_client_count = 0
 
     def accumulate_fedavg_payload(self, payload, client_idx):
@@ -714,7 +699,6 @@ class Server(object):
                 self.fedavg_accumulator[key].add_(tensor_cpu.to(dtype=torch.float32), alpha=weight)
             elif key not in self.fedavg_non_float_state:
                 self.fedavg_non_float_state[key] = tensor_cpu.clone()
-        self._accumulate_fedavg_named_optim_state(payload.get('named_optim_state', None), weight)
         self.fedavg_client_count += 1
 
     def finalize_fedavg_aggregation(self):
@@ -733,27 +717,10 @@ class Server(object):
 
         self.model = self.model.cpu()
         self.model.load_state_dict(averaged_state, strict=True)
-        global_named_state = {'state': {}}
-        for param_name, state_entry in self.fedavg_named_optim_accumulator.items():
-            denom = max(float(self.fedavg_named_optim_weight_sums.get(param_name, 0.0)), 1e-12)
-            out_entry = {
-                'step': int(self.fedavg_named_optim_step_max.get(param_name, 0)),
-                'exp_avg': (state_entry['exp_avg'] / denom).contiguous(),
-                'exp_avg_sq': (state_entry['exp_avg_sq'] / denom).contiguous(),
-            }
-            if 'max_exp_avg_sq' in state_entry:
-                max_denom = max(float(self.fedavg_named_optim_maxsq_weight_sums.get(param_name, 0.0)), 1e-12)
-                out_entry['max_exp_avg_sq'] = (state_entry['max_exp_avg_sq'] / max_denom).contiguous()
-            global_named_state['state'][param_name] = out_entry
-        self.global_named_optim_state = global_named_state
-        self._maybe_log_global_optim_state(tag='fedavg')
+        self.global_named_optim_state = {'state': {}}
         self.fedavg_weight_array = None
         self.fedavg_accumulator = {}
         self.fedavg_non_float_state = {}
-        self.fedavg_named_optim_accumulator = {}
-        self.fedavg_named_optim_weight_sums = {}
-        self.fedavg_named_optim_maxsq_weight_sums = {}
-        self.fedavg_named_optim_step_max = {}
         self.fedavg_client_count = 0
 
     def aggregate_fedavg(self, client_payloads, selected_client_list):
@@ -806,8 +773,8 @@ class Server(object):
             {
                 'backbone_state_dict': self.model.state_dict(),
                 'x_global': {k: v.cpu() for k, v in self.x_global.items()},
-                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
-                'v_global': {k: v.cpu() for k, v in self.v_global.items()} if self.algo == 'fedsubadam' else None,
+                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if self.algo == 'fedsubmuon' else None,
+                'v_global': None,
                 'seeds': dict(self.seeds),
                 'round': int(cur_round),
                 'best_metric': float(metric),
@@ -941,10 +908,10 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
+                self.m_global if self.algo == 'fedsubmuon' else None,
                 self.seeds,
                 trainable=False,
-                v_state=self.v_global if self.algo == 'fedsubadam' else None,
+                v_state=None,
             )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
@@ -1004,10 +971,10 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global if self.algo in ['fedsubmuon', 'fedsubadam'] else None,
+                self.m_global if self.algo == 'fedsubmuon' else None,
                 self.seeds,
                 trainable=False,
-                v_state=self.v_global if self.algo == 'fedsubadam' else None,
+                v_state=None,
             )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))

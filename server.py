@@ -1020,18 +1020,24 @@ class Server(object):
             eval_model.eval()
             temp_eval_model = True
         elif self.algo == 'florg':
-            eval_model = build_florg_model(
-                deepcopy(self.model),
-                self.args,
-                seed_state=self.global_florg_seed_state,
-            ).to(self.device)
-            load_florg_A_state(eval_model, self.global_florg_A_state)
-            eval_model.eval()
-            temp_eval_model = True
-            if not self._florg_eval_debug_logged:
-                layer_name, delta_norm = sample_florg_delta_norm(eval_model)
-                print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
-                self._florg_eval_debug_logged = True
+            if int(cur_round) <= 0:
+                # Round-0 eval uses the untouched backbone baseline.
+                self.model = self.model.to(self.device)
+                self.model.eval()
+                eval_model = self.model
+            else:
+                eval_model = build_florg_model(
+                    deepcopy(self.model),
+                    self.args,
+                    seed_state=self.global_florg_seed_state,
+                ).to(self.device)
+                load_florg_A_state(eval_model, self.global_florg_A_state)
+                eval_model.eval()
+                temp_eval_model = True
+                if not self._florg_eval_debug_logged:
+                    layer_name, delta_norm = sample_florg_delta_norm(eval_model)
+                    print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
+                    self._florg_eval_debug_logged = True
         elif self.algo == 'fedexlora':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_A_state(eval_model, self.global_lora_A_state)
@@ -1096,18 +1102,24 @@ class Server(object):
             eval_model.eval()
             temp_eval_model = True
         elif self.algo == 'florg':
-            eval_model = build_florg_model(
-                deepcopy(self.model),
-                self.args,
-                seed_state=self.global_florg_seed_state,
-            ).to(self.device)
-            load_florg_A_state(eval_model, self.global_florg_A_state)
-            eval_model.eval()
-            temp_eval_model = True
-            if not self._florg_eval_debug_logged:
-                layer_name, delta_norm = sample_florg_delta_norm(eval_model)
-                print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
-                self._florg_eval_debug_logged = True
+            if int(cur_round) <= 0:
+                # Round-0 eval uses the untouched backbone baseline.
+                self.model = self.model.to(self.device)
+                self.model.eval()
+                eval_model = self.model
+            else:
+                eval_model = build_florg_model(
+                    deepcopy(self.model),
+                    self.args,
+                    seed_state=self.global_florg_seed_state,
+                ).to(self.device)
+                load_florg_A_state(eval_model, self.global_florg_A_state)
+                eval_model.eval()
+                temp_eval_model = True
+                if not self._florg_eval_debug_logged:
+                    layer_name, delta_norm = sample_florg_delta_norm(eval_model)
+                    print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
+                    self._florg_eval_debug_logged = True
         elif self.algo == 'fedexlora':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_A_state(eval_model, self.global_lora_A_state)

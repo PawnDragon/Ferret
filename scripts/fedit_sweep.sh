@@ -10,10 +10,9 @@ for seed in "${seeds[@]}"; do
 
   python main.py \
     --algo fedit \
-    --save \
     --model /root/autodl-tmp/llama-3.2-1B/ \
     --dataset dolly \
-    --lr 0.005 \
+    --lr 0.00001 \
     --log \
     --device 0 \
     --momentum 0.0 \
@@ -22,10 +21,11 @@ for seed in "${seeds[@]}"; do
     --seed "${seed}" \
     --lora_r 64 \
     --lora_alpha 64 \
-    --rounds 60 \
+    --rounds 30 \
     --use_wandb \
     --wandb_project ferret \
     --wandb_run_name "${run_name}" \
     --batch_or_epoch epoch \
+    --early_stop \
     "$@"
 done

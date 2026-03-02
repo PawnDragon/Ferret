@@ -5,14 +5,14 @@ set -euo pipefail
 seeds=(494 495 496 497)
 
 for seed in "${seeds[@]}"; do
-  run_name="flora_dolly_seed${seed}"
-  echo "[flora sweep] seed=${seed}, run_name=${run_name}"
+  run_name="fedsalora_dolly_seed${seed}"
+  echo "[fedsalora sweep] seed=${seed}, run_name=${run_name}"
 
   python main.py \
-    --algo flora \
+    --algo fedsalora \
     --model /root/autodl-tmp/llama-3.2-1B/ \
     --dataset dolly \
-    --lr 0.00001 \
+    --lr 0.0001 \
     --log \
     --device 0 \
     --momentum 0.0 \

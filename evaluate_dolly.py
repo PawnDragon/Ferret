@@ -10,7 +10,13 @@ from transformers import AutoModelForCausalLM
 
 from evaluations import rouge_score
 from optimizers.ferret_optimizer import FerretFramework
-from optimizers.lora_utils import build_lora_model, load_lora_state
+from optimizers.lora_utils import (
+    build_lora_model,
+    load_classifier_state,
+    load_lora_A_state,
+    load_lora_B_state,
+    load_lora_state,
+)
 from utils_data.load_data import get_loaders
 from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
@@ -50,6 +56,9 @@ def load_checkpoint_into_model(model, ckpt_path):
     seeds = None
     saved_algo = None
     global_lora_state = None
+    global_lora_A_state = None
+    global_lora_B_state = None
+    global_classifier_state = None
     global_deltaW_state = None
     lora_hparams = {}
 
@@ -60,6 +69,9 @@ def load_checkpoint_into_model(model, ckpt_path):
         v_global = payload.get("v_global", None)
         seeds = payload.get("seeds", None)
         global_lora_state = payload.get("global_lora_state", None)
+        global_lora_A_state = payload.get("global_lora_A_state", None)
+        global_lora_B_state = payload.get("global_lora_B_state", None)
+        global_classifier_state = payload.get("global_classifier_state", None)
         global_deltaW_state = payload.get("global_deltaW_state", None)
         lora_hparams = (
             payload.get("lora_hparams", {})
@@ -78,6 +90,14 @@ def load_checkpoint_into_model(model, ckpt_path):
             or global_deltaW_state is not None
         ):
             ckpt_type = "lora_best"
+        elif (
+            saved_algo == "fedexlora"
+            or (
+                global_lora_A_state is not None
+                and global_lora_B_state is not None
+            )
+        ):
+            ckpt_type = "fedexlora_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
         else:
@@ -95,6 +115,9 @@ def load_checkpoint_into_model(model, ckpt_path):
         seeds,
         saved_algo,
         global_lora_state,
+        global_lora_A_state,
+        global_lora_B_state,
+        global_classifier_state,
         global_deltaW_state,
         lora_hparams,
     )
@@ -138,6 +161,7 @@ def build_parser():
             "fedsubsgd",
             "fedit",
             "flora",
+            "fedexlora",
             "fedavg",
         ],
     )
@@ -217,6 +241,9 @@ def run_evaluate(args):
     seeds = None
     saved_algo = None
     global_lora_state = None
+    global_lora_A_state = None
+    global_lora_B_state = None
+    global_classifier_state = None
     global_deltaW_state = None
     lora_hparams = {}
     if args.checkpoint:
@@ -228,6 +255,9 @@ def run_evaluate(args):
             seeds,
             saved_algo,
             global_lora_state,
+            global_lora_A_state,
+            global_lora_B_state,
+            global_classifier_state,
             global_deltaW_state,
             lora_hparams,
         ) = load_checkpoint_into_model(model, args.checkpoint)
@@ -241,12 +271,18 @@ def run_evaluate(args):
             "fedsubsgd",
             "fedit",
             "flora",
+            "fedexlora",
             "fedavg",
         ]:
             eval_algo = saved_algo
         else:
             if global_lora_state is not None:
                 eval_algo = "fedit"
+            elif (
+                global_lora_A_state is not None
+                and global_lora_B_state is not None
+            ):
+                eval_algo = "fedexlora"
             elif global_deltaW_state is not None:
                 eval_algo = "flora"
             else:
@@ -304,6 +340,18 @@ def run_evaluate(args):
             raise ValueError("FedIT eval requires checkpoint with global_lora_state")
         eval_model = build_lora_model(model, args)
         load_lora_state(eval_model, global_lora_state)
+        eval_model = eval_model.to(device)
+        eval_model.eval()
+    elif eval_algo == "fedexlora":
+        if global_lora_A_state is None:
+            raise ValueError("FedEx-LoRA eval requires checkpoint with global_lora_A_state")
+        if global_lora_B_state is None:
+            raise ValueError("FedEx-LoRA eval requires checkpoint with global_lora_B_state")
+        eval_model = build_lora_model(model, args)
+        load_lora_A_state(eval_model, global_lora_A_state)
+        load_lora_B_state(eval_model, global_lora_B_state)
+        if global_classifier_state is not None:
+            load_classifier_state(eval_model, global_classifier_state)
         eval_model = eval_model.to(device)
         eval_model.eval()
     elif eval_algo == "flora":

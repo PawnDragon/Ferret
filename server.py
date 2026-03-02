@@ -862,6 +862,11 @@ class Server(object):
         elif self.algo == 'fedsalora':
             ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
         else:
+            if len(self.global_lora_A_state) == 0 or len(self.global_lora_B_state) == 0:
+                print(
+                    '[warn][fedexlora] saving best checkpoint with empty LoRA state: '
+                    f'|A|={len(self.global_lora_A_state)}, |B|={len(self.global_lora_B_state)}'
+                )
             ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
             ckpt_payload['global_lora_B_state'] = {k: v.cpu() for k, v in self.global_lora_B_state.items()}
             ckpt_payload['global_classifier_state'] = {k: v.cpu() for k, v in self.global_classifier_state.items()}

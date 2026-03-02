@@ -795,10 +795,51 @@ if __name__ == '__main__':
                 break
 
     best_ckpt_path = os.path.join(log_dir, 'best.pt')
+    final_eval_ckpt_path = best_ckpt_path
     final_round_idx = int(last_round if last_round > 0 else args.rounds)
     if not os.path.exists(best_ckpt_path):
         print(f'[warn] best checkpoint not found at {best_ckpt_path}; skip final eval')
     else:
+        if args.algo == 'fedexlora':
+            best_payload = torch.load(best_ckpt_path, map_location='cpu')
+            if not isinstance(best_payload, dict):
+                raise RuntimeError('[fedexlora] best checkpoint payload must be a dict')
+
+            required_keys = [
+                'backbone_state_dict',
+                'global_lora_A_state',
+                'global_lora_B_state',
+                'global_classifier_state',
+            ]
+            missing_keys = [key for key in required_keys if key not in best_payload]
+            if len(missing_keys) > 0:
+                raise RuntimeError(
+                    f'[fedexlora] best checkpoint missing required keys for final eval: {missing_keys}'
+                )
+            if not isinstance(best_payload['backbone_state_dict'], dict):
+                raise RuntimeError('[fedexlora] backbone_state_dict must be a dict in best checkpoint')
+            if not isinstance(best_payload['global_lora_A_state'], dict):
+                raise RuntimeError('[fedexlora] global_lora_A_state must be a dict in best checkpoint')
+            if not isinstance(best_payload['global_lora_B_state'], dict):
+                raise RuntimeError('[fedexlora] global_lora_B_state must be a dict in best checkpoint')
+            if not isinstance(best_payload['global_classifier_state'], dict):
+                raise RuntimeError('[fedexlora] global_classifier_state must be a dict in best checkpoint')
+
+            eval_ready_payload = {
+                'algo': 'fedexlora',
+                'backbone_state_dict': best_payload['backbone_state_dict'],
+                'global_lora_A_state': best_payload['global_lora_A_state'],
+                'global_lora_B_state': best_payload['global_lora_B_state'],
+                'global_classifier_state': best_payload['global_classifier_state'],
+                'lora_hparams': best_payload.get('lora_hparams', {}),
+                'round': int(best_payload.get('round', final_round_idx)),
+                'best_metric': float(best_payload.get('best_metric', float('nan'))),
+                'metric': float(best_payload.get('metric', float('nan'))),
+            }
+            final_eval_ckpt_path = os.path.join(log_dir, 'best_eval_ready.pt')
+            torch.save(eval_ready_payload, final_eval_ckpt_path)
+            print(f'[info][fedexlora] Prepared eval-ready checkpoint: {final_eval_ckpt_path}')
+
         data_args = {
             'dataset': args.dataset,
             'zerotask': args.zerotask,
@@ -829,7 +870,7 @@ if __name__ == '__main__':
             'lora_bias': args.lora_bias,
         }
         final_eval = run_evaluate_from_checkpoint(
-            checkpoint_path=best_ckpt_path,
+            checkpoint_path=final_eval_ckpt_path,
             model_name_or_path=args.model,
             tokenizer_name_or_path=args.model,
             data_args=data_args,
@@ -843,7 +884,7 @@ if __name__ == '__main__':
                 json.dump(
                     {
                         f'final_eval_{final_metric_name}': final_metric_val,
-                        'checkpoint': best_ckpt_path,
+                        'checkpoint': final_eval_ckpt_path,
                         'round_end': final_round_idx,
                         'early_stopped': bool(early_stopped),
                         'early_stop_best_round': int(early_state['best_round']),

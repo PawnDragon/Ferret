@@ -424,6 +424,11 @@ class Server(object):
             }
         return out
 
+    def get_florg_basis_state_ref(self):
+        if self.algo != 'florg':
+            return None
+        return self.global_florg_basis_state
+
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
             return None

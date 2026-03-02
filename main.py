@@ -300,10 +300,6 @@ if __name__ == '__main__':
 
     server = Server(args, eval_loader=eval_loader, candidate_seeds=candidate_seeds, log_dir=log_dir)
     client_list = [Client(idx, args, candidate_seeds, list_train_loader[idx]) for idx in range(args.num_clients)]
-    if args.algo == 'florg':
-        initial_florg_basis = server.get_florg_basis_state()
-        for client in client_list:
-            client.set_florg_basis_state(initial_florg_basis)
 
     if args.debug_transport_check and args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] and len(server.seeds) > 0:
         first_layer = next(iter(server.seeds.keys()))
@@ -534,6 +530,7 @@ if __name__ == '__main__':
         elif args.algo == 'florg':
             broadcast_florg_A = server.get_florg_broadcast_state()
             broadcast_florg_seed_state = server.get_florg_seed_state()
+            broadcast_florg_basis_state = server.get_florg_basis_state_ref()
             total_comm_down_bytes = compute_comm_size({'global_florg_A_state': broadcast_florg_A}) * len(selected_client)
             client_payloads = []
             for client in selected_client:
@@ -542,7 +539,7 @@ if __name__ == '__main__':
                     cur_round=r,
                     florg_A_state=broadcast_florg_A,
                     florg_seed_state=broadcast_florg_seed_state,
-                    florg_basis_state=None,
+                    florg_basis_state=broadcast_florg_basis_state,
                 )
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])

@@ -27,6 +27,7 @@ from optimizers.lora_utils import (
 from optimizers.florg_utils import (
     build_florg_model,
     extract_florg_A_state,
+    extract_florg_basis_state,
     extract_florg_seed_state,
     load_florg_A_state,
     sample_florg_delta_norm,
@@ -196,6 +197,7 @@ class Server(object):
         self.global_deltaW_state = {}
         self.global_florg_A_state = {}
         self.global_florg_seed_state = {}
+        self.global_florg_basis_state = {}
         self.flora_scaling = lora_scaling(self.args)
         self.fedavg_weight_array = None
         self.fedavg_accumulator = {}
@@ -240,6 +242,7 @@ class Server(object):
             init_model = build_florg_model(deepcopy(self.model), self.args)
             self.global_florg_A_state = extract_florg_A_state(init_model)
             self.global_florg_seed_state = extract_florg_seed_state(init_model)
+            self.global_florg_basis_state = extract_florg_basis_state(init_model)
             del init_model
 
     def _get_ckpt_dir(self):
@@ -403,6 +406,23 @@ class Server(object):
             'base_seed': seed_state.get('base_seed', None),
             'layer_seeds': {str(k): int(v) for k, v in layer_seeds.items()},
         }
+
+    def get_florg_basis_state(self):
+        if self.algo != 'florg':
+            return None
+        out = {}
+        for layer_name, layer_state in self.global_florg_basis_state.items():
+            if not isinstance(layer_state, dict):
+                continue
+            l_tensor = layer_state.get('L', None)
+            r_tensor = layer_state.get('R', None)
+            if not isinstance(l_tensor, torch.Tensor) or not isinstance(r_tensor, torch.Tensor):
+                continue
+            out[layer_name] = {
+                'L': l_tensor.clone(),
+                'R': r_tensor.clone(),
+            }
+        return out
 
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
@@ -960,6 +980,7 @@ class Server(object):
                 print('[warn][florg] saving best checkpoint with empty florg A state')
             ckpt_payload['global_florg_A_state'] = {k: v.cpu() for k, v in self.global_florg_A_state.items()}
             ckpt_payload['global_florg_seed_state'] = self.get_florg_seed_state()
+            ckpt_payload['global_florg_basis_state'] = self.get_florg_basis_state()
             ckpt_payload['florg_hparams'] = {
                 'florg_rank_r': int(getattr(self.args, 'florg_rank_r', 16)),
                 'florg_seed_base': int(getattr(self.args, 'florg_seed_base', 95317)),
@@ -1030,6 +1051,7 @@ class Server(object):
                     deepcopy(self.model),
                     self.args,
                     seed_state=self.global_florg_seed_state,
+                    basis_state=self.global_florg_basis_state,
                 ).to(self.device)
                 load_florg_A_state(eval_model, self.global_florg_A_state)
                 eval_model.eval()
@@ -1112,6 +1134,7 @@ class Server(object):
                     deepcopy(self.model),
                     self.args,
                     seed_state=self.global_florg_seed_state,
+                    basis_state=self.global_florg_basis_state,
                 ).to(self.device)
                 load_florg_A_state(eval_model, self.global_florg_A_state)
                 eval_model.eval()

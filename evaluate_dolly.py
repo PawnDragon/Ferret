@@ -68,6 +68,7 @@ def load_checkpoint_into_model(model, ckpt_path):
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
+    global_florg_basis_state = None
     florg_hparams = {}
 
     if isinstance(payload, dict) and "backbone_state_dict" in payload:
@@ -83,6 +84,7 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_deltaW_state = payload.get("global_deltaW_state", None)
         global_florg_A_state = payload.get("global_florg_A_state", None)
         global_florg_seed_state = payload.get("global_florg_seed_state", None)
+        global_florg_basis_state = payload.get("global_florg_basis_state", None)
         lora_hparams = (
             payload.get("lora_hparams", {})
             if isinstance(payload.get("lora_hparams", {}), dict)
@@ -139,6 +141,7 @@ def load_checkpoint_into_model(model, ckpt_path):
         lora_hparams,
         global_florg_A_state,
         global_florg_seed_state,
+        global_florg_basis_state,
         florg_hparams,
     )
 
@@ -277,6 +280,7 @@ def run_evaluate(args):
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
+    global_florg_basis_state = None
     florg_hparams = {}
     if args.checkpoint:
         (
@@ -294,6 +298,7 @@ def run_evaluate(args):
             lora_hparams,
             global_florg_A_state,
             global_florg_seed_state,
+            global_florg_basis_state,
             florg_hparams,
         ) = load_checkpoint_into_model(model, args.checkpoint)
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
@@ -400,7 +405,12 @@ def run_evaluate(args):
             raise ValueError("FLoRG eval requires checkpoint with global_florg_A_state")
         if global_florg_seed_state is None:
             raise ValueError("FLoRG eval requires checkpoint with global_florg_seed_state")
-        eval_model = build_florg_model(model, args, seed_state=global_florg_seed_state)
+        eval_model = build_florg_model(
+            model,
+            args,
+            seed_state=global_florg_seed_state,
+            basis_state=global_florg_basis_state,
+        )
         load_florg_A_state(eval_model, global_florg_A_state)
         eval_model = eval_model.to(device)
         eval_model.eval()

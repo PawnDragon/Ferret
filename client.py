@@ -38,6 +38,27 @@ class Client(object):
         self._florg_shape_logged = False
         self.local_lora_B_state = None
         self.prev_round_lora_A_state = None
+        self.local_florg_basis_state = None
+
+    def _clone_florg_basis_state(self, basis_state):
+        if not isinstance(basis_state, dict):
+            return {}
+        out = {}
+        for layer_name, layer_state in basis_state.items():
+            if not isinstance(layer_state, dict):
+                continue
+            l_tensor = layer_state.get('L', None)
+            r_tensor = layer_state.get('R', None)
+            if not isinstance(l_tensor, torch.Tensor) or not isinstance(r_tensor, torch.Tensor):
+                continue
+            out[layer_name] = {
+                'L': l_tensor.detach().cpu().clone(),
+                'R': r_tensor.detach().cpu().clone(),
+            }
+        return out
+
+    def set_florg_basis_state(self, basis_state):
+        self.local_florg_basis_state = self._clone_florg_basis_state(basis_state)
 
     def _maybe_log_florg_shapes(self, cur_round):
         if self._florg_shape_logged or self.idx != 0:
@@ -129,6 +150,7 @@ class Client(object):
         classifier_state=None,
         florg_A_state=None,
         florg_seed_state=None,
+        florg_basis_state=None,
         fedavg_global_state=None,
         global_named_optim_state=None,
     ):
@@ -198,7 +220,14 @@ class Client(object):
 
         if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
             if getattr(self.args, 'algo', 'ferret') == 'florg':
-                self.model = build_florg_model(self.model, self.args, seed_state=florg_seed_state)
+                if self.local_florg_basis_state is None and florg_basis_state is not None:
+                    self.local_florg_basis_state = self._clone_florg_basis_state(florg_basis_state)
+                self.model = build_florg_model(
+                    self.model,
+                    self.args,
+                    seed_state=florg_seed_state,
+                    basis_state=self.local_florg_basis_state,
+                )
             else:
                 self.model = build_lora_model(self.model, self.args)
             self.model.to(self.device)

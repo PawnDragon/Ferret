@@ -352,6 +352,8 @@ def run_evaluate(args):
             args.florg_rank_r = int(florg_hparams["florg_rank_r"])
         if "florg_seed_base" in florg_hparams:
             args.florg_seed_base = int(florg_hparams["florg_seed_base"])
+        if "lora_target_modules" in florg_hparams:
+            args.lora_target_modules = florg_hparams["lora_target_modules"]
 
     model = model.to(device)
     model.eval()

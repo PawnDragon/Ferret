@@ -29,6 +29,40 @@ def _clone_seed_state(seed_state):
     }
 
 
+def _parse_target_modules(raw_target_modules):
+    if raw_target_modules is None:
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if isinstance(raw_target_modules, (list, tuple)):
+        parsed = [str(item).strip() for item in raw_target_modules if str(item).strip() != ""]
+        return parsed if len(parsed) > 0 else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    target_text = str(raw_target_modules).strip()
+    if target_text == "":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if target_text.lower() in ["all-linear", "all_linear"]:
+        return "all-linear"
+    if "," in target_text:
+        parsed = [part.strip() for part in target_text.split(",") if part.strip() != ""]
+        return parsed if len(parsed) > 0 else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return [target_text]
+
+
+def select_florg_target_linear_layers(model, args, rank_r):
+    all_linear_layers = select_target_linear_layers(model, rank_r)
+    target_modules = _parse_target_modules(getattr(args, "lora_target_modules", None))
+    if target_modules == "all-linear":
+        return all_linear_layers
+
+    selected = []
+    for layer_name in all_linear_layers:
+        leaf_name = layer_name.split(".")[-1]
+        for token in target_modules:
+            if layer_name == token or layer_name.endswith(f".{token}") or leaf_name == token:
+                selected.append(layer_name)
+                break
+    return selected
+
+
 def _clone_basis_state(basis_state):
     if not isinstance(basis_state, dict):
         return {}
@@ -47,8 +81,7 @@ def _clone_basis_state(basis_state):
     return out
 
 
-def _make_layer_seed_state(model, rank_r, base_seed):
-    layer_names = select_target_linear_layers(model, rank_r)
+def _make_layer_seed_state(layer_names, base_seed):
     layer_seeds = {}
     for idx, layer_name in enumerate(layer_names):
         layer_seeds[layer_name] = int(base_seed + idx * 104729)
@@ -66,10 +99,16 @@ def build_florg_model(backbone_model, args, seed_state=None, basis_state=None):
     rank_r = int(getattr(args, "florg_rank_r", getattr(args, "rank_r", 8)))
     if rank_r <= 0:
         raise ValueError(f"florg rank must be positive, got {rank_r}")
+    target_layer_names = select_florg_target_linear_layers(backbone_model, args, rank_r)
+    if len(target_layer_names) == 0:
+        raise RuntimeError(
+            "[florg] no target linear layers matched. "
+            "Please check --lora_target_modules/--florg_rank_r."
+        )
 
     if seed_state is None:
         base_seed = int(getattr(args, "florg_seed_base", int(getattr(args, "seed", 42)) + 911))
-        seed_state = _make_layer_seed_state(backbone_model, rank_r, base_seed)
+        seed_state = _make_layer_seed_state(target_layer_names, base_seed)
     else:
         seed_state = _clone_seed_state(seed_state)
     if not isinstance(basis_state, dict):
@@ -77,7 +116,7 @@ def build_florg_model(backbone_model, args, seed_state=None, basis_state=None):
 
     layer_seeds = seed_state.get("layer_seeds", {})
     resolved_basis_state = {}
-    for layer_name in select_target_linear_layers(backbone_model, rank_r):
+    for layer_name in target_layer_names:
         if layer_name not in layer_seeds:
             raise RuntimeError(f"[florg] missing layer seed for {layer_name}")
 
@@ -148,8 +187,10 @@ def build_florg_model(backbone_model, args, seed_state=None, basis_state=None):
 
             A = _module.florg_A.float()
             Q = torch.matmul(A.t(), A)
-            delta_w = torch.matmul(_module.florg_L.float(), torch.matmul(Q, _module.florg_R.float()))
-            y1 = F.linear(x2.float(), delta_w, bias=None)
+            # Equivalent to F.linear(x2, (L @ Q @ R), None) but avoids materializing deltaW.
+            z = torch.matmul(x2.float(), _module.florg_R.float().t())
+            z = torch.matmul(z, Q)
+            y1 = torch.matmul(z, _module.florg_L.float().t())
             y = y0.float() + y1
             return y.to(dtype=y0.dtype).reshape(*input_shape[:-1], _module.out_features)
 

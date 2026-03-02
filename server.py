@@ -989,6 +989,7 @@ class Server(object):
             ckpt_payload['florg_hparams'] = {
                 'florg_rank_r': int(getattr(self.args, 'florg_rank_r', 16)),
                 'florg_seed_base': int(getattr(self.args, 'florg_seed_base', 95317)),
+                'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
             }
 
         best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')

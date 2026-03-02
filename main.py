@@ -51,7 +51,7 @@ def is_finite_scalar(value):
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
     if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
-    if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora']:
+    if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
         return server.save_best_fedavg_ckpt(metric, cur_round)
@@ -95,7 +95,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedsalora', 'fedexlora', 'fedavg'])
+    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedsalora', 'fedexlora', 'florg', 'fedavg'])
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -161,6 +161,8 @@ if __name__ == '__main__':
     parser.add_argument('--lora_dropout', type=float, default=0.0)
     parser.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
     parser.add_argument('--lora_bias', type=str, default='none', choices=['none', 'all', 'lora_only'])
+    parser.add_argument('--florg_rank_r', type=int, default=16, help='rank r for FLoRG A matrix')
+    parser.add_argument('--florg_seed_base', type=int, default=95317, help='base seed for deterministic FLoRG L/R generation')
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')
@@ -490,6 +492,58 @@ if __name__ == '__main__':
                 total_comm_up_bytes += compute_comm_size(payload.get('lora_A_state', {}))
 
             server.aggregate_fedsalora(client_a_states, selected_client)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo == 'florg':
+            broadcast_florg_A = server.get_florg_broadcast_state()
+            broadcast_florg_seed_state = server.get_florg_seed_state()
+            total_comm_down_bytes = compute_comm_size({'global_florg_A_state': broadcast_florg_A}) * len(selected_client)
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(
+                    deepcopy(server.model),
+                    cur_round=r,
+                    florg_A_state=broadcast_florg_A,
+                    florg_seed_state=broadcast_florg_seed_state,
+                )
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size({'florg_A': payload.get('florg_A', {})})
+
+            server.aggregate_florg(client_payloads, selected_client, cur_round=r)
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
             if args.round_eval_false:
@@ -855,6 +909,8 @@ if __name__ == '__main__':
             'lora_dropout': args.lora_dropout,
             'lora_target_modules': args.lora_target_modules,
             'lora_bias': args.lora_bias,
+            'florg_rank_r': args.florg_rank_r,
+            'florg_seed_base': args.florg_seed_base,
         }
         final_eval = run_evaluate_from_checkpoint(
             checkpoint_path=final_eval_ckpt_path,

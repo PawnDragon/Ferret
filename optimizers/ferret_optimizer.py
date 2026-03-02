@@ -128,10 +128,13 @@ class FerretFramework(object):
         self.lr = lr
         self.model = model
         self.algo = getattr(args, 'algo', 'ferret')
-        if self.algo in ['fedsalora', 'fedexlora']:
+        if self.algo in ['fedsalora', 'fedexlora', 'florg']:
             for name, param in self.model.named_parameters():
-                keep_trainable = 'lora_' in name
-                if self.algo == 'fedexlora' and _is_classifier_param_name(name):
+                if self.algo == 'florg':
+                    keep_trainable = 'florg_A' in name
+                else:
+                    keep_trainable = 'lora_' in name
+                if self.algo in ['fedexlora', 'florg'] and _is_classifier_param_name(name):
                     keep_trainable = True
                 if not keep_trainable:
                     param.requires_grad_(False)

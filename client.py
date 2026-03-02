@@ -13,6 +13,11 @@ from optimizers.lora_utils import (
     load_lora_B_state,
     load_lora_state,
 )
+from optimizers.florg_utils import (
+    build_florg_model,
+    extract_florg_A_state,
+    load_florg_A_state,
+)
 
 
 class Client(object):
@@ -30,8 +35,23 @@ class Client(object):
         self.candidate_seeds = candidate_seeds
         self._optim_debug_logged = False
         self._fedex_optim_reset_logged = False
+        self._florg_shape_logged = False
         self.local_lora_B_state = None
         self.prev_round_lora_A_state = None
+
+    def _maybe_log_florg_shapes(self, cur_round):
+        if self._florg_shape_logged or self.idx != 0:
+            return
+        for layer_name, module in self.model.named_modules():
+            if not hasattr(module, 'florg_A'):
+                continue
+            print(
+                f'[debug][florg][client{self.idx}] round {cur_round} '
+                f'layer={layer_name} L_shape={tuple(module.florg_L.shape)} '
+                f'R_shape={tuple(module.florg_R.shape)} A_shape={tuple(module.florg_A.shape)}'
+            )
+            self._florg_shape_logged = True
+            return
 
     def _set_runtime_debug_context(self, cur_round):
         # Shared args object carries lightweight runtime context for framework-level debug prints.
@@ -107,6 +127,8 @@ class Client(object):
         lora_A_state=None,
         lora_B_state=None,
         classifier_state=None,
+        florg_A_state=None,
+        florg_seed_state=None,
         fedavg_global_state=None,
         global_named_optim_state=None,
     ):
@@ -174,8 +196,11 @@ class Client(object):
                 payload['m'] = m_local
             return payload
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora']:
-            self.model = build_lora_model(self.model, self.args)
+        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
+            if getattr(self.args, 'algo', 'ferret') == 'florg':
+                self.model = build_florg_model(self.model, self.args, seed_state=florg_seed_state)
+            else:
+                self.model = build_lora_model(self.model, self.args)
             self.model.to(self.device)
             if getattr(self.args, 'algo', 'ferret') == 'fedit':
                 load_lora_state(self.model, lora_state)
@@ -199,6 +224,9 @@ class Client(object):
                 load_lora_A_state(self.model, lora_A_state)
                 load_lora_B_state(self.model, lora_B_state)
                 load_classifier_state(self.model, classifier_state)
+            elif getattr(self.args, 'algo', 'ferret') == 'florg':
+                load_florg_A_state(self.model, florg_A_state)
+                self._maybe_log_florg_shapes(cur_round)
 
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
@@ -282,6 +310,14 @@ class Client(object):
                     'lora_A_state': local_lora_A_state,
                     'lora_B_state': local_lora_B_state,
                     'classifier_state': local_classifier_state,
+                    'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+                }
+            if getattr(self.args, 'algo', 'ferret') == 'florg':
+                local_florg_A_state = extract_florg_A_state(self.model)
+                self.model = None
+                return {
+                    'florg_A': local_florg_A_state,
+                    'num_samples': len(self.train_loader),
                     'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
                 }
 

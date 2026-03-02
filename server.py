@@ -24,6 +24,13 @@ from optimizers.lora_utils import (
     lora_scaling,
     resolve_layer_name_for_model,
 )
+from optimizers.florg_utils import (
+    build_florg_model,
+    extract_florg_A_state,
+    extract_florg_seed_state,
+    load_florg_A_state,
+    sample_florg_delta_norm,
+)
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
@@ -187,6 +194,8 @@ class Server(object):
         self.global_lora_B_state = {}
         self.global_classifier_state = {}
         self.global_deltaW_state = {}
+        self.global_florg_A_state = {}
+        self.global_florg_seed_state = {}
         self.flora_scaling = lora_scaling(self.args)
         self.fedavg_weight_array = None
         self.fedavg_accumulator = {}
@@ -199,6 +208,8 @@ class Server(object):
         self.global_named_optim_state = {'state': {}}
         self._optim_debug_logged = False
         self._fedex_debug_logged = False
+        self._florg_debug_logged = False
+        self._florg_eval_debug_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
@@ -224,6 +235,11 @@ class Server(object):
             self.global_lora_B_state = extract_lora_B_state(init_model)
             self.global_classifier_state = extract_classifier_state(init_model)
             load_classifier_state(self.model, self.global_classifier_state)
+            del init_model
+        if self.algo == 'florg':
+            init_model = build_florg_model(deepcopy(self.model), self.args)
+            self.global_florg_A_state = extract_florg_A_state(init_model)
+            self.global_florg_seed_state = extract_florg_seed_state(init_model)
             del init_model
 
     def _get_ckpt_dir(self):
@@ -336,6 +352,10 @@ class Server(object):
             }
         if self.algo == 'fedexlora':
             return self.get_broadcast_state_fedexlora()
+        if self.algo == 'florg':
+            return {
+                'global_florg_A_state': self.get_florg_broadcast_state(),
+            }
         return {
             'backbone_state_dict': self.model.state_dict(),
         }
@@ -363,6 +383,25 @@ class Server(object):
             'global_lora_A_state': {k: v.clone() for k, v in self.global_lora_A_state.items()},
             'global_lora_B_state': {k: v.clone() for k, v in self.global_lora_B_state.items()},
             'global_classifier_state': {k: v.clone() for k, v in self.global_classifier_state.items()},
+        }
+
+    def get_florg_broadcast_state(self):
+        if self.algo != 'florg':
+            return None
+        return {k: v.clone() for k, v in self.global_florg_A_state.items()}
+
+    def get_florg_seed_state(self):
+        if self.algo != 'florg':
+            return None
+        seed_state = self.global_florg_seed_state
+        if not isinstance(seed_state, dict):
+            return {'base_seed': None, 'layer_seeds': {}}
+        layer_seeds = seed_state.get('layer_seeds', {})
+        if not isinstance(layer_seeds, dict):
+            layer_seeds = {}
+        return {
+            'base_seed': seed_state.get('base_seed', None),
+            'layer_seeds': {str(k): int(v) for k, v in layer_seeds.items()},
         }
 
     def get_fedavg_broadcast_state(self):
@@ -625,6 +664,61 @@ class Server(object):
         self.global_lora_A_state = new_global_lora_a
         self.global_lora_B_state = new_global_lora_b
 
+    def aggregate_florg(self, client_payloads, selected_client_list, cur_round=1):
+        if len(client_payloads) == 0:
+            return
+        if len(self.global_florg_A_state) == 0:
+            return
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+        new_global_florg_a = {}
+
+        for key, prev_a in self.global_florg_A_state.items():
+            prev_a_f32 = prev_a.to(dtype=torch.float32)
+            if prev_a_f32.ndim != 2:
+                raise RuntimeError(f'[florg] expected 2D A tensor for key={key}, got shape={tuple(prev_a_f32.shape)}')
+            rank_r, k = int(prev_a_f32.shape[0]), int(prev_a_f32.shape[1])
+            gram_q = torch.zeros((k, k), dtype=torch.float32)
+
+            for client_idx, payload in enumerate(client_payloads):
+                local_state = payload.get('florg_A', {})
+                if key not in local_state:
+                    raise RuntimeError(f'[florg] missing key in client payload: {key}')
+                local_a = local_state[key].to(dtype=torch.float32)
+                if tuple(local_a.shape) != (rank_r, k):
+                    raise RuntimeError(
+                        f'[florg] shape mismatch for {key}: expected {(rank_r, k)}, got {tuple(local_a.shape)}'
+                    )
+                weight = float(weight_array[client_idx])
+                gram_q += torch.matmul(local_a.t(), local_a) * weight
+
+            gram_q = 0.5 * (gram_q + gram_q.t())
+            eigvals, eigvecs = torch.linalg.eigh(gram_q)
+            sort_idx = torch.argsort(eigvals, descending=True)
+            top_idx = sort_idx[:rank_r]
+            top_vals = eigvals[top_idx].clamp_min(0.0)
+            top_vecs = eigvecs[:, top_idx]
+            a_tilde = torch.matmul(torch.diag(torch.sqrt(top_vals)), top_vecs.t())
+
+            procrustes_m = torch.matmul(prev_a_f32, a_tilde.t())
+            U, _, Vh = torch.linalg.svd(procrustes_m, full_matrices=False)
+            S = torch.matmul(U, Vh)
+            a_next = torch.matmul(S, a_tilde)
+            new_global_florg_a[key] = a_next.cpu().contiguous()
+
+            if (not self._florg_debug_logged) and int(cur_round) >= 1:
+                top3 = torch.sort(eigvals, descending=True).values[:3]
+                approx_err = torch.linalg.norm(torch.matmul(a_next.t(), a_next) - gram_q)
+                print(
+                    f'[debug][florg][server] key={key} '
+                    f'top_eigs={[float(v.item()) for v in top3]} '
+                    f'||Q||={float(torch.linalg.norm(gram_q).item()):.6e} '
+                    f'||A_next^T A_next - Q||={float(approx_err.item()):.6e}'
+                )
+                self._florg_debug_logged = True
+
+        self.global_florg_A_state = new_global_florg_a
+
     def _accumulate_fedavg_named_optim_state(self, named_state, weight):
         if not isinstance(named_state, dict):
             return
@@ -796,7 +890,7 @@ class Server(object):
         return True
 
     def save_best_lora_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedit', 'flora', 'fedsalora', 'fedexlora'] or not self.args.save:
+        if self.algo not in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -812,23 +906,47 @@ class Server(object):
             'round': int(cur_round),
             'best_metric': float(self.best_metric),
             'metric': float(metric),
-            'lora_hparams': {
+        }
+
+        if self.algo == 'fedit':
+            ckpt_payload['lora_hparams'] = {
                 'lora_r': int(getattr(self.args, 'lora_r', 16)),
                 'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
                 'lora_dropout': float(getattr(self.args, 'lora_dropout', 0.0)),
                 'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 'lora_bias': getattr(self.args, 'lora_bias', 'none'),
                 'scaling': float(self.flora_scaling),
-            },
-        }
-
-        if self.algo == 'fedit':
+            }
             ckpt_payload['global_lora_state'] = {k: v.cpu() for k, v in self.global_lora_state.items()}
         elif self.algo == 'flora':
+            ckpt_payload['lora_hparams'] = {
+                'lora_r': int(getattr(self.args, 'lora_r', 16)),
+                'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
+                'lora_dropout': float(getattr(self.args, 'lora_dropout', 0.0)),
+                'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                'lora_bias': getattr(self.args, 'lora_bias', 'none'),
+                'scaling': float(self.flora_scaling),
+            }
             ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
         elif self.algo == 'fedsalora':
+            ckpt_payload['lora_hparams'] = {
+                'lora_r': int(getattr(self.args, 'lora_r', 16)),
+                'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
+                'lora_dropout': float(getattr(self.args, 'lora_dropout', 0.0)),
+                'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                'lora_bias': getattr(self.args, 'lora_bias', 'none'),
+                'scaling': float(self.flora_scaling),
+            }
             ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
-        else:
+        elif self.algo == 'fedexlora':
+            ckpt_payload['lora_hparams'] = {
+                'lora_r': int(getattr(self.args, 'lora_r', 16)),
+                'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
+                'lora_dropout': float(getattr(self.args, 'lora_dropout', 0.0)),
+                'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                'lora_bias': getattr(self.args, 'lora_bias', 'none'),
+                'scaling': float(self.flora_scaling),
+            }
             if len(self.global_lora_A_state) == 0 or len(self.global_lora_B_state) == 0:
                 print(
                     '[warn][fedexlora] saving best checkpoint with empty LoRA state: '
@@ -837,6 +955,15 @@ class Server(object):
             ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
             ckpt_payload['global_lora_B_state'] = {k: v.cpu() for k, v in self.global_lora_B_state.items()}
             ckpt_payload['global_classifier_state'] = {k: v.cpu() for k, v in self.global_classifier_state.items()}
+        else:
+            if len(self.global_florg_A_state) == 0:
+                print('[warn][florg] saving best checkpoint with empty florg A state')
+            ckpt_payload['global_florg_A_state'] = {k: v.cpu() for k, v in self.global_florg_A_state.items()}
+            ckpt_payload['global_florg_seed_state'] = self.get_florg_seed_state()
+            ckpt_payload['florg_hparams'] = {
+                'florg_rank_r': int(getattr(self.args, 'florg_rank_r', 16)),
+                'florg_seed_base': int(getattr(self.args, 'florg_seed_base', 95317)),
+            }
 
         best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
         torch.save(ckpt_payload, best_ckpt_path)
@@ -892,6 +1019,19 @@ class Server(object):
             load_lora_state(eval_model, self.global_lora_state)
             eval_model.eval()
             temp_eval_model = True
+        elif self.algo == 'florg':
+            eval_model = build_florg_model(
+                deepcopy(self.model),
+                self.args,
+                seed_state=self.global_florg_seed_state,
+            ).to(self.device)
+            load_florg_A_state(eval_model, self.global_florg_A_state)
+            eval_model.eval()
+            temp_eval_model = True
+            if not self._florg_eval_debug_logged:
+                layer_name, delta_norm = sample_florg_delta_norm(eval_model)
+                print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
+                self._florg_eval_debug_logged = True
         elif self.algo == 'fedexlora':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_A_state(eval_model, self.global_lora_A_state)
@@ -955,6 +1095,19 @@ class Server(object):
             load_lora_state(eval_model, self.global_lora_state)
             eval_model.eval()
             temp_eval_model = True
+        elif self.algo == 'florg':
+            eval_model = build_florg_model(
+                deepcopy(self.model),
+                self.args,
+                seed_state=self.global_florg_seed_state,
+            ).to(self.device)
+            load_florg_A_state(eval_model, self.global_florg_A_state)
+            eval_model.eval()
+            temp_eval_model = True
+            if not self._florg_eval_debug_logged:
+                layer_name, delta_norm = sample_florg_delta_norm(eval_model)
+                print(f'[debug][florg][eval] layer={layer_name} ||deltaW||={delta_norm:.6e}')
+                self._florg_eval_debug_logged = True
         elif self.algo == 'fedexlora':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_A_state(eval_model, self.global_lora_A_state)

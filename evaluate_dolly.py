@@ -17,6 +17,11 @@ from optimizers.lora_utils import (
     load_lora_B_state,
     load_lora_state,
 )
+from optimizers.florg_utils import (
+    build_florg_model,
+    load_florg_A_state,
+    sample_florg_delta_norm,
+)
 from utils_data.load_data import get_loaders
 from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
@@ -61,6 +66,9 @@ def load_checkpoint_into_model(model, ckpt_path):
     global_classifier_state = None
     global_deltaW_state = None
     lora_hparams = {}
+    global_florg_A_state = None
+    global_florg_seed_state = None
+    florg_hparams = {}
 
     if isinstance(payload, dict) and "backbone_state_dict" in payload:
         model.load_state_dict(payload["backbone_state_dict"], strict=True)
@@ -73,9 +81,16 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_lora_B_state = payload.get("global_lora_B_state", None)
         global_classifier_state = payload.get("global_classifier_state", None)
         global_deltaW_state = payload.get("global_deltaW_state", None)
+        global_florg_A_state = payload.get("global_florg_A_state", None)
+        global_florg_seed_state = payload.get("global_florg_seed_state", None)
         lora_hparams = (
             payload.get("lora_hparams", {})
             if isinstance(payload.get("lora_hparams", {}), dict)
+            else {}
+        )
+        florg_hparams = (
+            payload.get("florg_hparams", {})
+            if isinstance(payload.get("florg_hparams", {}), dict)
             else {}
         )
         hparams = payload.get("hparams", None)
@@ -98,6 +113,8 @@ def load_checkpoint_into_model(model, ckpt_path):
             )
         ):
             ckpt_type = "fedexlora_best"
+        elif saved_algo == "florg" or global_florg_A_state is not None:
+            ckpt_type = "florg_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
         else:
@@ -120,6 +137,9 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_classifier_state,
         global_deltaW_state,
         lora_hparams,
+        global_florg_A_state,
+        global_florg_seed_state,
+        florg_hparams,
     )
 
 
@@ -162,6 +182,7 @@ def build_parser():
             "fedit",
             "flora",
             "fedexlora",
+            "florg",
             "fedavg",
         ],
     )
@@ -206,6 +227,8 @@ def build_parser():
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
     parser.add_argument("--lora_bias", type=str, default="none")
+    parser.add_argument("--florg_rank_r", type=int, default=16)
+    parser.add_argument("--florg_seed_base", type=int, default=95317)
 
     parser.add_argument("--save_json", type=str, default="")
     return parser
@@ -252,6 +275,9 @@ def run_evaluate(args):
     global_classifier_state = None
     global_deltaW_state = None
     lora_hparams = {}
+    global_florg_A_state = None
+    global_florg_seed_state = None
+    florg_hparams = {}
     if args.checkpoint:
         (
             ckpt_type,
@@ -266,6 +292,9 @@ def run_evaluate(args):
             global_classifier_state,
             global_deltaW_state,
             lora_hparams,
+            global_florg_A_state,
+            global_florg_seed_state,
+            florg_hparams,
         ) = load_checkpoint_into_model(model, args.checkpoint)
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
 
@@ -278,6 +307,7 @@ def run_evaluate(args):
             "fedit",
             "flora",
             "fedexlora",
+            "florg",
             "fedavg",
         ]:
             eval_algo = saved_algo
@@ -289,6 +319,8 @@ def run_evaluate(args):
                 and global_lora_B_state is not None
             ):
                 eval_algo = "fedexlora"
+            elif global_florg_A_state is not None:
+                eval_algo = "florg"
             elif global_deltaW_state is not None:
                 eval_algo = "flora"
             else:
@@ -310,6 +342,11 @@ def run_evaluate(args):
             args.lora_target_modules = lora_hparams["lora_target_modules"]
         if "lora_bias" in lora_hparams:
             args.lora_bias = lora_hparams["lora_bias"]
+    if isinstance(florg_hparams, dict) and len(florg_hparams) > 0:
+        if "florg_rank_r" in florg_hparams:
+            args.florg_rank_r = int(florg_hparams["florg_rank_r"])
+        if "florg_seed_base" in florg_hparams:
+            args.florg_seed_base = int(florg_hparams["florg_seed_base"])
 
     model = model.to(device)
     model.eval()
@@ -358,6 +395,17 @@ def run_evaluate(args):
             load_classifier_state(eval_model, global_classifier_state)
         eval_model = eval_model.to(device)
         eval_model.eval()
+    elif eval_algo == "florg":
+        if global_florg_A_state is None:
+            raise ValueError("FLoRG eval requires checkpoint with global_florg_A_state")
+        if global_florg_seed_state is None:
+            raise ValueError("FLoRG eval requires checkpoint with global_florg_seed_state")
+        eval_model = build_florg_model(model, args, seed_state=global_florg_seed_state)
+        load_florg_A_state(eval_model, global_florg_A_state)
+        eval_model = eval_model.to(device)
+        eval_model.eval()
+        debug_layer_name, debug_delta_norm = sample_florg_delta_norm(eval_model)
+        print(f"[debug][florg][eval] layer={debug_layer_name} ||deltaW||={debug_delta_norm:.6e}")
     elif eval_algo == "flora":
         # Flora checkpoints are evaluated from the saved backbone state.
         # Current training already applies global delta to backbone each round.

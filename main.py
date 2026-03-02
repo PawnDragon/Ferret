@@ -51,7 +51,7 @@ def is_finite_scalar(value):
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
     if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
-    if args.algo in ['fedit', 'flora', 'fedsalora']:
+    if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
         return server.save_best_fedavg_ckpt(metric, cur_round)
@@ -95,7 +95,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedsalora', 'fedavg'])
+    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedsalora', 'fedexlora', 'fedavg'])
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -492,6 +492,67 @@ if __name__ == '__main__':
                 total_comm_up_bytes += compute_comm_size(payload.get('lora_A_state', {}))
 
             server.aggregate_fedsalora(client_a_states, selected_client)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo == 'fedexlora':
+            broadcast_state = server.get_broadcast_state_fedexlora()
+            total_comm_down_bytes = compute_comm_size(broadcast_state) * len(selected_client)
+            broadcast_lora_A = broadcast_state.get('global_lora_A_state', {})
+            broadcast_lora_B = broadcast_state.get('global_lora_B_state', {})
+            broadcast_classifier = broadcast_state.get('global_classifier_state', {})
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(
+                    deepcopy(server.model),
+                    cur_round=r,
+                    lora_A_state=broadcast_lora_A,
+                    lora_B_state=broadcast_lora_B,
+                    classifier_state=broadcast_classifier,
+                )
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size(
+                    {
+                        'lora_A_state': payload.get('lora_A_state', {}),
+                        'lora_B_state': payload.get('lora_B_state', {}),
+                        'classifier_state': payload.get('classifier_state', {}),
+                    }
+                )
+
+            server.aggregate_fedexlora(client_payloads, selected_client, cur_round=r)
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
             if args.round_eval_false:

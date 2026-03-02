@@ -22,6 +22,11 @@ def _is_finite_tensor(tensor):
     return isinstance(tensor, torch.Tensor) and bool(torch.isfinite(tensor).all().item())
 
 
+def _is_classifier_param_name(name):
+    lowered = str(name).lower()
+    return ('classifier' in lowered) or lowered.startswith('score.') or ('.score.' in lowered)
+
+
 def _build_adamw_step_tensor(optimizer, param_obj, step_int, old_step=None):
     if isinstance(old_step, torch.Tensor):
         return torch.tensor(float(step_int), device=old_step.device, dtype=old_step.dtype)
@@ -123,9 +128,12 @@ class FerretFramework(object):
         self.lr = lr
         self.model = model
         self.algo = getattr(args, 'algo', 'ferret')
-        if self.algo == 'fedsalora':
+        if self.algo in ['fedsalora', 'fedexlora']:
             for name, param in self.model.named_parameters():
-                if 'lora_' not in name:
+                keep_trainable = 'lora_' in name
+                if self.algo == 'fedexlora' and _is_classifier_param_name(name):
+                    keep_trainable = True
+                if not keep_trainable:
                     param.requires_grad_(False)
         self.named_parameters_to_optim = [
             (name, param) for name, param in self.model.named_parameters() if param.requires_grad
@@ -169,7 +177,7 @@ class FerretFramework(object):
                 eps=float(getattr(args, 'adam_eps', 1e-8)),
                 weight_decay=float(getattr(args, 'weight_decay', 0.0)),
             )
-        elif self.algo in ['fedit', 'flora']:
+        elif self.algo in ['fedit', 'flora', 'fedexlora']:
             self.optim = torch.optim.AdamW(
                 [p for _, p in self.named_parameters_to_optim],
                 lr=args.lr,

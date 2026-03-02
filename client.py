@@ -4,9 +4,11 @@ from copy import deepcopy
 from optimizers.ferret_optimizer import *
 from optimizers.lora_utils import (
     build_lora_model,
+    extract_classifier_state,
     extract_lora_A_state,
     extract_lora_B_state,
     extract_lora_state,
+    load_classifier_state,
     load_lora_A_state,
     load_lora_B_state,
     load_lora_state,
@@ -27,6 +29,7 @@ class Client(object):
             self.device = torch.device('cpu')
         self.candidate_seeds = candidate_seeds
         self._optim_debug_logged = False
+        self._fedex_optim_reset_logged = False
         self.local_lora_B_state = None
         self.prev_round_lora_A_state = None
 
@@ -102,6 +105,8 @@ class Client(object):
         submuon_state=None,
         lora_state=None,
         lora_A_state=None,
+        lora_B_state=None,
+        classifier_state=None,
         fedavg_global_state=None,
         global_named_optim_state=None,
     ):
@@ -172,7 +177,7 @@ class Client(object):
                 payload['m'] = m_local
             return payload
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora']:
             self.model = build_lora_model(self.model, self.args)
             self.model.to(self.device)
             if getattr(self.args, 'algo', 'ferret') == 'fedit':
@@ -193,12 +198,26 @@ class Client(object):
                         f'loaded_A_norm={loaded_a_norm:.6e}, loaded_B_norm={loaded_b_norm:.6e}, '
                         f'A_shift_from_prev={a_shift:.6e}, B_reload_delta={b_recover_delta:.6e}'
                     )
+            elif getattr(self.args, 'algo', 'ferret') == 'fedexlora':
+                load_lora_A_state(self.model, lora_A_state)
+                load_lora_B_state(self.model, lora_B_state)
+                load_classifier_state(self.model, classifier_state)
 
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             if getattr(self.args, 'algo', 'ferret') == 'fedit' and global_named_optim_state is not None:
                 framework.load_named_optim_state(global_named_optim_state)
                 self._maybe_log_loaded_named_state(framework, global_named_optim_state, cur_round, tag='fedit')
+            if (
+                getattr(self.args, 'algo', 'ferret') == 'fedexlora'
+                and int(cur_round) == 1
+                and (not self._fedex_optim_reset_logged)
+            ):
+                print(
+                    f'[debug][fedexlora][client{self.idx}] round {cur_round} '
+                    f'optimizer_state_len_before_train={len(framework.optim.state)}'
+                )
+                self._fedex_optim_reset_logged = True
             self.model.train()
             self.model.zero_grad()
 
@@ -258,6 +277,17 @@ class Client(object):
                 self.model = None
                 return {
                     'lora_A_state': local_lora_A_state,
+                    'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+                }
+            if getattr(self.args, 'algo', 'ferret') == 'fedexlora':
+                local_lora_A_state = extract_lora_A_state(self.model)
+                local_lora_B_state = extract_lora_B_state(self.model)
+                local_classifier_state = extract_classifier_state(self.model)
+                self.model = None
+                return {
+                    'lora_A_state': local_lora_A_state,
+                    'lora_B_state': local_lora_B_state,
+                    'classifier_state': local_classifier_state,
                     'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
                 }
 

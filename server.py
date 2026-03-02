@@ -12,8 +12,14 @@ from optimizers.ferret_optimizer import FerretFramework
 from optimizers.lora_utils import (
     build_lora_model,
     compute_deltaw_from_lora_state,
+    extract_classifier_state,
     extract_lora_A_state,
+    extract_lora_B_state,
     extract_lora_state,
+    get_lora_pair_keys,
+    load_classifier_state,
+    load_lora_A_state,
+    load_lora_B_state,
     load_lora_state,
     lora_scaling,
     resolve_layer_name_for_model,
@@ -178,6 +184,8 @@ class Server(object):
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
         self.global_lora_state = {}
         self.global_lora_A_state = {}
+        self.global_lora_B_state = {}
+        self.global_classifier_state = {}
         self.global_deltaW_state = {}
         self.flora_scaling = lora_scaling(self.args)
         self.fedavg_weight_array = None
@@ -190,6 +198,7 @@ class Server(object):
         self.fedavg_client_count = 0
         self.global_named_optim_state = {'state': {}}
         self._optim_debug_logged = False
+        self._fedex_debug_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
@@ -209,6 +218,13 @@ class Server(object):
         if self.algo == 'fedsalora':
             init_model = build_lora_model(deepcopy(self.model), self.args)
             self.global_lora_A_state = extract_lora_A_state(init_model)
+            del init_model
+        if self.algo == 'fedexlora':
+            init_model = build_lora_model(deepcopy(self.model), self.args)
+            self.global_lora_A_state = extract_lora_A_state(init_model)
+            self.global_lora_B_state = extract_lora_B_state(init_model)
+            self.global_classifier_state = extract_classifier_state(init_model)
+            load_classifier_state(self.model, self.global_classifier_state)
             del init_model
 
     def _get_ckpt_dir(self):
@@ -321,6 +337,8 @@ class Server(object):
                 'backbone_state_dict': self.model.state_dict(),
                 'global_lora_A_state': self.get_fedsalora_broadcast_state(),
             }
+        if self.algo == 'fedexlora':
+            return self.get_broadcast_state_fedexlora()
         return {
             'backbone_state_dict': self.model.state_dict(),
         }
@@ -339,6 +357,16 @@ class Server(object):
         if self.algo != 'fedsalora':
             return None
         return {k: v.clone() for k, v in self.global_lora_A_state.items()}
+
+    def get_broadcast_state_fedexlora(self):
+        if self.algo != 'fedexlora':
+            return None
+        return {
+            'backbone_state_dict': self.model.state_dict(),
+            'global_lora_A_state': {k: v.clone() for k, v in self.global_lora_A_state.items()},
+            'global_lora_B_state': {k: v.clone() for k, v in self.global_lora_B_state.items()},
+            'global_classifier_state': {k: v.clone() for k, v in self.global_classifier_state.items()},
+        }
 
     def get_fedavg_broadcast_state(self):
         if self.algo != 'fedavg':
@@ -472,6 +500,141 @@ class Server(object):
                     continue
                 new_global_lora_a[key] += local_a_state[key].to(dtype=torch.float32) * weight
         self.global_lora_A_state = {k: v.cpu() for k, v in new_global_lora_a.items()}
+
+    def aggregate_fedexlora(self, client_payloads, selected_client_list, cur_round=1):
+        if len(client_payloads) == 0:
+            return
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+
+        # 1) classifier weighted average
+        classifier_keys = sorted(
+            {
+                key
+                for payload in client_payloads
+                for key in payload.get('classifier_state', {}).keys()
+            }
+        )
+        new_global_classifier = {}
+        for key in classifier_keys:
+            ref_tensor = None
+            for payload in client_payloads:
+                local_classifier = payload.get('classifier_state', {})
+                if key in local_classifier:
+                    ref_tensor = local_classifier[key]
+                    break
+            if ref_tensor is None:
+                continue
+            avg_tensor = torch.zeros_like(ref_tensor, dtype=torch.float32)
+            for client_idx, payload in enumerate(client_payloads):
+                local_classifier = payload.get('classifier_state', {})
+                if key not in local_classifier:
+                    continue
+                avg_tensor += local_classifier[key].to(dtype=torch.float32) * float(weight_array[client_idx])
+            new_global_classifier[key] = avg_tensor.cpu()
+        self.global_classifier_state = new_global_classifier
+        if len(self.global_classifier_state) > 0:
+            load_classifier_state(self.model, self.global_classifier_state)
+
+        # 2) FedEx-LoRA: average A/B and compensate residual into base weight.
+        first_a_state = client_payloads[0].get('lora_A_state', {})
+        first_b_state = client_payloads[0].get('lora_B_state', {})
+        first_lora_state = {}
+        first_lora_state.update(first_a_state)
+        first_lora_state.update(first_b_state)
+        layer_pairs = get_lora_pair_keys(first_lora_state)
+        name_to_module = dict(self.model.named_modules())
+        new_global_lora_a = {}
+        new_global_lora_b = {}
+
+        for layer_name, pair in layer_pairs.items():
+            if 'a_key' not in pair or 'b_key' not in pair:
+                continue
+            a_key = pair['a_key']
+            b_key = pair['b_key']
+
+            resolved_layer = resolve_layer_name_for_model(layer_name, self.model)
+            module = name_to_module.get(resolved_layer, None)
+            if module is None or (not hasattr(module, 'weight')):
+                raise RuntimeError(f'[fedexlora] cannot resolve base layer for {layer_name} -> {resolved_layer}')
+
+            base_weight = module.weight.detach().cpu()
+            if base_weight.ndim != 2:
+                raise RuntimeError(
+                    f'[fedexlora] expected 2D base weight at {resolved_layer}, got shape={tuple(base_weight.shape)}'
+                )
+            out_dim, in_dim = int(base_weight.shape[0]), int(base_weight.shape[1])
+            rank = max(int(getattr(self.args, 'lora_r', 0)), 1)
+
+            A_bar = torch.zeros_like(first_a_state[a_key], dtype=torch.float32)
+            B_bar = torch.zeros_like(first_b_state[b_key], dtype=torch.float32)
+            M = torch.zeros((out_dim, in_dim), dtype=torch.float32)
+
+            for client_idx, payload in enumerate(client_payloads):
+                local_a_state = payload.get('lora_A_state', {})
+                local_b_state = payload.get('lora_B_state', {})
+                if a_key not in local_a_state or b_key not in local_b_state:
+                    raise RuntimeError(f'[fedexlora] missing LoRA keys for layer={layer_name}, a={a_key}, b={b_key}')
+
+                a_i = local_a_state[a_key].to(dtype=torch.float32)
+                b_i = local_b_state[b_key].to(dtype=torch.float32)
+
+                if a_i.ndim != 2 or b_i.ndim != 2:
+                    raise RuntimeError(
+                        f'[fedexlora] invalid tensor rank at layer={layer_name}: '
+                        f'A.shape={tuple(a_i.shape)}, B.shape={tuple(b_i.shape)}'
+                    )
+                if b_i.shape[1] != a_i.shape[0]:
+                    raise RuntimeError(
+                        f'[fedexlora] matmul mismatch at layer={layer_name}: '
+                        f'A.shape={tuple(a_i.shape)}, B.shape={tuple(b_i.shape)}'
+                    )
+                if b_i.shape != (out_dim, rank) or a_i.shape != (rank, in_dim):
+                    raise RuntimeError(
+                        f'[fedexlora] shape mismatch at layer={layer_name} ({resolved_layer}): '
+                        f'expected B={(out_dim, rank)}, A={(rank, in_dim)}, got B={tuple(b_i.shape)}, A={tuple(a_i.shape)}'
+                    )
+
+                local_prod = torch.matmul(b_i, a_i)
+                if tuple(local_prod.shape) != (out_dim, in_dim):
+                    raise RuntimeError(
+                        f'[fedexlora] product shape mismatch at layer={layer_name}: '
+                        f'(B@A).shape={tuple(local_prod.shape)} vs base_weight.shape={(out_dim, in_dim)}'
+                    )
+
+                weight = float(weight_array[client_idx])
+                M += local_prod * weight
+                A_bar += a_i * weight
+                B_bar += b_i * weight
+
+            BA_bar = torch.matmul(B_bar, A_bar)
+            if tuple(BA_bar.shape) != (out_dim, in_dim):
+                raise RuntimeError(
+                    f'[fedexlora] (B_bar@A_bar) shape mismatch at layer={layer_name}: '
+                    f'got {tuple(BA_bar.shape)}, expected {(out_dim, in_dim)}'
+                )
+            residual = M - BA_bar
+            scaled_residual = residual * float(self.flora_scaling)
+            with torch.no_grad():
+                module.weight.data.add_(
+                    scaled_residual.to(device=module.weight.device, dtype=module.weight.dtype)
+                )
+
+            new_global_lora_a[a_key] = A_bar.cpu()
+            new_global_lora_b[b_key] = B_bar.cpu()
+
+            if (not self._fedex_debug_logged) and int(cur_round) == 1:
+                print(
+                    f'[debug][fedexlora][server] layer={resolved_layer} '
+                    f'||M||={float(torch.linalg.norm(M).item()):.6e}, '
+                    f'||BbarAbar||={float(torch.linalg.norm(BA_bar).item()):.6e}, '
+                    f'||R||={float(torch.linalg.norm(residual).item()):.6e}, '
+                    f'||R*s||={float(torch.linalg.norm(scaled_residual).item()):.6e}'
+                )
+                self._fedex_debug_logged = True
+
+        self.global_lora_A_state = new_global_lora_a
+        self.global_lora_B_state = new_global_lora_b
 
     def _accumulate_fedavg_named_optim_state(self, named_state, weight):
         if not isinstance(named_state, dict):
@@ -666,7 +829,7 @@ class Server(object):
         return True
 
     def save_best_lora_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedit', 'flora', 'fedsalora'] or not self.args.save:
+        if self.algo not in ['fedit', 'flora', 'fedsalora', 'fedexlora'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -696,8 +859,12 @@ class Server(object):
             ckpt_payload['global_lora_state'] = {k: v.cpu() for k, v in self.global_lora_state.items()}
         elif self.algo == 'flora':
             ckpt_payload['global_deltaW_state'] = {k: v.cpu() for k, v in self.global_deltaW_state.items()}
+        elif self.algo == 'fedsalora':
+            ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
         else:
             ckpt_payload['global_lora_A_state'] = {k: v.cpu() for k, v in self.global_lora_A_state.items()}
+            ckpt_payload['global_lora_B_state'] = {k: v.cpu() for k, v in self.global_lora_B_state.items()}
+            ckpt_payload['global_classifier_state'] = {k: v.cpu() for k, v in self.global_classifier_state.items()}
 
         best_ckpt_path = os.path.join(ckpt_dir, 'best.pt')
         torch.save(ckpt_payload, best_ckpt_path)
@@ -751,6 +918,13 @@ class Server(object):
         if self.algo == 'fedit':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_state(eval_model, self.global_lora_state)
+            eval_model.eval()
+            temp_eval_model = True
+        elif self.algo == 'fedexlora':
+            eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
+            load_lora_A_state(eval_model, self.global_lora_A_state)
+            load_lora_B_state(eval_model, self.global_lora_B_state)
+            load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
         else:
@@ -807,6 +981,13 @@ class Server(object):
         if self.algo == 'fedit':
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_state(eval_model, self.global_lora_state)
+            eval_model.eval()
+            temp_eval_model = True
+        elif self.algo == 'fedexlora':
+            eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
+            load_lora_A_state(eval_model, self.global_lora_A_state)
+            load_lora_B_state(eval_model, self.global_lora_B_state)
+            load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
         else:

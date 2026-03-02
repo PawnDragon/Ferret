@@ -34,6 +34,11 @@ def _lora_b_key(name):
     return LORA_B_TOKEN in name
 
 
+def _classifier_key(name):
+    lowered = str(name).lower()
+    return ('classifier' in lowered) or lowered.startswith('score.') or ('.score.' in lowered)
+
+
 def maybe_log_lora_scaling(args):
     global _SCALING_LOGGED
     if _SCALING_LOGGED:
@@ -60,9 +65,14 @@ def build_lora_model(backbone_model, args):
     )
     lora_model = get_peft_model(backbone_model, lora_config)
 
+    train_classifier = str(getattr(args, 'algo', '')).lower() == 'fedexlora'
+
     # Enforce backbone freeze for FL LoRA experiments.
     for name, param in lora_model.named_parameters():
-        param.requires_grad_(bool(_lora_trainable_key(name)))
+        is_trainable = bool(_lora_trainable_key(name))
+        if train_classifier and _classifier_key(name):
+            is_trainable = True
+        param.requires_grad_(is_trainable)
 
     return lora_model
 
@@ -92,6 +102,15 @@ def extract_lora_B_state(model):
             continue
         lora_b_state[name] = param.detach().cpu().clone()
     return lora_b_state
+
+
+def extract_classifier_state(model):
+    classifier_state = {}
+    for name, param in model.named_parameters():
+        if not _classifier_key(name):
+            continue
+        classifier_state[name] = param.detach().cpu().clone()
+    return classifier_state
 
 
 def load_lora_state(model, lora_state):
@@ -130,6 +149,19 @@ def load_lora_B_state(model, lora_b_state):
             if name not in lora_b_state:
                 continue
             src = lora_b_state[name].to(device=param.device, dtype=param.dtype)
+            param.copy_(src)
+
+
+def load_classifier_state(model, classifier_state):
+    if classifier_state is None:
+        return
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not _classifier_key(name):
+                continue
+            if name not in classifier_state:
+                continue
+            src = classifier_state[name].to(device=param.device, dtype=param.dtype)
             param.copy_(src)
 
 

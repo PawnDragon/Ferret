@@ -1,3 +1,5 @@
+import gc
+
 from tqdm import tqdm
 from copy import deepcopy
 
@@ -52,6 +54,36 @@ class Client(object):
             )
             self._florg_shape_logged = True
             return
+
+    def _clear_framework_optimizer_state(self, framework):
+        if framework is None:
+            return
+        optim = getattr(framework, 'optim', None)
+        if optim is None:
+            return
+        try:
+            optim.zero_grad(set_to_none=True)
+        except TypeError:
+            optim.zero_grad()
+        if hasattr(optim, 'state') and isinstance(optim.state, dict):
+            optim.state.clear()
+        framework.optim = None
+
+    def _release_florg_training_state(self, framework):
+        self._clear_framework_optimizer_state(framework)
+        if self.model is not None:
+            try:
+                self.model.zero_grad(set_to_none=True)
+            except TypeError:
+                self.model.zero_grad()
+            self.model.to('cpu')
+        self.model = None
+        if framework is not None:
+            framework.model = None
+        del framework
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _set_runtime_debug_context(self, cur_round):
         # Shared args object carries lightweight runtime context for framework-level debug prints.
@@ -289,7 +321,6 @@ class Client(object):
                         f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                     )
 
-            local_lora_state = extract_lora_state(self.model)
             if getattr(self.args, 'algo', 'ferret') == 'fedsalora':
                 local_lora_A_state = extract_lora_A_state(self.model)
                 local_lora_B_state = extract_lora_B_state(self.model)
@@ -322,13 +353,14 @@ class Client(object):
                 }
             if getattr(self.args, 'algo', 'ferret') == 'florg':
                 local_florg_A_state = extract_florg_A_state(self.model)
-                self.model = None
+                self._release_florg_training_state(framework)
                 return {
                     'florg_A': local_florg_A_state,
                     'num_samples': len(self.train_loader),
                     'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
                 }
 
+            local_lora_state = extract_lora_state(self.model)
             self.model = None
             return {
                 'lora_state': local_lora_state,

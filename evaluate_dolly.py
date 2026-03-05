@@ -65,6 +65,7 @@ def load_checkpoint_into_model(model, ckpt_path):
     global_lora_B_state = None
     global_classifier_state = None
     global_deltaW_state = None
+    common_hparams = {}
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
@@ -97,6 +98,7 @@ def load_checkpoint_into_model(model, ckpt_path):
         )
         hparams = payload.get("hparams", None)
         if isinstance(hparams, dict):
+            common_hparams = dict(hparams)
             saved_algo = hparams.get("algo", None)
         if saved_algo is None:
             saved_algo = payload.get("algo", None)
@@ -119,8 +121,14 @@ def load_checkpoint_into_model(model, ckpt_path):
             ckpt_type = "florg_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
-        else:
+        elif saved_algo == "ferret":
+            ckpt_type = "ferret_best"
+        elif saved_algo in ["fedsubmuon", "fedsubadam", "fedsubsgd"] or (
+            x_global is not None and seeds is not None
+        ):
             ckpt_type = "fedsubmuon_best"
+        else:
+            ckpt_type = "backbone_best"
     elif isinstance(payload, dict):
         model.load_state_dict(payload, strict=True)
     else:
@@ -138,6 +146,7 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_lora_B_state,
         global_classifier_state,
         global_deltaW_state,
+        common_hparams,
         lora_hparams,
         global_florg_A_state,
         global_florg_seed_state,
@@ -283,6 +292,7 @@ def run_evaluate(args):
     global_lora_B_state = None
     global_classifier_state = None
     global_deltaW_state = None
+    common_hparams = {}
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
@@ -301,6 +311,7 @@ def run_evaluate(args):
             global_lora_B_state,
             global_classifier_state,
             global_deltaW_state,
+            common_hparams,
             lora_hparams,
             global_florg_A_state,
             global_florg_seed_state,
@@ -309,9 +320,14 @@ def run_evaluate(args):
         ) = load_checkpoint_into_model(model, args.checkpoint)
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
 
+    if isinstance(common_hparams, dict) and len(common_hparams) > 0:
+        if "lora_target_modules" in common_hparams:
+            args.lora_target_modules = common_hparams["lora_target_modules"]
+
     eval_algo = args.algo
     if eval_algo == "auto":
         if saved_algo in [
+            "ferret",
             "fedsubmuon",
             "fedsubadam",
             "fedsubsgd",

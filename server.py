@@ -214,7 +214,12 @@ class Server(object):
         self._florg_eval_debug_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
+            self.x_global, self.m_global, self.seeds = init_submuon_state(
+                self.model,
+                self.args.rank_r,
+                self.args.seed,
+                raw_target_modules=getattr(self.args, 'lora_target_modules', None),
+            )
             if self.algo != 'fedsubmuon':
                 self.m_global = {}
                 self.v_global = {}
@@ -907,6 +912,7 @@ class Server(object):
                     'lr': self.args.lr,
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
+                    'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },
             ckpt_path,

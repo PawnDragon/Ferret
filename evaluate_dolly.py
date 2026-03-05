@@ -197,6 +197,12 @@ def build_parser():
     parser.add_argument("--zerotask", type=int, default=7)
     parser.add_argument("--dataset_subsample", type=float, default=1.0)
     parser.add_argument("--iid", type=str, default="dir0.5")
+    parser.add_argument(
+        "--ni_root",
+        type=str,
+        default="./data/NI",
+        help="root directory for Natural Instructions dataset",
+    )
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)

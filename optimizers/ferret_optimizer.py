@@ -128,8 +128,6 @@ class FerretFramework(object):
         self.lr = lr
         self.model = model
         self.algo = getattr(args, 'algo', 'ferret')
-        if self.algo == 'ferret':
-            self._apply_target_module_mask_for_ferret()
         if self.algo in ['fedsalora', 'fedexlora', 'florg']:
             for name, param in self.model.named_parameters():
                 if self.algo == 'florg':
@@ -189,22 +187,6 @@ class FerretFramework(object):
     def _freeze_backbone_for_submuon(self):
         for p in self.model.parameters():
             p.requires_grad_(False)
-
-    def _apply_target_module_mask_for_ferret(self):
-        target_layers = select_target_linear_layers(
-            self.model,
-            rank=1,
-            raw_target_modules=getattr(self.args, 'lora_target_modules', None),
-        )
-        if len(target_layers) == 0:
-            raise RuntimeError(
-                f'[ferret] no target linear layer is selected by '
-                f'lora_target_modules={getattr(self.args, "lora_target_modules", None)}'
-            )
-
-        trainable_prefixes = tuple(f'{layer_name}.' for layer_name in target_layers)
-        for name, param in self.model.named_parameters():
-            param.requires_grad_(name.startswith(trainable_prefixes))
 
     def _resolve_optimizer_name(self):
         name = str(getattr(self.args, 'optimizer', 'adamw')).lower()

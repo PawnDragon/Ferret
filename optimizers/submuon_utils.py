@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 
 
+DEFAULT_TARGET_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+
+
 def zeropower_via_newtonschulz5(G, steps):
     """
     Compute matrix zeroth-power direction with a 5th-order Newton-Schulz iteration.
@@ -52,17 +55,54 @@ def make_uv(seed, out_dim, in_dim, r, device, dtype):
     return U, V
 
 
-def select_target_linear_layers(model, rank):
-    targets = []
+def _parse_target_modules(raw_target_modules):
+    if raw_target_modules is None:
+        return 'all-linear'
+    if isinstance(raw_target_modules, (list, tuple)):
+        parsed = [str(item).strip() for item in raw_target_modules if str(item).strip() != '']
+        return parsed if len(parsed) > 0 else 'all-linear'
+
+    target_text = str(raw_target_modules).strip()
+    if target_text == '':
+        return 'all-linear'
+    if target_text.lower() in ['all-linear', 'all_linear']:
+        return 'all-linear'
+    if ',' in target_text:
+        parsed = [part.strip() for part in target_text.split(',') if part.strip() != '']
+        return parsed if len(parsed) > 0 else DEFAULT_TARGET_MODULES
+    return [target_text]
+
+
+def _is_target_layer_name(layer_name, target_modules):
+    if target_modules == 'all-linear':
+        return True
+    leaf_name = layer_name.split('.')[-1]
+    for token in target_modules:
+        if layer_name == token or layer_name.endswith(f'.{token}') or leaf_name == token:
+            return True
+    return False
+
+
+def select_target_linear_layers(model, rank, raw_target_modules=None):
+    all_targets = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             if min(module.in_features, module.out_features) >= rank:
-                targets.append(name)
-    return targets
+                all_targets.append(name)
+
+    target_modules = _parse_target_modules(raw_target_modules)
+    if target_modules == 'all-linear':
+        return all_targets
+    return [name for name in all_targets if _is_target_layer_name(name, target_modules)]
 
 
-def init_submuon_state(model, rank, base_seed):
-    layer_names = select_target_linear_layers(model, rank)
+def init_submuon_state(model, rank, base_seed, raw_target_modules=None):
+    layer_names = select_target_linear_layers(model, rank, raw_target_modules=raw_target_modules)
+    if len(layer_names) == 0:
+        raise RuntimeError(
+            f'[fedsub] no target linear layer is selected; '
+            f'rank_r={rank}, lora_target_modules={raw_target_modules}'
+        )
     x_global = {}
     m_global = {}
     seeds = {}

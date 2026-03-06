@@ -32,6 +32,7 @@ from optimizers.florg_utils import (
     load_florg_A_state,
     sample_florg_delta_norm,
 )
+from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subspaces
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
@@ -212,9 +213,19 @@ class Server(object):
         self._fedex_debug_logged = False
         self._florg_debug_logged = False
         self._florg_eval_debug_logged = False
+        self._multisub_debug_logged = False
+        self.global_multisub_metadata = {}
+        self.global_multisub_x_state = {}
+        self.global_multisub_scores = {}
+        self.global_multisub_selected_keys = []
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            self.x_global, self.m_global, self.seeds = init_submuon_state(self.model, self.args.rank_r, self.args.seed)
+            self.x_global, self.m_global, self.seeds = init_submuon_state(
+                self.model,
+                self.args.rank_r,
+                self.args.seed,
+                raw_target_modules=getattr(self.args, 'lora_target_modules', None),
+            )
             if self.algo != 'fedsubmuon':
                 self.m_global = {}
                 self.v_global = {}
@@ -244,6 +255,26 @@ class Server(object):
             self.global_florg_seed_state = extract_florg_seed_state(init_model)
             self.global_florg_basis_state = extract_florg_basis_state(init_model)
             del init_model
+        if self.algo == 'fedmultisubmuon':
+            base_seed = int(getattr(self.args, 'multisub_seed_base', int(self.args.seed) + 13579))
+            self.global_multisub_metadata, self.global_multisub_x_state, self.global_multisub_scores = initialize_subspaces(
+                self.model,
+                rank_r=int(self.args.rank_r),
+                svd_rank=int(getattr(self.args, 'svd_rank', 500)),
+                num_subspaces=int(getattr(self.args, 'multisub_num_subspaces', 4)),
+                base_seed=base_seed,
+                target_modules=getattr(self.args, 'lora_target_modules', None),
+            )
+            self.global_multisub_selected_keys = select_topk_subspaces(
+                self.global_multisub_scores,
+                int(getattr(self.args, 'multisub_topk', 0)),
+            )
+            if len(self.global_multisub_selected_keys) == 0:
+                self.global_multisub_selected_keys = list(self.global_multisub_x_state.keys())
+            print(
+                f'[fedmultisubmuon] initialized {len(self.global_multisub_x_state)} subspaces; '
+                f'round-1 topk={len(self.global_multisub_selected_keys)}'
+            )
 
     def _get_ckpt_dir(self):
         os.makedirs(self.log_dir, exist_ok=True)
@@ -335,6 +366,8 @@ class Server(object):
     def get_broadcast_state(self):
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             return self.get_submuon_broadcast_state()
+        if self.algo == 'fedmultisubmuon':
+            return self.get_multisub_broadcast_state()
         if self.algo == 'fedit':
             return {
                 'backbone_state_dict': self.model.state_dict(),
@@ -361,6 +394,34 @@ class Server(object):
             }
         return {
             'backbone_state_dict': self.model.state_dict(),
+        }
+
+    def get_multisub_broadcast_state(self):
+        if self.algo != 'fedmultisubmuon':
+            return None
+        selected_keys = list(self.global_multisub_selected_keys)
+        metadata = {}
+        x_global = {}
+        score_state = {}
+        for key in selected_keys:
+            if key not in self.global_multisub_metadata or key not in self.global_multisub_x_state:
+                continue
+            meta = self.global_multisub_metadata[key]
+            metadata[key] = {
+                'layer_name': str(meta['layer_name']),
+                'indices': meta['indices'].clone(),
+                'A': meta['A'].clone(),
+                'seed': int(meta['seed']),
+                'rank': int(meta.get('rank', int(self.global_multisub_x_state[key].shape[0]))),
+                'flat_id': int(meta.get('flat_id', -1)),
+            }
+            x_global[key] = self.global_multisub_x_state[key].clone()
+            score_state[key] = float(self.global_multisub_scores.get(key, 0.0))
+        return {
+            'x_global': x_global,
+            'metadata': metadata,
+            'selected_keys': selected_keys,
+            'score_state': score_state,
         }
 
     def get_fedit_broadcast_state(self):
@@ -494,6 +555,56 @@ class Server(object):
         self.x_global = new_x
         if self.algo == 'fedsubmuon':
             self.m_global = new_m
+
+    def aggregate_fedmultisubmuon(self, client_payloads, selected_client_list, cur_round=1):
+        if self.algo != 'fedmultisubmuon' or len(client_payloads) == 0:
+            return
+        weight_array = self._get_client_weight_array(selected_client_list)
+        active_keys = list(self.global_multisub_selected_keys)
+        if len(active_keys) == 0:
+            active_keys = list(self.global_multisub_x_state.keys())
+
+        for sub_key in active_keys:
+            if sub_key not in self.global_multisub_x_state:
+                continue
+            accum = torch.zeros_like(self.global_multisub_x_state[sub_key], dtype=torch.float32)
+            score_acc = 0.0
+            score_w = 0.0
+            x_w = 0.0
+            for client_idx, payload in enumerate(client_payloads):
+                weight = float(weight_array[client_idx])
+                x_local = payload.get('x', {})
+                if isinstance(x_local, dict) and sub_key in x_local:
+                    x_tensor = x_local[sub_key]
+                    if isinstance(x_tensor, torch.Tensor):
+                        accum.add_(x_tensor.to(dtype=torch.float32), alpha=weight)
+                        x_w += weight
+
+                score_local = payload.get('scores', {})
+                if isinstance(score_local, dict) and sub_key in score_local:
+                    score_val = float(score_local[sub_key])
+                    if np.isfinite(score_val):
+                        score_acc += score_val * weight
+                        score_w += weight
+
+            if x_w > 0.0:
+                self.global_multisub_x_state[sub_key] = (accum / x_w).cpu().contiguous()
+            if score_w > 0.0:
+                self.global_multisub_scores[sub_key] = float(score_acc / score_w)
+
+        self.global_multisub_selected_keys = select_topk_subspaces(
+            self.global_multisub_scores,
+            int(getattr(self.args, 'multisub_topk', 0)),
+        )
+        if len(self.global_multisub_selected_keys) == 0:
+            self.global_multisub_selected_keys = list(self.global_multisub_x_state.keys())
+        if (not self._multisub_debug_logged) and int(cur_round) >= 1:
+            top_items = sorted(
+                self.global_multisub_scores.items(),
+                key=lambda kv: (-float(kv[1]), kv[0]),
+            )[:3]
+            print(f'[debug][fedmultisubmuon][server] round={cur_round} top_scores={top_items}')
+            self._multisub_debug_logged = True
 
     def aggregate_lora(self, client_payloads, selected_client_list):
         if len(client_payloads) == 0:
@@ -907,6 +1018,59 @@ class Server(object):
                     'lr': self.args.lr,
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
+                    'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                },
+            },
+            ckpt_path,
+        )
+        print(f'[ckpt] saved to: {ckpt_path}')
+        return True
+
+    def save_best_multisub_ckpt(self, metric, cur_round):
+        if self.algo != 'fedmultisubmuon' or not self.args.save:
+            return False
+
+        improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
+        if not improved:
+            return False
+
+        self.best_metric = metric
+        metadata_cpu = {}
+        for key, meta in self.global_multisub_metadata.items():
+            metadata_cpu[key] = {
+                'layer_name': str(meta['layer_name']),
+                'indices': meta['indices'].cpu(),
+                'A': meta['A'].cpu(),
+                'seed': int(meta['seed']),
+                'rank': int(meta.get('rank', int(self.global_multisub_x_state[key].shape[0]))),
+                'flat_id': int(meta.get('flat_id', -1)),
+            }
+
+        ckpt_path = os.path.join(self._get_ckpt_dir(), 'best.pt')
+        torch.save(
+            {
+                'algo': 'fedmultisubmuon',
+                'backbone_state_dict': self.model.state_dict(),
+                'global_multisub_x_state': {k: v.cpu() for k, v in self.global_multisub_x_state.items()},
+                'global_multisub_metadata': metadata_cpu,
+                'global_multisub_scores': {k: float(v) for k, v in self.global_multisub_scores.items()},
+                'global_multisub_selected_keys': list(self.global_multisub_selected_keys),
+                'round': int(cur_round),
+                'best_metric': float(metric),
+                'hparams': {
+                    'algo': self.args.algo,
+                    'rank_r': int(self.args.rank_r),
+                    'svd_rank': int(getattr(self.args, 'svd_rank', 500)),
+                    'beta': float(getattr(self.args, 'beta', 0.95)),
+                    'ns_steps': int(getattr(self.args, 'ns_steps', 5)),
+                    'lr': float(self.args.lr),
+                    'multisub_num_subspaces': int(getattr(self.args, 'multisub_num_subspaces', 4)),
+                    'multisub_topk': int(getattr(self.args, 'multisub_topk', 0)),
+                    'multisub_score_interval': int(getattr(self.args, 'multisub_score_interval', 1)),
+                    'multisub_score_beta1': float(getattr(self.args, 'multisub_score_beta1', 0.9)),
+                    'multisub_score_beta2': float(getattr(self.args, 'multisub_score_beta2', 0.999)),
+                    'multisub_seed_base': int(getattr(self.args, 'multisub_seed_base', int(self.args.seed) + 13579)),
+                    'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },
             ckpt_path,
@@ -1073,6 +1237,10 @@ class Server(object):
             load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
+        elif self.algo == 'fedmultisubmuon':
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            eval_model = self.model
         else:
             self.model = self.model.to(self.device)
             self.model.eval()
@@ -1086,6 +1254,17 @@ class Server(object):
                 self.seeds,
                 trainable=False,
                 v_state=None,
+            )
+        elif self.algo == 'fedmultisubmuon':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_multisub_state(
+                {
+                    'x_global': self.global_multisub_x_state,
+                    'metadata': self.global_multisub_metadata,
+                    'selected_keys': list(self.global_multisub_x_state.keys()),
+                    'score_state': self.global_multisub_scores,
+                },
+                trainable=False,
             )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
@@ -1113,7 +1292,10 @@ class Server(object):
         print()
 
         if framework is not None:
-            framework.clear_submuon_state()
+            if self.algo == 'fedmultisubmuon':
+                framework.clear_multisub_state()
+            else:
+                framework.clear_submuon_state()
         if temp_eval_model:
             eval_model = eval_model.cpu()
             del eval_model
@@ -1156,6 +1338,10 @@ class Server(object):
             load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
+        elif self.algo == 'fedmultisubmuon':
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            eval_model = self.model
         else:
             self.model = self.model.to(self.device)
             self.model.eval()
@@ -1169,6 +1355,17 @@ class Server(object):
                 self.seeds,
                 trainable=False,
                 v_state=None,
+            )
+        elif self.algo == 'fedmultisubmuon':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_multisub_state(
+                {
+                    'x_global': self.global_multisub_x_state,
+                    'metadata': self.global_multisub_metadata,
+                    'selected_keys': list(self.global_multisub_x_state.keys()),
+                    'score_state': self.global_multisub_scores,
+                },
+                trainable=False,
             )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
@@ -1197,7 +1394,10 @@ class Server(object):
         print()
 
         if framework is not None:
-            framework.clear_submuon_state()
+            if self.algo == 'fedmultisubmuon':
+                framework.clear_multisub_state()
+            else:
+                framework.clear_submuon_state()
         if temp_eval_model:
             eval_model = eval_model.cpu()
             del eval_model

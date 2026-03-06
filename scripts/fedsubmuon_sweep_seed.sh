@@ -5,12 +5,12 @@ set -euo pipefail
 seeds=(495 496 497)
 
 for seed in "${seeds[@]}"; do
-  run_name="fedsubmuon_dolly_seed${seed}"
+  run_name="fedsubmuon_dolly_qwen_seed${seed}"
   echo "[fedsubmuon sweep] seed=${seed}, run_name=${run_name}"
 
   python main.py \
     --algo fedsubmuon \
-    --model /root/autodl-tmp/llama-3.2-1B/ \
+    --model /root/autodl-tmp/qwen/ \
     --dataset dolly \
     --lr 0.005 \
     --log \
@@ -21,11 +21,13 @@ for seed in "${seeds[@]}"; do
     --seed "${seed}" \
     --rank_r 64 \
     --seed_refresh_F 5 \
-    --rounds 20 \
+    --rounds 30 \
     --use_wandb \
     --wandb_project ferret \
     --wandb_run_name "${run_name}" \
     --batch_or_epoch epoch \
     --stop_F 10 \
+    --early_stop \
+    --early_stop_patience 5 \
     "$@"
 done

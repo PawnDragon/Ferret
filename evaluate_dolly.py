@@ -65,11 +65,16 @@ def load_checkpoint_into_model(model, ckpt_path):
     global_lora_B_state = None
     global_classifier_state = None
     global_deltaW_state = None
+    common_hparams = {}
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
     global_florg_basis_state = None
     florg_hparams = {}
+    global_multisub_x_state = None
+    global_multisub_metadata = None
+    global_multisub_scores = None
+    global_multisub_selected_keys = None
 
     if isinstance(payload, dict) and "backbone_state_dict" in payload:
         model.load_state_dict(payload["backbone_state_dict"], strict=True)
@@ -85,6 +90,10 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_florg_A_state = payload.get("global_florg_A_state", None)
         global_florg_seed_state = payload.get("global_florg_seed_state", None)
         global_florg_basis_state = payload.get("global_florg_basis_state", None)
+        global_multisub_x_state = payload.get("global_multisub_x_state", None)
+        global_multisub_metadata = payload.get("global_multisub_metadata", None)
+        global_multisub_scores = payload.get("global_multisub_scores", None)
+        global_multisub_selected_keys = payload.get("global_multisub_selected_keys", None)
         lora_hparams = (
             payload.get("lora_hparams", {})
             if isinstance(payload.get("lora_hparams", {}), dict)
@@ -97,6 +106,7 @@ def load_checkpoint_into_model(model, ckpt_path):
         )
         hparams = payload.get("hparams", None)
         if isinstance(hparams, dict):
+            common_hparams = dict(hparams)
             saved_algo = hparams.get("algo", None)
         if saved_algo is None:
             saved_algo = payload.get("algo", None)
@@ -117,10 +127,24 @@ def load_checkpoint_into_model(model, ckpt_path):
             ckpt_type = "fedexlora_best"
         elif saved_algo == "florg" or global_florg_A_state is not None:
             ckpt_type = "florg_best"
+        elif (
+            saved_algo == "fedmultisubmuon"
+            or (
+                global_multisub_x_state is not None
+                and global_multisub_metadata is not None
+            )
+        ):
+            ckpt_type = "fedmultisubmuon_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
-        else:
+        elif saved_algo == "ferret":
+            ckpt_type = "ferret_best"
+        elif saved_algo in ["fedsubmuon", "fedsubadam", "fedsubsgd"] or (
+            x_global is not None and seeds is not None
+        ):
             ckpt_type = "fedsubmuon_best"
+        else:
+            ckpt_type = "backbone_best"
     elif isinstance(payload, dict):
         model.load_state_dict(payload, strict=True)
     else:
@@ -138,11 +162,16 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_lora_B_state,
         global_classifier_state,
         global_deltaW_state,
+        common_hparams,
         lora_hparams,
         global_florg_A_state,
         global_florg_seed_state,
         global_florg_basis_state,
         florg_hparams,
+        global_multisub_x_state,
+        global_multisub_metadata,
+        global_multisub_scores,
+        global_multisub_selected_keys,
     )
 
 
@@ -182,6 +211,7 @@ def build_parser():
             "fedsubmuon",
             "fedsubadam",
             "fedsubsgd",
+            "fedmultisubmuon",
             "fedit",
             "flora",
             "fedexlora",
@@ -197,6 +227,12 @@ def build_parser():
     parser.add_argument("--zerotask", type=int, default=7)
     parser.add_argument("--dataset_subsample", type=float, default=1.0)
     parser.add_argument("--iid", type=str, default="dir0.5")
+    parser.add_argument(
+        "--ni_root",
+        type=str,
+        default="./data/NI",
+        help="root directory for Natural Instructions dataset",
+    )
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)
@@ -209,6 +245,7 @@ def build_parser():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank_r", type=int, default=8)
+    parser.add_argument("--svd_rank", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument(
         "--optimizer",
@@ -232,6 +269,12 @@ def build_parser():
     parser.add_argument("--lora_bias", type=str, default="none")
     parser.add_argument("--florg_rank_r", type=int, default=16)
     parser.add_argument("--florg_seed_base", type=int, default=95317)
+    parser.add_argument("--multisub_num_subspaces", type=int, default=4)
+    parser.add_argument("--multisub_topk", type=int, default=64)
+    parser.add_argument("--multisub_seed_base", type=int, default=0)
+    parser.add_argument("--multisub_score_interval", type=int, default=1)
+    parser.add_argument("--multisub_score_beta1", type=float, default=0.9)
+    parser.add_argument("--multisub_score_beta2", type=float, default=0.999)
 
     parser.add_argument("--save_json", type=str, default="")
     return parser
@@ -277,11 +320,16 @@ def run_evaluate(args):
     global_lora_B_state = None
     global_classifier_state = None
     global_deltaW_state = None
+    common_hparams = {}
     lora_hparams = {}
     global_florg_A_state = None
     global_florg_seed_state = None
     global_florg_basis_state = None
     florg_hparams = {}
+    global_multisub_x_state = None
+    global_multisub_metadata = None
+    global_multisub_scores = None
+    global_multisub_selected_keys = None
     if args.checkpoint:
         (
             ckpt_type,
@@ -295,20 +343,31 @@ def run_evaluate(args):
             global_lora_B_state,
             global_classifier_state,
             global_deltaW_state,
+            common_hparams,
             lora_hparams,
             global_florg_A_state,
             global_florg_seed_state,
             global_florg_basis_state,
             florg_hparams,
+            global_multisub_x_state,
+            global_multisub_metadata,
+            global_multisub_scores,
+            global_multisub_selected_keys,
         ) = load_checkpoint_into_model(model, args.checkpoint)
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
+
+    if isinstance(common_hparams, dict) and len(common_hparams) > 0:
+        if "lora_target_modules" in common_hparams:
+            args.lora_target_modules = common_hparams["lora_target_modules"]
 
     eval_algo = args.algo
     if eval_algo == "auto":
         if saved_algo in [
+            "ferret",
             "fedsubmuon",
             "fedsubadam",
             "fedsubsgd",
+            "fedmultisubmuon",
             "fedit",
             "flora",
             "fedexlora",
@@ -326,6 +385,11 @@ def run_evaluate(args):
                 eval_algo = "fedexlora"
             elif global_florg_A_state is not None:
                 eval_algo = "florg"
+            elif (
+                global_multisub_x_state is not None
+                and global_multisub_metadata is not None
+            ):
+                eval_algo = "fedmultisubmuon"
             elif global_deltaW_state is not None:
                 eval_algo = "flora"
             else:
@@ -382,6 +446,22 @@ def run_evaluate(args):
             seeds,
             trainable=False,
             v_state=None,
+        )
+    elif eval_algo == "fedmultisubmuon":
+        if global_multisub_x_state is None or global_multisub_metadata is None:
+            raise ValueError(
+                "FedMultiSubMuon eval requires checkpoint with global_multisub_x_state and global_multisub_metadata"
+            )
+        args.algo = eval_algo
+        framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
+        framework.set_multisub_state(
+            {
+                "x_global": global_multisub_x_state,
+                "metadata": global_multisub_metadata,
+                "selected_keys": list(global_multisub_x_state.keys()),
+                "score_state": global_multisub_scores if isinstance(global_multisub_scores, dict) else {},
+            },
+            trainable=False,
         )
     elif eval_algo == "fedit":
         if global_lora_state is None:
@@ -485,7 +565,10 @@ def run_evaluate(args):
         print(f"[result] eval_rouge={result}")
 
     if framework is not None:
-        framework.clear_submuon_state()
+        if eval_algo == "fedmultisubmuon":
+            framework.clear_multisub_state()
+        else:
+            framework.clear_submuon_state()
 
     metrics = {
         "model": args.model,

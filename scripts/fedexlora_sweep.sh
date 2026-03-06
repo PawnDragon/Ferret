@@ -5,14 +5,14 @@ set -euo pipefail
 seeds=(494 495 496 497)
 
 for seed in "${seeds[@]}"; do
-  run_name="fedexlora_dolly_seed${seed}"
+  run_name="fedexlora_dolly_qwen_seed${seed}"
   echo "[fedexlora sweep] seed=${seed}, run_name=${run_name}"
 
   python main.py \
     --algo fedexlora \
-    --model /root/autodl-tmp/llama-3.2-1B/ \
+    --model /root/autodl-tmp/qwen/ \
     --dataset dolly \
-    --lr 0.00001 \
+    --lr 0.00005 \
     --optimizer adamw \
     --log \
     --device 0 \
@@ -20,13 +20,15 @@ for seed in "${seeds[@]}"; do
     --n_accum 4 \
     --equal_weight \
     --seed "${seed}" \
-    --lora_r 64 \
-    --lora_alpha 64 \
+    --lora_r 8 \
+    --lora_alpha 8 \
     --rounds 60 \
     --use_wandb \
     --wandb_project ferret \
     --wandb_run_name "${run_name}" \
     --batch_or_epoch epoch \
     --early_stop \
+    --early_stop_patience 5 \
+    --optimizer adamw \
     "$@"
 done

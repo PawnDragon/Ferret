@@ -437,6 +437,34 @@ class Server(object):
             'score_state': score_state,
         }
 
+    def log_multisub_selection(self, cur_round, broadcast_state=None):
+        if self.algo != 'fedmultisubmuon':
+            return
+        state = broadcast_state if isinstance(broadcast_state, dict) else self.get_multisub_broadcast_state()
+        if not isinstance(state, dict):
+            print(f'[fedmultisubmuon][round {cur_round}] selected subspaces: 0')
+            return
+
+        selected_keys = state.get('selected_keys', [])
+        metadata = state.get('metadata', {})
+        score_state = state.get('score_state', {})
+        if not isinstance(selected_keys, (list, tuple)):
+            selected_keys = []
+        print(f'[fedmultisubmuon][round {cur_round}] selected subspaces: {len(selected_keys)}')
+
+        for idx, sub_key in enumerate(selected_keys):
+            meta = metadata.get(sub_key, {}) if isinstance(metadata, dict) else {}
+            layer_name = str(meta.get('layer_name', 'unknown'))
+            rank_big = int(meta.get('rank_big', -1))
+            rank_small = int(meta.get('rank_small', -1))
+            idx_tensor = meta.get('indices', None)
+            n_cols = int(idx_tensor.numel()) if isinstance(idx_tensor, torch.Tensor) else -1
+            score_val = float(score_state.get(sub_key, float('nan'))) if isinstance(score_state, dict) else float('nan')
+            print(
+                f'  [{idx}] key={sub_key}, layer={layer_name}, '
+                f'rank_big={rank_big}, rank_small={rank_small}, cols={n_cols}, score={score_val:.6e}'
+            )
+
     def get_fedit_broadcast_state(self):
         if self.algo != 'fedit':
             return None

@@ -400,6 +400,7 @@ if __name__ == '__main__':
 
         if args.algo == 'fedmultisubmuon':
             broadcast_state = server.get_multisub_broadcast_state()
+            server.log_multisub_selection(cur_round=r, broadcast_state=broadcast_state)
             total_comm_down_bytes = compute_comm_size(broadcast_state) * len(selected_client)
 
             client_payloads = []

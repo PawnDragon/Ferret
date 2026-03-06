@@ -1,10 +1,9 @@
-import sys
-from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 
+from optimizers.adamss_allocator import SubspacesAllocator
 from optimizers.submuon_utils import select_target_linear_layers
 
 
@@ -125,37 +124,10 @@ def select_topk_subspaces(score_state: Dict[str, float], topk: int) -> List[str]
     return [key for key, _ in items[:k]]
 
 
-_ADAMSS_ALLOCATOR_CLS = None
-
-
-def _load_adamss_allocator_cls():
-    global _ADAMSS_ALLOCATOR_CLS
-    if _ADAMSS_ALLOCATOR_CLS is not None:
-        return _ADAMSS_ALLOCATOR_CLS
-
-    fedmuon_root = Path(__file__).resolve().parents[2]
-    adamss_root = fedmuon_root / 'AdaMSS'
-    if adamss_root.is_dir():
-        adamss_path = str(adamss_root)
-        if adamss_path not in sys.path:
-            sys.path.insert(0, adamss_path)
-
-    try:
-        from adamss_pkg.asa import SubspacesAllocator
-    except Exception as exc:
-        raise RuntimeError(
-            f'[fedmultisubmuon] failed to import AdaMSS allocator from {adamss_root}'
-        ) from exc
-
-    _ADAMSS_ALLOCATOR_CLS = SubspacesAllocator
-    return _ADAMSS_ALLOCATOR_CLS
-
-
 def build_adamss_allocator(mask_interval: int, beta1: float, beta2: float):
-    allocator_cls = _load_adamss_allocator_cls()
     b1 = float(max(min(beta1, 1.0 - 1e-6), 1e-6))
     b2 = float(max(min(beta2, 1.0 - 1e-6), 1e-6))
-    return allocator_cls(
+    return SubspacesAllocator(
         tt=1.0,
         target_KK=1,
         init_warmup=0,

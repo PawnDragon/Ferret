@@ -401,7 +401,18 @@ if __name__ == '__main__':
         if args.algo == 'fedmultisubmuon':
             broadcast_state = server.get_multisub_broadcast_state()
             server.log_multisub_selection(cur_round=r, broadcast_state=broadcast_state)
-            total_comm_down_bytes = compute_comm_size(broadcast_state) * len(selected_client)
+            # Communication accounting policy for fixed basis in FedMultiSubMuon:
+            # round-1 (warmup): count full downlink once (includes basis metadata A/indices)
+            # round>=2: count only adaptive payload (B/C/scores)
+            if int(r) <= 1:
+                comm_down_state = broadcast_state
+            else:
+                comm_down_state = {
+                    'b_global': broadcast_state.get('b_global', {}),
+                    'c_global': broadcast_state.get('c_global', {}),
+                    'score_state': broadcast_state.get('score_state', {}),
+                }
+            total_comm_down_bytes = compute_comm_size(comm_down_state) * len(selected_client)
 
             client_payloads = []
             for client in selected_client:

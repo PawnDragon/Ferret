@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from optimizers.fedmultisub_utils import orthogonality_error, update_adamss_score
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
@@ -154,6 +155,16 @@ class FerretFramework(object):
         self.subadam_step = 0
         self.target_linear_layers = []
         self._submuon_uv_cache = {}
+        self.multisub_x = {}
+        self.multisub_m = {}
+        self.multisub_meta = {}
+        self.multisub_scores = {}
+        self.multisub_exp_avg = {}
+        self.multisub_exp_unc = {}
+        self.multisub_layer_to_keys = {}
+        self._orig_multisub_forward = {}
+        self._multisub_uv_cache = {}
+        self._multisub_debug_logged = False
         self._orig_linear_forward = {}
         self._flora_delta = {}
         self._flora_scaling = 1.0
@@ -179,6 +190,8 @@ class FerretFramework(object):
                     f'rank_r={self.args.rank_r}, '
                     f'lora_target_modules={getattr(self.args, "lora_target_modules", None)}'
                 )
+        elif self.algo == 'fedmultisubmuon':
+            self._freeze_backbone_for_submuon()
         else:
             self.optim = self._build_local_optimizer([p for _, p in self.named_parameters_to_optim])
             # Ferret still needs grouped params for random-seed projection.
@@ -255,6 +268,20 @@ class FerretFramework(object):
             )
         return self._submuon_uv_cache[key]
 
+    def _get_multisub_v(self, subspace_key, seed, in_dim, rank, device, dtype):
+        key = ('multisub', subspace_key, int(seed), int(in_dim), int(rank), str(device), str(dtype))
+        if key not in self._multisub_uv_cache:
+            v_mat, _ = make_uv(
+                seed=int(seed),
+                out_dim=int(in_dim),
+                in_dim=int(in_dim),
+                r=int(rank),
+                device=device,
+                dtype=dtype,
+            )
+            self._multisub_uv_cache[key] = v_mat
+        return self._multisub_uv_cache[key]
+
     def _install_submuon_forward(self):
         for layer_name in self.target_linear_layers:
             if layer_name not in self.submuon_x:
@@ -285,6 +312,47 @@ class FerretFramework(object):
 
             module.forward = patched_forward
 
+    def _install_multisub_forward(self):
+        for layer_name, key_list in self.multisub_layer_to_keys.items():
+            if len(key_list) == 0:
+                continue
+            module = self._resolve_module(layer_name)
+            if layer_name in self._orig_multisub_forward:
+                continue
+            self._orig_multisub_forward[layer_name] = module.forward
+
+            def patched_forward(x, _module=module, _layer_name=layer_name, _key_list=tuple(key_list)):
+                input_shape = x.shape
+                x2 = x.reshape(-1, input_shape[-1])
+                y0 = F.linear(x2, _module.weight, _module.bias)
+                y_delta = None
+
+                for sub_key in _key_list:
+                    X = self.multisub_x[sub_key].to(dtype=x2.dtype)
+                    meta = self.multisub_meta[sub_key]
+                    A = meta['A'].to(dtype=x2.dtype)
+                    col_idx = meta['indices']
+                    V = self._get_multisub_v(
+                        subspace_key=sub_key,
+                        seed=meta['seed'],
+                        in_dim=int(col_idx.numel()),
+                        rank=int(X.shape[0]),
+                        device=x2.device,
+                        dtype=x2.dtype,
+                    )
+                    x_sub = torch.index_select(x2, dim=1, index=col_idx)
+                    a = x_sub @ V
+                    b = a @ X.t()
+                    contrib = b @ A.t()
+                    y_delta = contrib if y_delta is None else (y_delta + contrib)
+
+                if y_delta is None:
+                    return y0.reshape(*input_shape[:-1], _module.out_features)
+                y = y0 + y_delta.to(dtype=y0.dtype)
+                return y.reshape(*input_shape[:-1], _module.out_features)
+
+            module.forward = patched_forward
+
     def clear_submuon_state(self):
         for layer_name, orig_forward in self._orig_linear_forward.items():
             module = self._resolve_module(layer_name)
@@ -298,6 +366,20 @@ class FerretFramework(object):
         self.subadam_step = 0
         if self.algo in ['fedsubadam', 'fedsubsgd']:
             self.optim = None
+
+    def clear_multisub_state(self):
+        for layer_name, orig_forward in self._orig_multisub_forward.items():
+            module = self._resolve_module(layer_name)
+            module.forward = orig_forward
+        self._orig_multisub_forward = {}
+        self._multisub_uv_cache = {}
+        self.multisub_x = {}
+        self.multisub_m = {}
+        self.multisub_meta = {}
+        self.multisub_scores = {}
+        self.multisub_exp_avg = {}
+        self.multisub_exp_unc = {}
+        self.multisub_layer_to_keys = {}
 
     def clear_flora_delta_state(self):
         with torch.no_grad():
@@ -381,6 +463,114 @@ class FerretFramework(object):
             v_out = {k: v.detach().cpu().clone() for k, v in self.submuon_v.items()}
             return x_out, m_out, v_out
         return x_out, m_out
+
+    def set_multisub_state(self, multisub_state, trainable=True):
+        if self.algo != 'fedmultisubmuon':
+            return
+        self.clear_multisub_state()
+        if not isinstance(multisub_state, dict):
+            return
+
+        x_state = multisub_state.get('x_global', {})
+        metadata = multisub_state.get('metadata', {})
+        selected_keys = multisub_state.get('selected_keys', [])
+        incoming_scores = multisub_state.get('score_state', {})
+        if not isinstance(x_state, dict) or not isinstance(metadata, dict):
+            return
+        if not isinstance(selected_keys, (list, tuple)):
+            selected_keys = list(x_state.keys())
+        if len(selected_keys) == 0:
+            selected_keys = list(x_state.keys())
+
+        device = next(self.model.parameters()).device
+        for sub_key in selected_keys:
+            if sub_key not in x_state or sub_key not in metadata:
+                continue
+            meta_entry = metadata[sub_key]
+            if not isinstance(meta_entry, dict):
+                continue
+            layer_name = meta_entry.get('layer_name', None)
+            a_tensor = meta_entry.get('A', None)
+            col_idx = meta_entry.get('indices', None)
+            if layer_name is None or (not isinstance(a_tensor, torch.Tensor)) or (not isinstance(col_idx, torch.Tensor)):
+                continue
+
+            x_tensor = x_state[sub_key]
+            if not isinstance(x_tensor, torch.Tensor):
+                continue
+            module = self._resolve_module(str(layer_name))
+            if x_tensor.ndim != 2 or x_tensor.shape[0] != x_tensor.shape[1]:
+                raise RuntimeError(
+                    f'[fedmultisubmuon] expected square X for {sub_key}, got shape={tuple(x_tensor.shape)}'
+                )
+            if a_tensor.ndim != 2:
+                raise RuntimeError(
+                    f'[fedmultisubmuon] expected 2D A for {sub_key}, got shape={tuple(a_tensor.shape)}'
+                )
+            if int(a_tensor.shape[1]) != int(x_tensor.shape[0]):
+                raise RuntimeError(
+                    f'[fedmultisubmuon] shape mismatch for {sub_key}: A={tuple(a_tensor.shape)}, X={tuple(x_tensor.shape)}'
+                )
+            if int(a_tensor.shape[0]) != int(module.out_features):
+                raise RuntimeError(
+                    f'[fedmultisubmuon] A out-dim mismatch for {sub_key}: '
+                    f'A.shape[0]={int(a_tensor.shape[0])}, layer_out={int(module.out_features)}'
+                )
+            if col_idx.ndim != 1:
+                raise RuntimeError(
+                    f'[fedmultisubmuon] indices must be 1D for {sub_key}, got shape={tuple(col_idx.shape)}'
+                )
+            if int(col_idx.numel()) == 0:
+                continue
+            if int(col_idx.max().item()) >= int(module.in_features) or int(col_idx.min().item()) < 0:
+                raise RuntimeError(
+                    f'[fedmultisubmuon] column indices out of range for {sub_key}: '
+                    f'min={int(col_idx.min().item())}, max={int(col_idx.max().item())}, in_features={int(module.in_features)}'
+                )
+            x_param = torch.nn.Parameter(
+                x_tensor.to(device=device, dtype=torch.float32).clone().detach(),
+                requires_grad=trainable,
+            )
+            self.multisub_x[sub_key] = x_param
+            self.multisub_m[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
+            self.multisub_exp_avg[sub_key] = 0.0
+            self.multisub_exp_unc[sub_key] = 0.0
+            self.multisub_scores[sub_key] = float(incoming_scores.get(sub_key, 0.0))
+            self.multisub_meta[sub_key] = {
+                'layer_name': str(layer_name),
+                'A': a_tensor.to(device=device, dtype=torch.float32).contiguous(),
+                'indices': col_idx.to(device=device, dtype=torch.long).contiguous(),
+                'seed': int(meta_entry.get('seed', 0)),
+            }
+            self.multisub_layer_to_keys.setdefault(str(layer_name), []).append(sub_key)
+            if (not self._multisub_debug_logged) and trainable:
+                v_debug = self._get_multisub_v(
+                    subspace_key=sub_key,
+                    seed=int(meta_entry.get('seed', 0)),
+                    in_dim=int(col_idx.numel()),
+                    rank=int(x_param.shape[0]),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                print(
+                    f'[debug][fedmultisubmuon][framework] {sub_key} '
+                    f'A_shape={tuple(a_tensor.shape)} X_shape={tuple(x_tensor.shape)} '
+                    f'V_orth_err={orthogonality_error(v_debug):.6e}'
+                )
+                self._multisub_debug_logged = True
+
+        if len(self.multisub_x) > 0:
+            self._install_multisub_forward()
+
+    def export_multisub_state(self):
+        x_out = {k: v.detach().cpu().clone() for k, v in self.multisub_x.items()}
+        score_out = {}
+        for sub_key in self.multisub_x.keys():
+            if sub_key in self.multisub_scores:
+                score_out[sub_key] = float(self.multisub_scores[sub_key])
+            else:
+                score_out[sub_key] = float(self.multisub_x[sub_key].detach().float().abs().mean().item())
+        return x_out, score_out
 
     def get_named_optim_state(self):
         return export_named_adamw_state(self.model, self.optim)
@@ -539,6 +729,39 @@ class FerretFramework(object):
                         self.submuon_m[layer_name].mul_(beta).add_((1.0 - beta) * grad)
                         delta = zeropower_via_newtonschulz5(self.submuon_m[layer_name].float(), self.args.ns_steps)
                         X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
+                        X.grad = None
+            return logits.detach(), loss.detach()
+
+        if self.algo == 'fedmultisubmuon':
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                beta = float(getattr(self.args, 'beta', 0.95))
+                beta1 = float(getattr(self.args, 'multisub_score_beta1', 0.9))
+                beta2 = float(getattr(self.args, 'multisub_score_beta2', 0.999))
+                score_interval = max(int(getattr(self.args, 'multisub_score_interval', 1)), 1)
+                with torch.no_grad():
+                    for sub_key, X in self.multisub_x.items():
+                        grad = X.grad
+                        if grad is None:
+                            continue
+                        self.multisub_m[sub_key].mul_(beta).add_((1.0 - beta) * grad)
+                        delta = zeropower_via_newtonschulz5(self.multisub_m[sub_key].float(), self.args.ns_steps)
+                        X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
+
+                        if (self._local_step_counter % score_interval) == 0:
+                            ipt_scalar = float((X.detach() * grad.detach()).abs().mean().item())
+                            exp_avg_prev = float(self.multisub_exp_avg.get(sub_key, 0.0))
+                            exp_unc_prev = float(self.multisub_exp_unc.get(sub_key, 0.0))
+                            exp_avg, exp_unc, score = update_adamss_score(
+                                ipt_abs_scalar=ipt_scalar,
+                                exp_avg_prev=exp_avg_prev,
+                                exp_unc_prev=exp_unc_prev,
+                                beta1=beta1,
+                                beta2=beta2,
+                            )
+                            self.multisub_exp_avg[sub_key] = exp_avg
+                            self.multisub_exp_unc[sub_key] = exp_unc
+                            self.multisub_scores[sub_key] = score
                         X.grad = None
             return logits.detach(), loss.detach()
 

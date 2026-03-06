@@ -51,6 +51,8 @@ def is_finite_scalar(value):
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
     if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
+    if args.algo == 'fedmultisubmuon':
+        return server.save_best_multisub_ckpt(metric, cur_round)
     if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
@@ -92,10 +94,23 @@ def apply_early_stop_state(early_state, val_loss, cur_round, min_delta):
 
 
 if __name__ == '__main__':
+    algo_choices = [
+        'ferret',
+        'fedsubmuon',
+        'fedsubadam',
+        'fedsubsgd',
+        'fedmultisubmuon',
+        'fedit',
+        'flora',
+        'fedsalora',
+        'fedexlora',
+        'florg',
+        'fedavg',
+    ]
     parser = argparse.ArgumentParser()
 
     # Algorithm
-    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=['ferret', 'fedsubmuon', 'fedsubadam', 'fedsubsgd', 'fedit', 'flora', 'fedsalora', 'fedexlora', 'florg', 'fedavg'])
+    parser.add_argument('--algo', type=lambda x: x.lower(), default='ferret', choices=algo_choices)
 
     # Federation
     parser.add_argument('--num_clients', type=int, default=200, help='N in our paper')
@@ -163,6 +178,12 @@ if __name__ == '__main__':
     parser.add_argument('--lora_bias', type=str, default='none', choices=['none', 'all', 'lora_only'])
     parser.add_argument('--florg_rank_r', type=int, default=16, help='rank r for FLoRG A matrix')
     parser.add_argument('--florg_seed_base', type=int, default=95317, help='base seed for deterministic FLoRG L/R generation')
+    parser.add_argument('--multisub_num_subspaces', type=int, default=4, help='number of subspaces per target layer for FedMultiSubMuon')
+    parser.add_argument('--multisub_topk', type=int, default=50, help='number of globally selected subspaces each round; <=0 means all')
+    parser.add_argument('--multisub_seed_base', type=int, default=0, help='base seed for FedMultiSubMuon subspace initialization; 0 means seed+13579')
+    parser.add_argument('--multisub_score_interval', type=int, default=10, help='AdaMSS score update interval in local steps')
+    parser.add_argument('--multisub_score_beta1', type=float, default=0.9, help='beta1 for FedMultiSubMuon AdaMSS score EMA')
+    parser.add_argument('--multisub_score_beta2', type=float, default=0.999, help='beta2 for FedMultiSubMuon AdaMSS score EMA')
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')
@@ -199,13 +220,15 @@ if __name__ == '__main__':
 
     time_stamp = str(time.time())
     args = parser.parse_args()
+    if int(getattr(args, 'multisub_seed_base', 0)) == 0:
+        args.multisub_seed_base = int(args.seed) + 13579
     if args.optimizer is None:
-        if args.algo in ['ferret', 'fedsalora', 'fedsubsgd']:
+        if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon']:
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo == 'fedsubmuon':
-        print(f'[info] --optimizer={args.optimizer} is ignored for fedsubmuon (keeps original update rule).')
+    if args.algo in ['fedsubmuon', 'fedmultisubmuon']:
+        print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps Muon-style update rule).')
 
     eval_avg_acc = []
     previous_metric = args.eval_metric
@@ -374,7 +397,71 @@ if __name__ == '__main__':
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
-        if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if args.algo == 'fedmultisubmuon':
+            broadcast_state = server.get_multisub_broadcast_state()
+            total_comm_down_bytes = compute_comm_size(broadcast_state) * len(selected_client)
+
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(server.model, cur_round=r, multisub_state=broadcast_state)
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                payload_x = payload.get('x', {})
+                payload_indices = {}
+                meta_state = broadcast_state.get('metadata', {})
+                if isinstance(payload_x, dict) and isinstance(meta_state, dict):
+                    for sub_key in payload_x.keys():
+                        if sub_key in meta_state and isinstance(meta_state[sub_key], dict):
+                            idx_tensor = meta_state[sub_key].get('indices', None)
+                            if isinstance(idx_tensor, torch.Tensor):
+                                payload_indices[sub_key] = idx_tensor
+                total_comm_up_bytes += compute_comm_size(
+                    {
+                        'x': payload_x,
+                        'scores': payload.get('scores', {}),
+                        'selected_keys': list(payload_x.keys()),
+                        'indices': payload_indices,
+                    }
+                )
+
+            server.aggregate_fedmultisubmuon(client_payloads, selected_client, cur_round=r)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
                 server.maybe_refresh_submuon_seeds(r)
             broadcast_state = server.get_submuon_broadcast_state()
@@ -898,6 +985,12 @@ if __name__ == '__main__':
             'algo': 'auto',
             'seed': args.seed,
             'rank_r': args.rank_r,
+            'multisub_num_subspaces': args.multisub_num_subspaces,
+            'multisub_topk': args.multisub_topk,
+            'multisub_score_interval': args.multisub_score_interval,
+            'multisub_score_beta1': args.multisub_score_beta1,
+            'multisub_score_beta2': args.multisub_score_beta2,
+            'multisub_seed_base': args.multisub_seed_base,
             'lr': args.lr,
             'beta': args.beta,
             'ns_steps': args.ns_steps,

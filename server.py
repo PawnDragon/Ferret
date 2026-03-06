@@ -271,15 +271,13 @@ class Server(object):
                 base_seed=base_seed,
                 target_modules=getattr(self.args, 'lora_target_modules', None),
             )
-            self.global_multisub_selected_keys = select_topk_subspaces(
-                self.global_multisub_scores,
-                int(getattr(self.args, 'multisub_topk', 0)),
-            )
-            if len(self.global_multisub_selected_keys) == 0:
-                self.global_multisub_selected_keys = list(self.global_multisub_b_state.keys())
+            # Warmup policy:
+            # round-1 uses all subspaces so every subspace can collect score at least once.
+            # from round-2 onward, top-k is selected in aggregate_fedmultisubmuon() using round-(t-1) scores.
+            self.global_multisub_selected_keys = list(self.global_multisub_b_state.keys())
             print(
                 f'[fedmultisubmuon] initialized {len(self.global_multisub_b_state)} subspaces; '
-                f'round-1 topk={len(self.global_multisub_selected_keys)}'
+                f'round-1 warmup uses all={len(self.global_multisub_selected_keys)}'
             )
 
     def _get_ckpt_dir(self):
@@ -452,6 +450,7 @@ class Server(object):
             selected_keys = []
         print(f'[fedmultisubmuon][round {cur_round}] selected subspaces: {len(selected_keys)}')
 
+        round_scores = []
         for idx, sub_key in enumerate(selected_keys):
             meta = metadata.get(sub_key, {}) if isinstance(metadata, dict) else {}
             layer_name = str(meta.get('layer_name', 'unknown'))
@@ -459,10 +458,21 @@ class Server(object):
             rank_small = int(meta.get('rank_small', -1))
             idx_tensor = meta.get('indices', None)
             n_cols = int(idx_tensor.numel()) if isinstance(idx_tensor, torch.Tensor) else -1
-            score_val = float(score_state.get(sub_key, float('nan'))) if isinstance(score_state, dict) else float('nan')
+            if isinstance(score_state, dict) and sub_key in score_state:
+                score_val = float(score_state[sub_key])
+            else:
+                score_val = float(self.global_multisub_scores.get(sub_key, float('nan')))
+            round_scores.append(score_val)
             print(
                 f'  [{idx}] key={sub_key}, layer={layer_name}, '
                 f'rank_big={rank_big}, rank_small={rank_small}, cols={n_cols}, score={score_val:.6e}'
+            )
+        finite_scores = [s for s in round_scores if np.isfinite(s)]
+        if len(finite_scores) > 0:
+            print(
+                f'[fedmultisubmuon][round {cur_round}] score summary: '
+                f'min={min(finite_scores):.6e}, max={max(finite_scores):.6e}, '
+                f'mean={float(np.mean(finite_scores)):.6e}'
             )
 
     def get_fedit_broadcast_state(self):

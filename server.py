@@ -260,6 +260,7 @@ class Server(object):
             self.global_multisub_metadata, self.global_multisub_x_state, self.global_multisub_scores = initialize_subspaces(
                 self.model,
                 rank_r=int(self.args.rank_r),
+                svd_rank=int(getattr(self.args, 'svd_rank', 500)),
                 num_subspaces=int(getattr(self.args, 'multisub_num_subspaces', 4)),
                 base_seed=base_seed,
                 target_modules=getattr(self.args, 'lora_target_modules', None),
@@ -1059,6 +1060,7 @@ class Server(object):
                 'hparams': {
                     'algo': self.args.algo,
                     'rank_r': int(self.args.rank_r),
+                    'svd_rank': int(getattr(self.args, 'svd_rank', 500)),
                     'beta': float(getattr(self.args, 'beta', 0.95)),
                     'ns_steps': int(getattr(self.args, 'ns_steps', 5)),
                     'lr': float(self.args.lr),

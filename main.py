@@ -157,6 +157,7 @@ if __name__ == '__main__':
 
     # FedSubMuon
     parser.add_argument('--rank_r', type=int, default=8)
+    parser.add_argument('--svd_rank', type=int, default=500, help='SVD rank used for FedMultiSubMuon subspace partition')
     parser.add_argument('--beta', type=float, default=0.95)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.999)
@@ -985,6 +986,7 @@ if __name__ == '__main__':
             'algo': 'auto',
             'seed': args.seed,
             'rank_r': args.rank_r,
+            'svd_rank': args.svd_rank,
             'multisub_num_subspaces': args.multisub_num_subspaces,
             'multisub_topk': args.multisub_topk,
             'multisub_score_interval': args.multisub_score_interval,

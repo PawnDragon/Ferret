@@ -26,7 +26,7 @@ def _split_indices_evenly(indices: torch.Tensor, num_parts: int) -> List[torch.T
     return parts
 
 
-def partition_subspaces(weight: torch.Tensor, num_subspaces: int, spectral_rank: int = 8) -> List[torch.Tensor]:
+def partition_subspaces(weight: torch.Tensor, num_subspaces: int, spectral_rank: int = 500) -> List[torch.Tensor]:
     # AdaMSS-inspired spectral partition: sort columns by top singular feature, then split evenly.
     in_dim = int(weight.shape[1])
     if in_dim == 0:
@@ -44,6 +44,7 @@ def partition_subspaces(weight: torch.Tensor, num_subspaces: int, spectral_rank:
 def initialize_subspaces(
     model,
     rank_r: int,
+    svd_rank: int,
     num_subspaces: int,
     base_seed: int,
     target_modules=None,
@@ -53,7 +54,7 @@ def initialize_subspaces(
     if len(layer_names) == 0:
         raise RuntimeError(
             f'[fedmultisubmuon] no target linear layer is selected; '
-            f'rank_r={rank_r}, lora_target_modules={target_modules}'
+            f'rank_r={rank_r}, svd_rank={svd_rank}, lora_target_modules={target_modules}'
         )
 
     metadata = {}
@@ -66,7 +67,11 @@ def initialize_subspaces(
         if module is None or (not hasattr(module, 'weight')):
             continue
         weight = module.weight.detach().cpu().float()
-        subspace_columns = partition_subspaces(weight, num_subspaces=num_subspaces)
+        subspace_columns = partition_subspaces(
+            weight,
+            num_subspaces=num_subspaces,
+            spectral_rank=int(svd_rank),
+        )
         for sub_idx, col_indices in enumerate(subspace_columns):
             if int(col_indices.numel()) == 0:
                 continue

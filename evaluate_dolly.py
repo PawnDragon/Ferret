@@ -245,6 +245,7 @@ def build_parser():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank_r", type=int, default=8)
+    parser.add_argument("--svd_rank", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument(
         "--optimizer",

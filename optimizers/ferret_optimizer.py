@@ -4,7 +4,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from optimizers.fedmultisub_utils import orthogonality_error, update_adamss_score
+from optimizers.fedmultisub_utils import (
+    build_adamss_allocator,
+    compute_adamss_subspace_score,
+    shape_signature,
+)
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
@@ -155,15 +159,15 @@ class FerretFramework(object):
         self.subadam_step = 0
         self.target_linear_layers = []
         self._submuon_uv_cache = {}
-        self.multisub_x = {}
-        self.multisub_m = {}
+        self.multisub_b = {}
+        self.multisub_c = {}
+        self.multisub_mb = {}
+        self.multisub_mc = {}
         self.multisub_meta = {}
         self.multisub_scores = {}
-        self.multisub_exp_avg = {}
-        self.multisub_exp_unc = {}
         self.multisub_layer_to_keys = {}
         self._orig_multisub_forward = {}
-        self._multisub_uv_cache = {}
+        self._multisub_allocator = None
         self._multisub_debug_logged = False
         self._orig_linear_forward = {}
         self._flora_delta = {}
@@ -268,20 +272,6 @@ class FerretFramework(object):
             )
         return self._submuon_uv_cache[key]
 
-    def _get_multisub_v(self, subspace_key, seed, in_dim, rank, device, dtype):
-        key = ('multisub', subspace_key, int(seed), int(in_dim), int(rank), str(device), str(dtype))
-        if key not in self._multisub_uv_cache:
-            v_mat, _ = make_uv(
-                seed=int(seed),
-                out_dim=int(in_dim),
-                in_dim=int(in_dim),
-                r=int(rank),
-                device=device,
-                dtype=dtype,
-            )
-            self._multisub_uv_cache[key] = v_mat
-        return self._multisub_uv_cache[key]
-
     def _install_submuon_forward(self):
         for layer_name in self.target_linear_layers:
             if layer_name not in self.submuon_x:
@@ -328,22 +318,15 @@ class FerretFramework(object):
                 y_delta = None
 
                 for sub_key in _key_list:
-                    X = self.multisub_x[sub_key].to(dtype=x2.dtype)
+                    B = self.multisub_b[sub_key].to(dtype=x2.dtype)
+                    C = self.multisub_c[sub_key].to(dtype=x2.dtype)
                     meta = self.multisub_meta[sub_key]
                     A = meta['A'].to(dtype=x2.dtype)
                     col_idx = meta['indices']
-                    V = self._get_multisub_v(
-                        subspace_key=sub_key,
-                        seed=meta['seed'],
-                        in_dim=int(col_idx.numel()),
-                        rank=int(X.shape[0]),
-                        device=x2.device,
-                        dtype=x2.dtype,
-                    )
                     x_sub = torch.index_select(x2, dim=1, index=col_idx)
-                    a = x_sub @ V
-                    b = a @ X.t()
-                    contrib = b @ A.t()
+                    abc_1 = x_sub @ C.t()
+                    abc_2 = abc_1 @ B.t()
+                    contrib = abc_2 @ A.t()
                     y_delta = contrib if y_delta is None else (y_delta + contrib)
 
                 if y_delta is None:
@@ -372,14 +355,14 @@ class FerretFramework(object):
             module = self._resolve_module(layer_name)
             module.forward = orig_forward
         self._orig_multisub_forward = {}
-        self._multisub_uv_cache = {}
-        self.multisub_x = {}
-        self.multisub_m = {}
+        self.multisub_b = {}
+        self.multisub_c = {}
+        self.multisub_mb = {}
+        self.multisub_mc = {}
         self.multisub_meta = {}
         self.multisub_scores = {}
-        self.multisub_exp_avg = {}
-        self.multisub_exp_unc = {}
         self.multisub_layer_to_keys = {}
+        self._multisub_allocator = None
 
     def clear_flora_delta_state(self):
         with torch.no_grad():
@@ -471,20 +454,21 @@ class FerretFramework(object):
         if not isinstance(multisub_state, dict):
             return
 
-        x_state = multisub_state.get('x_global', {})
+        b_state = multisub_state.get('b_global', {})
+        c_state = multisub_state.get('c_global', {})
         metadata = multisub_state.get('metadata', {})
         selected_keys = multisub_state.get('selected_keys', [])
         incoming_scores = multisub_state.get('score_state', {})
-        if not isinstance(x_state, dict) or not isinstance(metadata, dict):
+        if not isinstance(b_state, dict) or not isinstance(c_state, dict) or not isinstance(metadata, dict):
             return
         if not isinstance(selected_keys, (list, tuple)):
-            selected_keys = list(x_state.keys())
+            selected_keys = list(b_state.keys())
         if len(selected_keys) == 0:
-            selected_keys = list(x_state.keys())
+            selected_keys = list(b_state.keys())
 
         device = next(self.model.parameters()).device
         for sub_key in selected_keys:
-            if sub_key not in x_state or sub_key not in metadata:
+            if sub_key not in b_state or sub_key not in c_state or sub_key not in metadata:
                 continue
             meta_entry = metadata[sub_key]
             if not isinstance(meta_entry, dict):
@@ -495,21 +479,28 @@ class FerretFramework(object):
             if layer_name is None or (not isinstance(a_tensor, torch.Tensor)) or (not isinstance(col_idx, torch.Tensor)):
                 continue
 
-            x_tensor = x_state[sub_key]
-            if not isinstance(x_tensor, torch.Tensor):
+            b_tensor = b_state[sub_key]
+            c_tensor = c_state[sub_key]
+            if (not isinstance(b_tensor, torch.Tensor)) or (not isinstance(c_tensor, torch.Tensor)):
                 continue
             module = self._resolve_module(str(layer_name))
-            if x_tensor.ndim != 2 or x_tensor.shape[0] != x_tensor.shape[1]:
+            if b_tensor.ndim != 2 or c_tensor.ndim != 2 or a_tensor.ndim != 2:
                 raise RuntimeError(
-                    f'[fedmultisubmuon] expected square X for {sub_key}, got shape={tuple(x_tensor.shape)}'
+                    f'[fedmultisubmuon] expected 2D tensors for {sub_key}, '
+                    f'got A={tuple(a_tensor.shape)}, B={tuple(b_tensor.shape)}, C={tuple(c_tensor.shape)}'
                 )
-            if a_tensor.ndim != 2:
+            rank_big = int(a_tensor.shape[1])
+            rank_small = int(c_tensor.shape[0])
+            n_sub = int(col_idx.numel())
+            if tuple(b_tensor.shape) != (rank_big, rank_small):
                 raise RuntimeError(
-                    f'[fedmultisubmuon] expected 2D A for {sub_key}, got shape={tuple(a_tensor.shape)}'
+                    f'[fedmultisubmuon] B shape mismatch for {sub_key}: '
+                    f'expected {(rank_big, rank_small)}, got {tuple(b_tensor.shape)}'
                 )
-            if int(a_tensor.shape[1]) != int(x_tensor.shape[0]):
+            if tuple(c_tensor.shape) != (rank_small, n_sub):
                 raise RuntimeError(
-                    f'[fedmultisubmuon] shape mismatch for {sub_key}: A={tuple(a_tensor.shape)}, X={tuple(x_tensor.shape)}'
+                    f'[fedmultisubmuon] C shape mismatch for {sub_key}: '
+                    f'expected {(rank_small, n_sub)}, got {tuple(c_tensor.shape)}'
                 )
             if int(a_tensor.shape[0]) != int(module.out_features):
                 raise RuntimeError(
@@ -527,50 +518,62 @@ class FerretFramework(object):
                     f'[fedmultisubmuon] column indices out of range for {sub_key}: '
                     f'min={int(col_idx.min().item())}, max={int(col_idx.max().item())}, in_features={int(module.in_features)}'
                 )
-            x_param = torch.nn.Parameter(
-                x_tensor.to(device=device, dtype=torch.float32).clone().detach(),
+            b_param = torch.nn.Parameter(
+                b_tensor.to(device=device, dtype=torch.float32).clone().detach(),
                 requires_grad=trainable,
             )
-            self.multisub_x[sub_key] = x_param
-            self.multisub_m[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
-            self.multisub_exp_avg[sub_key] = 0.0
-            self.multisub_exp_unc[sub_key] = 0.0
+            c_param = torch.nn.Parameter(
+                c_tensor.to(device=device, dtype=torch.float32).clone().detach(),
+                requires_grad=trainable,
+            )
+            self.multisub_b[sub_key] = b_param
+            self.multisub_c[sub_key] = c_param
+            self.multisub_mb[sub_key] = torch.zeros_like(b_param, device=device, dtype=torch.float32)
+            self.multisub_mc[sub_key] = torch.zeros_like(c_param, device=device, dtype=torch.float32)
             self.multisub_scores[sub_key] = float(incoming_scores.get(sub_key, 0.0))
             self.multisub_meta[sub_key] = {
                 'layer_name': str(layer_name),
                 'A': a_tensor.to(device=device, dtype=torch.float32).contiguous(),
                 'indices': col_idx.to(device=device, dtype=torch.long).contiguous(),
-                'seed': int(meta_entry.get('seed', 0)),
+                'rank_big': rank_big,
+                'rank_small': rank_small,
             }
             self.multisub_layer_to_keys.setdefault(str(layer_name), []).append(sub_key)
             if (not self._multisub_debug_logged) and trainable:
-                v_debug = self._get_multisub_v(
-                    subspace_key=sub_key,
-                    seed=int(meta_entry.get('seed', 0)),
-                    in_dim=int(col_idx.numel()),
-                    rank=int(x_param.shape[0]),
-                    device=device,
-                    dtype=torch.float32,
-                )
+                delta = self.multisub_meta[sub_key]['A'] @ b_param @ c_param
+                if tuple(delta.shape) != (int(module.out_features), int(col_idx.numel())):
+                    raise RuntimeError(
+                        f'[fedmultisubmuon] invalid ABC shape for {sub_key}: '
+                        f'{shape_signature(self.multisub_meta[sub_key], b_param, c_param)}'
+                    )
                 print(
                     f'[debug][fedmultisubmuon][framework] {sub_key} '
-                    f'A_shape={tuple(a_tensor.shape)} X_shape={tuple(x_tensor.shape)} '
-                    f'V_orth_err={orthogonality_error(v_debug):.6e}'
+                    f'A_shape={tuple(a_tensor.shape)} B_shape={tuple(b_tensor.shape)} C_shape={tuple(c_tensor.shape)}'
                 )
                 self._multisub_debug_logged = True
 
-        if len(self.multisub_x) > 0:
+        if len(self.multisub_b) > 0 and trainable:
+            score_interval = max(int(getattr(self.args, 'multisub_score_interval', 1)), 1)
+            beta1 = float(getattr(self.args, 'multisub_score_beta1', 0.9))
+            beta2 = float(getattr(self.args, 'multisub_score_beta2', 0.999))
+            self._multisub_allocator = build_adamss_allocator(
+                mask_interval=score_interval,
+                beta1=beta1,
+                beta2=beta2,
+            )
+        if len(self.multisub_b) > 0:
             self._install_multisub_forward()
 
     def export_multisub_state(self):
-        x_out = {k: v.detach().cpu().clone() for k, v in self.multisub_x.items()}
+        b_out = {k: v.detach().cpu().clone() for k, v in self.multisub_b.items()}
+        c_out = {k: v.detach().cpu().clone() for k, v in self.multisub_c.items()}
         score_out = {}
-        for sub_key in self.multisub_x.keys():
+        for sub_key in self.multisub_b.keys():
             if sub_key in self.multisub_scores:
                 score_out[sub_key] = float(self.multisub_scores[sub_key])
             else:
-                score_out[sub_key] = float(self.multisub_x[sub_key].detach().float().abs().mean().item())
-        return x_out, score_out
+                score_out[sub_key] = 0.0
+        return b_out, c_out, score_out
 
     def get_named_optim_state(self):
         return export_named_adamw_state(self.model, self.optim)
@@ -736,33 +739,33 @@ class FerretFramework(object):
             (loss / self.args.n_accum).backward()
             if apply_optim_step:
                 beta = float(getattr(self.args, 'beta', 0.95))
-                beta1 = float(getattr(self.args, 'multisub_score_beta1', 0.9))
-                beta2 = float(getattr(self.args, 'multisub_score_beta2', 0.999))
                 score_interval = max(int(getattr(self.args, 'multisub_score_interval', 1)), 1)
                 with torch.no_grad():
-                    for sub_key, X in self.multisub_x.items():
-                        grad = X.grad
-                        if grad is None:
+                    for sub_key in self.multisub_b.keys():
+                        B = self.multisub_b[sub_key]
+                        C = self.multisub_c[sub_key]
+                        grad_b = B.grad
+                        grad_c = C.grad
+                        if grad_b is None or grad_c is None:
                             continue
-                        self.multisub_m[sub_key].mul_(beta).add_((1.0 - beta) * grad)
-                        delta = zeropower_via_newtonschulz5(self.multisub_m[sub_key].float(), self.args.ns_steps)
-                        X.data.sub_(self.lr * delta.to(dtype=X.data.dtype))
+                        self.multisub_mb[sub_key].mul_(beta).add_((1.0 - beta) * grad_b)
+                        self.multisub_mc[sub_key].mul_(beta).add_((1.0 - beta) * grad_c)
+                        delta_b = zeropower_via_newtonschulz5(self.multisub_mb[sub_key].float(), self.args.ns_steps)
+                        delta_c = zeropower_via_newtonschulz5(self.multisub_mc[sub_key].float(), self.args.ns_steps)
+                        B.data.sub_(self.lr * delta_b.to(dtype=B.data.dtype))
+                        C.data.sub_(self.lr * delta_c.to(dtype=C.data.dtype))
 
                         if (self._local_step_counter % score_interval) == 0:
-                            ipt_scalar = float((X.detach() * grad.detach()).abs().mean().item())
-                            exp_avg_prev = float(self.multisub_exp_avg.get(sub_key, 0.0))
-                            exp_unc_prev = float(self.multisub_exp_unc.get(sub_key, 0.0))
-                            exp_avg, exp_unc, score = update_adamss_score(
-                                ipt_abs_scalar=ipt_scalar,
-                                exp_avg_prev=exp_avg_prev,
-                                exp_unc_prev=exp_unc_prev,
-                                beta1=beta1,
-                                beta2=beta2,
+                            score_val = compute_adamss_subspace_score(
+                                allocator=self._multisub_allocator,
+                                sub_key=sub_key,
+                                b_param=B,
+                                c_param=C,
                             )
-                            self.multisub_exp_avg[sub_key] = exp_avg
-                            self.multisub_exp_unc[sub_key] = exp_unc
-                            self.multisub_scores[sub_key] = score
-                        X.grad = None
+                            if score_val is not None:
+                                self.multisub_scores[sub_key] = float(score_val)
+                        B.grad = None
+                        C.grad = None
             return logits.detach(), loss.detach()
 
         if self.algo in ['fedsubadam', 'fedsubsgd']:

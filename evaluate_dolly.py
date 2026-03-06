@@ -71,7 +71,8 @@ def load_checkpoint_into_model(model, ckpt_path):
     global_florg_seed_state = None
     global_florg_basis_state = None
     florg_hparams = {}
-    global_multisub_x_state = None
+    global_multisub_b_state = None
+    global_multisub_c_state = None
     global_multisub_metadata = None
     global_multisub_scores = None
     global_multisub_selected_keys = None
@@ -90,7 +91,8 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_florg_A_state = payload.get("global_florg_A_state", None)
         global_florg_seed_state = payload.get("global_florg_seed_state", None)
         global_florg_basis_state = payload.get("global_florg_basis_state", None)
-        global_multisub_x_state = payload.get("global_multisub_x_state", None)
+        global_multisub_b_state = payload.get("global_multisub_b_state", None)
+        global_multisub_c_state = payload.get("global_multisub_c_state", None)
         global_multisub_metadata = payload.get("global_multisub_metadata", None)
         global_multisub_scores = payload.get("global_multisub_scores", None)
         global_multisub_selected_keys = payload.get("global_multisub_selected_keys", None)
@@ -130,7 +132,8 @@ def load_checkpoint_into_model(model, ckpt_path):
         elif (
             saved_algo == "fedmultisubmuon"
             or (
-                global_multisub_x_state is not None
+                global_multisub_b_state is not None
+                and global_multisub_c_state is not None
                 and global_multisub_metadata is not None
             )
         ):
@@ -168,7 +171,8 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_florg_seed_state,
         global_florg_basis_state,
         florg_hparams,
-        global_multisub_x_state,
+        global_multisub_b_state,
+        global_multisub_c_state,
         global_multisub_metadata,
         global_multisub_scores,
         global_multisub_selected_keys,
@@ -326,7 +330,8 @@ def run_evaluate(args):
     global_florg_seed_state = None
     global_florg_basis_state = None
     florg_hparams = {}
-    global_multisub_x_state = None
+    global_multisub_b_state = None
+    global_multisub_c_state = None
     global_multisub_metadata = None
     global_multisub_scores = None
     global_multisub_selected_keys = None
@@ -349,7 +354,8 @@ def run_evaluate(args):
             global_florg_seed_state,
             global_florg_basis_state,
             florg_hparams,
-            global_multisub_x_state,
+            global_multisub_b_state,
+            global_multisub_c_state,
             global_multisub_metadata,
             global_multisub_scores,
             global_multisub_selected_keys,
@@ -386,7 +392,8 @@ def run_evaluate(args):
             elif global_florg_A_state is not None:
                 eval_algo = "florg"
             elif (
-                global_multisub_x_state is not None
+                global_multisub_b_state is not None
+                and global_multisub_c_state is not None
                 and global_multisub_metadata is not None
             ):
                 eval_algo = "fedmultisubmuon"
@@ -448,17 +455,23 @@ def run_evaluate(args):
             v_state=None,
         )
     elif eval_algo == "fedmultisubmuon":
-        if global_multisub_x_state is None or global_multisub_metadata is None:
+        if (
+            global_multisub_b_state is None
+            or global_multisub_c_state is None
+            or global_multisub_metadata is None
+        ):
             raise ValueError(
-                "FedMultiSubMuon eval requires checkpoint with global_multisub_x_state and global_multisub_metadata"
+                "FedMultiSubMuon eval requires checkpoint with global_multisub_b_state, "
+                "global_multisub_c_state and global_multisub_metadata"
             )
         args.algo = eval_algo
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
         framework.set_multisub_state(
             {
-                "x_global": global_multisub_x_state,
+                "b_global": global_multisub_b_state,
+                "c_global": global_multisub_c_state,
                 "metadata": global_multisub_metadata,
-                "selected_keys": list(global_multisub_x_state.keys()),
+                "selected_keys": list(global_multisub_b_state.keys()),
                 "score_state": global_multisub_scores if isinstance(global_multisub_scores, dict) else {},
             },
             trainable=False,

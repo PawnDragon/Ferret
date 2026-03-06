@@ -213,11 +213,12 @@ class Client(object):
                         f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                     )
 
-            x_local, score_local = framework.export_multisub_state()
+            b_local, c_local, score_local = framework.export_multisub_state()
             framework.clear_multisub_state()
             self.model = None
             return {
-                'x': x_local,
+                'b': b_local,
+                'c': c_local,
                 'scores': score_local,
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }

@@ -215,7 +215,8 @@ class Server(object):
         self._florg_eval_debug_logged = False
         self._multisub_debug_logged = False
         self.global_multisub_metadata = {}
-        self.global_multisub_x_state = {}
+        self.global_multisub_b_state = {}
+        self.global_multisub_c_state = {}
         self.global_multisub_scores = {}
         self.global_multisub_selected_keys = []
 
@@ -257,7 +258,12 @@ class Server(object):
             del init_model
         if self.algo == 'fedmultisubmuon':
             base_seed = int(getattr(self.args, 'multisub_seed_base', int(self.args.seed) + 13579))
-            self.global_multisub_metadata, self.global_multisub_x_state, self.global_multisub_scores = initialize_subspaces(
+            (
+                self.global_multisub_metadata,
+                self.global_multisub_b_state,
+                self.global_multisub_c_state,
+                self.global_multisub_scores,
+            ) = initialize_subspaces(
                 self.model,
                 rank_r=int(self.args.rank_r),
                 svd_rank=int(getattr(self.args, 'svd_rank', 500)),
@@ -270,9 +276,9 @@ class Server(object):
                 int(getattr(self.args, 'multisub_topk', 0)),
             )
             if len(self.global_multisub_selected_keys) == 0:
-                self.global_multisub_selected_keys = list(self.global_multisub_x_state.keys())
+                self.global_multisub_selected_keys = list(self.global_multisub_b_state.keys())
             print(
-                f'[fedmultisubmuon] initialized {len(self.global_multisub_x_state)} subspaces; '
+                f'[fedmultisubmuon] initialized {len(self.global_multisub_b_state)} subspaces; '
                 f'round-1 topk={len(self.global_multisub_selected_keys)}'
             )
 
@@ -401,24 +407,31 @@ class Server(object):
             return None
         selected_keys = list(self.global_multisub_selected_keys)
         metadata = {}
-        x_global = {}
+        b_global = {}
+        c_global = {}
         score_state = {}
         for key in selected_keys:
-            if key not in self.global_multisub_metadata or key not in self.global_multisub_x_state:
+            if (
+                key not in self.global_multisub_metadata
+                or key not in self.global_multisub_b_state
+                or key not in self.global_multisub_c_state
+            ):
                 continue
             meta = self.global_multisub_metadata[key]
             metadata[key] = {
                 'layer_name': str(meta['layer_name']),
                 'indices': meta['indices'].clone(),
                 'A': meta['A'].clone(),
-                'seed': int(meta['seed']),
-                'rank': int(meta.get('rank', int(self.global_multisub_x_state[key].shape[0]))),
+                'rank_big': int(meta.get('rank_big', int(self.global_multisub_b_state[key].shape[0]))),
+                'rank_small': int(meta.get('rank_small', int(self.global_multisub_c_state[key].shape[0]))),
                 'flat_id': int(meta.get('flat_id', -1)),
             }
-            x_global[key] = self.global_multisub_x_state[key].clone()
+            b_global[key] = self.global_multisub_b_state[key].clone()
+            c_global[key] = self.global_multisub_c_state[key].clone()
             score_state[key] = float(self.global_multisub_scores.get(key, 0.0))
         return {
-            'x_global': x_global,
+            'b_global': b_global,
+            'c_global': c_global,
             'metadata': metadata,
             'selected_keys': selected_keys,
             'score_state': score_state,
@@ -562,23 +575,31 @@ class Server(object):
         weight_array = self._get_client_weight_array(selected_client_list)
         active_keys = list(self.global_multisub_selected_keys)
         if len(active_keys) == 0:
-            active_keys = list(self.global_multisub_x_state.keys())
+            active_keys = list(self.global_multisub_b_state.keys())
 
         for sub_key in active_keys:
-            if sub_key not in self.global_multisub_x_state:
+            if sub_key not in self.global_multisub_b_state or sub_key not in self.global_multisub_c_state:
                 continue
-            accum = torch.zeros_like(self.global_multisub_x_state[sub_key], dtype=torch.float32)
+            accum_b = torch.zeros_like(self.global_multisub_b_state[sub_key], dtype=torch.float32)
+            accum_c = torch.zeros_like(self.global_multisub_c_state[sub_key], dtype=torch.float32)
             score_acc = 0.0
             score_w = 0.0
-            x_w = 0.0
+            b_w = 0.0
+            c_w = 0.0
             for client_idx, payload in enumerate(client_payloads):
                 weight = float(weight_array[client_idx])
-                x_local = payload.get('x', {})
-                if isinstance(x_local, dict) and sub_key in x_local:
-                    x_tensor = x_local[sub_key]
-                    if isinstance(x_tensor, torch.Tensor):
-                        accum.add_(x_tensor.to(dtype=torch.float32), alpha=weight)
-                        x_w += weight
+                b_local = payload.get('b', {})
+                c_local = payload.get('c', {})
+                if isinstance(b_local, dict) and sub_key in b_local:
+                    b_tensor = b_local[sub_key]
+                    if isinstance(b_tensor, torch.Tensor):
+                        accum_b.add_(b_tensor.to(dtype=torch.float32), alpha=weight)
+                        b_w += weight
+                if isinstance(c_local, dict) and sub_key in c_local:
+                    c_tensor = c_local[sub_key]
+                    if isinstance(c_tensor, torch.Tensor):
+                        accum_c.add_(c_tensor.to(dtype=torch.float32), alpha=weight)
+                        c_w += weight
 
                 score_local = payload.get('scores', {})
                 if isinstance(score_local, dict) and sub_key in score_local:
@@ -587,8 +608,10 @@ class Server(object):
                         score_acc += score_val * weight
                         score_w += weight
 
-            if x_w > 0.0:
-                self.global_multisub_x_state[sub_key] = (accum / x_w).cpu().contiguous()
+            if b_w > 0.0:
+                self.global_multisub_b_state[sub_key] = (accum_b / b_w).cpu().contiguous()
+            if c_w > 0.0:
+                self.global_multisub_c_state[sub_key] = (accum_c / c_w).cpu().contiguous()
             if score_w > 0.0:
                 self.global_multisub_scores[sub_key] = float(score_acc / score_w)
 
@@ -597,7 +620,7 @@ class Server(object):
             int(getattr(self.args, 'multisub_topk', 0)),
         )
         if len(self.global_multisub_selected_keys) == 0:
-            self.global_multisub_selected_keys = list(self.global_multisub_x_state.keys())
+            self.global_multisub_selected_keys = list(self.global_multisub_b_state.keys())
         if (not self._multisub_debug_logged) and int(cur_round) >= 1:
             top_items = sorted(
                 self.global_multisub_scores.items(),
@@ -1041,8 +1064,8 @@ class Server(object):
                 'layer_name': str(meta['layer_name']),
                 'indices': meta['indices'].cpu(),
                 'A': meta['A'].cpu(),
-                'seed': int(meta['seed']),
-                'rank': int(meta.get('rank', int(self.global_multisub_x_state[key].shape[0]))),
+                'rank_big': int(meta.get('rank_big', int(self.global_multisub_b_state[key].shape[0]))),
+                'rank_small': int(meta.get('rank_small', int(self.global_multisub_c_state[key].shape[0]))),
                 'flat_id': int(meta.get('flat_id', -1)),
             }
 
@@ -1051,7 +1074,8 @@ class Server(object):
             {
                 'algo': 'fedmultisubmuon',
                 'backbone_state_dict': self.model.state_dict(),
-                'global_multisub_x_state': {k: v.cpu() for k, v in self.global_multisub_x_state.items()},
+                'global_multisub_b_state': {k: v.cpu() for k, v in self.global_multisub_b_state.items()},
+                'global_multisub_c_state': {k: v.cpu() for k, v in self.global_multisub_c_state.items()},
                 'global_multisub_metadata': metadata_cpu,
                 'global_multisub_scores': {k: float(v) for k, v in self.global_multisub_scores.items()},
                 'global_multisub_selected_keys': list(self.global_multisub_selected_keys),
@@ -1259,9 +1283,10 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_multisub_state(
                 {
-                    'x_global': self.global_multisub_x_state,
+                    'b_global': self.global_multisub_b_state,
+                    'c_global': self.global_multisub_c_state,
                     'metadata': self.global_multisub_metadata,
-                    'selected_keys': list(self.global_multisub_x_state.keys()),
+                    'selected_keys': list(self.global_multisub_b_state.keys()),
                     'score_state': self.global_multisub_scores,
                 },
                 trainable=False,
@@ -1360,9 +1385,10 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_multisub_state(
                 {
-                    'x_global': self.global_multisub_x_state,
+                    'b_global': self.global_multisub_b_state,
+                    'c_global': self.global_multisub_c_state,
                     'metadata': self.global_multisub_metadata,
-                    'selected_keys': list(self.global_multisub_x_state.keys()),
+                    'selected_keys': list(self.global_multisub_b_state.keys()),
                     'score_state': self.global_multisub_scores,
                 },
                 trainable=False,

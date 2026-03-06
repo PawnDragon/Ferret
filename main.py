@@ -407,20 +407,22 @@ if __name__ == '__main__':
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, multisub_state=broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                payload_x = payload.get('x', {})
+                payload_b = payload.get('b', {})
+                payload_c = payload.get('c', {})
                 payload_indices = {}
                 meta_state = broadcast_state.get('metadata', {})
-                if isinstance(payload_x, dict) and isinstance(meta_state, dict):
-                    for sub_key in payload_x.keys():
+                if isinstance(payload_b, dict) and isinstance(meta_state, dict):
+                    for sub_key in payload_b.keys():
                         if sub_key in meta_state and isinstance(meta_state[sub_key], dict):
                             idx_tensor = meta_state[sub_key].get('indices', None)
                             if isinstance(idx_tensor, torch.Tensor):
                                 payload_indices[sub_key] = idx_tensor
                 total_comm_up_bytes += compute_comm_size(
                     {
-                        'x': payload_x,
+                        'b': payload_b,
+                        'c': payload_c,
                         'scores': payload.get('scores', {}),
-                        'selected_keys': list(payload_x.keys()),
+                        'selected_keys': list(payload_b.keys()),
                         'indices': payload_indices,
                     }
                 )

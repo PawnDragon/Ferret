@@ -7,6 +7,23 @@ from optimizers.adamss_allocator import SubspacesAllocator
 from optimizers.submuon_utils import select_target_linear_layers
 
 
+def _orthogonal_row_init(rows: int, cols: int, seed: int) -> torch.Tensor:
+    """
+    Return a (rows, cols) matrix with orthonormal rows (rows <= cols).
+    This mirrors AdaMSS orth-style initialization where one factor is orthogonal.
+    """
+    if rows <= 0 or cols <= 0:
+        return torch.zeros((rows, cols), dtype=torch.float32)
+    if rows > cols:
+        raise RuntimeError(f'[fedmultisubmuon] orth init requires rows<=cols, got rows={rows}, cols={cols}')
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(int(seed))
+    # QR on (cols, rows) gives column-orthonormal Q; transpose -> row-orthonormal.
+    rand = torch.randn((cols, rows), generator=gen, dtype=torch.float32)
+    q, _ = torch.linalg.qr(rand, mode='reduced')
+    return q.t().contiguous()
+
+
 def _split_indices_evenly(indices: torch.Tensor, num_parts: int) -> List[torch.Tensor]:
     if num_parts <= 0:
         return [indices]
@@ -80,7 +97,7 @@ def initialize_subspaces(
             if n_sub == 0:
                 continue
             w_sub = weight[:, col_indices]
-            u, _, vh = torch.linalg.svd(w_sub, full_matrices=False)
+            u, _, _ = torch.linalg.svd(w_sub, full_matrices=False)
             rank_big = int(min(rank_r, int(u.shape[1])))
             if rank_big <= 0:
                 continue
@@ -93,7 +110,7 @@ def initialize_subspaces(
 
             a_tensor = u[:, :rank_big].contiguous().cpu()
             b_tensor = torch.zeros((rank_big, rank_small), dtype=torch.float32)
-            c_tensor = vh[:rank_small, :].contiguous().cpu()
+            c_tensor = _orthogonal_row_init(rank_small, n_sub, seed=seed).cpu()
 
             metadata[key] = {
                 'layer_name': layer_name,

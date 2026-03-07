@@ -336,8 +336,19 @@ if __name__ == '__main__':
     args.device = 0
 
     client_indices_rounds = []
+    clients_per_round = int(args.num_clients * args.m)
+    print(
+        f'[info] federation setup: num_clients={int(args.num_clients)}, '
+        f'clients_per_round={clients_per_round} (m={float(args.m):.4f})'
+    )
     for _ in range(args.rounds):
-        client_indices_rounds.append(np.random.choice(np.arange(args.num_clients), size=int(args.num_clients * args.m), replace=False))
+        client_indices_rounds.append(
+            np.random.choice(
+                np.arange(args.num_clients),
+                size=clients_per_round,
+                replace=False,
+            )
+        )
 
     candidate_seeds = np.random.randint(1, 100000000000, args.K)
 

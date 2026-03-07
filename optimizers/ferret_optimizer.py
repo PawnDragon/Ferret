@@ -680,16 +680,17 @@ class FerretFramework(object):
             n_sub = int(col_idx.numel())
             if n_sub == 0:
                 continue
-            rank = int(a_tensor.shape[1])
-            if tuple(x_tensor.shape) != (rank, rank):
+            rank_left = int(a_tensor.shape[1])
+            rank_right = int(v_tensor.shape[1])
+            if tuple(x_tensor.shape) != (rank_left, rank_right):
                 raise RuntimeError(
                     f'[fedstructmuon] X shape mismatch for {sub_key}: '
-                    f'expected {(rank, rank)}, got {tuple(x_tensor.shape)}'
+                    f'expected {(rank_left, rank_right)}, got {tuple(x_tensor.shape)}'
                 )
-            if tuple(v_tensor.shape) != (n_sub, rank):
+            if tuple(v_tensor.shape) != (n_sub, rank_right):
                 raise RuntimeError(
                     f'[fedstructmuon] V shape mismatch for {sub_key}: '
-                    f'expected {(n_sub, rank)}, got {tuple(v_tensor.shape)}'
+                    f'expected {(n_sub, rank_right)}, got {tuple(v_tensor.shape)}'
                 )
             if int(a_tensor.shape[0]) != int(module.out_features):
                 raise RuntimeError(
@@ -714,7 +715,9 @@ class FerretFramework(object):
                 'A': a_tensor.to(device=device, dtype=torch.float32).contiguous(),
                 'V': v_tensor.to(device=device, dtype=torch.float32).contiguous(),
                 'indices': col_idx.to(device=device, dtype=torch.long).contiguous(),
-                'rank': rank,
+                'rank': rank_left,  # backward-compatible alias
+                'rank_left': rank_left,
+                'rank_right': rank_right,
             }
             self.struct_layer_to_keys.setdefault(str(layer_name), []).append(sub_key)
 

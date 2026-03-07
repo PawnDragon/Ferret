@@ -160,6 +160,8 @@ if __name__ == '__main__':
 
     # FedSubMuon
     parser.add_argument('--rank_r', type=int, default=8)
+    parser.add_argument('--rank_left', type=int, default=None, help='left rank for FedStructMuon core X; default uses rank_r')
+    parser.add_argument('--rank_right', type=int, default=None, help='right rank for FedStructMuon core X; default uses rank_r')
     parser.add_argument('--svd_rank', type=int, default=500, help='SVD rank used for FedMultiSubMuon subspace partition')
     parser.add_argument('--beta', type=float, default=0.95)
     parser.add_argument('--beta1', type=float, default=0.9)
@@ -228,6 +230,14 @@ if __name__ == '__main__':
 
     time_stamp = str(time.time())
     args = parser.parse_args()
+    if args.rank_left is None:
+        args.rank_left = int(args.rank_r)
+    if args.rank_right is None:
+        args.rank_right = int(args.rank_r)
+    if int(args.rank_left) <= 0:
+        args.rank_left = int(args.rank_r)
+    if int(args.rank_right) <= 0:
+        args.rank_right = int(args.rank_r)
     if int(getattr(args, 'multisub_seed_base', 0)) == 0:
         args.multisub_seed_base = int(args.seed) + 13579
     if int(getattr(args, 'struct_seed_base', 0)) == 0:
@@ -1079,6 +1089,8 @@ if __name__ == '__main__':
             'algo': 'auto',
             'seed': args.seed,
             'rank_r': args.rank_r,
+            'rank_left': args.rank_left,
+            'rank_right': args.rank_right,
             'svd_rank': args.svd_rank,
             'multisub_num_subspaces': args.multisub_num_subspaces,
             'multisub_topk': args.multisub_topk,

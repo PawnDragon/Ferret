@@ -294,6 +294,8 @@ class Server(object):
             ) = initialize_struct_subspaces(
                 self.model,
                 rank_r=int(self.args.rank_r),
+                rank_left=int(getattr(self.args, 'rank_left', int(self.args.rank_r))),
+                rank_right=int(getattr(self.args, 'rank_right', int(self.args.rank_r))),
                 svd_rank=int(getattr(self.args, 'svd_rank', 500)),
                 num_subspaces=int(getattr(self.args, 'struct_num_subspaces', 4)),
                 base_seed=base_seed,
@@ -481,6 +483,8 @@ class Server(object):
                 'A': meta['A'].clone(),
                 'V': meta['V'].clone(),
                 'rank': int(meta.get('rank', int(self.global_struct_x_state[key].shape[0]))),
+                'rank_left': int(meta.get('rank_left', int(self.global_struct_x_state[key].shape[0]))),
+                'rank_right': int(meta.get('rank_right', int(self.global_struct_x_state[key].shape[1]))),
                 'flat_id': int(meta.get('flat_id', -1)),
             }
             x_global[key] = self.global_struct_x_state[key].clone()
@@ -551,7 +555,8 @@ class Server(object):
         for idx, sub_key in enumerate(selected_keys):
             meta = metadata.get(sub_key, {}) if isinstance(metadata, dict) else {}
             layer_name = str(meta.get('layer_name', 'unknown'))
-            rank = int(meta.get('rank', -1))
+            rank_left = int(meta.get('rank_left', meta.get('rank', -1)))
+            rank_right = int(meta.get('rank_right', -1))
             idx_tensor = meta.get('indices', None)
             n_cols = int(idx_tensor.numel()) if isinstance(idx_tensor, torch.Tensor) else -1
             if isinstance(score_state, dict) and sub_key in score_state:
@@ -561,7 +566,7 @@ class Server(object):
             round_scores.append(score_val)
             print(
                 f'  [{idx}] key={sub_key}, layer={layer_name}, '
-                f'rank={rank}, cols={n_cols}, score={score_val:.6e}'
+                f'rank_left={rank_left}, rank_right={rank_right}, cols={n_cols}, score={score_val:.6e}'
             )
         finite_scores = [s for s in round_scores if np.isfinite(s)]
         if len(finite_scores) > 0:
@@ -784,6 +789,12 @@ class Server(object):
                 if isinstance(x_local, dict) and sub_key in x_local:
                     x_tensor = x_local[sub_key]
                     if isinstance(x_tensor, torch.Tensor):
+                        if tuple(x_tensor.shape) != tuple(self.global_struct_x_state[sub_key].shape):
+                            raise RuntimeError(
+                                f'[fedstructmuon] X shape mismatch in aggregation for {sub_key}: '
+                                f'global={tuple(self.global_struct_x_state[sub_key].shape)}, '
+                                f'client={tuple(x_tensor.shape)}'
+                            )
                         accum_x.add_(x_tensor.to(dtype=torch.float32), alpha=weight)
                         x_w += weight
                 score_local = payload.get('scores', {})
@@ -1302,6 +1313,8 @@ class Server(object):
                 'A': meta['A'].cpu(),
                 'V': meta['V'].cpu(),
                 'rank': int(meta.get('rank', int(self.global_struct_x_state[key].shape[0]))),
+                'rank_left': int(meta.get('rank_left', int(self.global_struct_x_state[key].shape[0]))),
+                'rank_right': int(meta.get('rank_right', int(self.global_struct_x_state[key].shape[1]))),
                 'seed': int(meta.get('seed', -1)),
                 'flat_id': int(meta.get('flat_id', -1)),
             }
@@ -1320,6 +1333,8 @@ class Server(object):
                 'hparams': {
                     'algo': self.args.algo,
                     'rank_r': int(self.args.rank_r),
+                    'rank_left': int(getattr(self.args, 'rank_left', int(self.args.rank_r))),
+                    'rank_right': int(getattr(self.args, 'rank_right', int(self.args.rank_r))),
                     'svd_rank': int(getattr(self.args, 'svd_rank', 500)),
                     'beta': float(getattr(self.args, 'beta', 0.95)),
                     'ns_steps': int(getattr(self.args, 'ns_steps', 5)),

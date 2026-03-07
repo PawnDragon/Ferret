@@ -267,6 +267,8 @@ def build_parser():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank_r", type=int, default=8)
+    parser.add_argument("--rank_left", type=int, default=None)
+    parser.add_argument("--rank_right", type=int, default=None)
     parser.add_argument("--svd_rank", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument(
@@ -309,6 +311,14 @@ def build_parser():
 def run_evaluate(args):
     device, _ = resolve_runtime_device(args.device)
     setup_seed(args.seed)
+    if getattr(args, "rank_left", None) is None:
+        args.rank_left = int(args.rank_r)
+    if getattr(args, "rank_right", None) is None:
+        args.rank_right = int(args.rank_r)
+    if int(args.rank_left) <= 0:
+        args.rank_left = int(args.rank_r)
+    if int(args.rank_right) <= 0:
+        args.rank_right = int(args.rank_r)
 
     # Keep exactly the same final-eval path as main.py.
     setup_seed(args.seed)
@@ -395,6 +405,14 @@ def run_evaluate(args):
     if isinstance(common_hparams, dict) and len(common_hparams) > 0:
         if "lora_target_modules" in common_hparams:
             args.lora_target_modules = common_hparams["lora_target_modules"]
+        if "rank_left" in common_hparams:
+            args.rank_left = int(common_hparams["rank_left"])
+        elif "rank_r" in common_hparams:
+            args.rank_left = int(common_hparams["rank_r"])
+        if "rank_right" in common_hparams:
+            args.rank_right = int(common_hparams["rank_right"])
+        elif "rank_r" in common_hparams:
+            args.rank_right = int(common_hparams["rank_r"])
 
     eval_algo = args.algo
     if eval_algo == "auto":

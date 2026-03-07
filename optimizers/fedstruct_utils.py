@@ -8,10 +8,12 @@ from optimizers.submuon_utils import make_uv, select_target_linear_layers
 
 def initialize_struct_subspaces(
     model,
-    rank_r: int,
-    svd_rank: int,
-    num_subspaces: int,
-    base_seed: int,
+    rank_r: int = None,
+    rank_left: int = None,
+    rank_right: int = None,
+    svd_rank: int = 500,
+    num_subspaces: int = 4,
+    base_seed: int = 0,
     target_modules=None,
 ) -> Tuple[Dict[str, dict], Dict[str, torch.Tensor], Dict[str, float]]:
     """
@@ -19,12 +21,31 @@ def initialize_struct_subspaces(
     fixed A_k from one-time structured decomposition + fixed V_k from FedSubMuon helper.
     Trainable core X_k is initialized to zeros so initial delta is exactly zero.
     """
+    if rank_left is None:
+        rank_left = rank_r
+    if rank_right is None:
+        rank_right = rank_r
+    if rank_left is None or rank_right is None:
+        raise RuntimeError('[fedstructmuon] rank_left/rank_right cannot both be None')
+    rank_left = int(rank_left)
+    rank_right = int(rank_right)
+    if rank_left <= 0 or rank_right <= 0:
+        raise RuntimeError(
+            f'[fedstructmuon] invalid ranks: rank_left={rank_left}, rank_right={rank_right}'
+        )
+
     module_map = dict(model.named_modules())
-    layer_names = select_target_linear_layers(model, rank_r, raw_target_modules=target_modules)
+    # Keep layer filtering behavior compatible with legacy square-rank mode.
+    layer_names = select_target_linear_layers(
+        model,
+        min(rank_left, rank_right),
+        raw_target_modules=target_modules,
+    )
     if len(layer_names) == 0:
         raise RuntimeError(
             f'[fedstructmuon] no target linear layer is selected; '
-            f'rank_r={rank_r}, svd_rank={svd_rank}, lora_target_modules={target_modules}'
+            f'rank_left={rank_left}, rank_right={rank_right}, '
+            f'svd_rank={svd_rank}, lora_target_modules={target_modules}'
         )
 
     metadata = {}
@@ -50,8 +71,9 @@ def initialize_struct_subspaces(
 
             w_sub = weight[:, col_indices]
             u, _, _ = torch.linalg.svd(w_sub, full_matrices=False)
-            rank_local = int(min(rank_r, int(u.shape[1]), n_sub))
-            if rank_local <= 0:
+            rank_left_local = int(min(rank_left, int(u.shape[1])))
+            rank_right_local = int(min(rank_right, n_sub))
+            if rank_left_local <= 0 or rank_right_local <= 0:
                 continue
 
             key = f'{layer_name}::sub{sub_idx}'
@@ -60,20 +82,22 @@ def initialize_struct_subspaces(
                 seed=seed,
                 out_dim=n_sub,
                 in_dim=n_sub,
-                r=rank_local,
+                r=rank_right_local,
                 device='cpu',
                 dtype=torch.float32,
             )
-            a_tensor = u[:, :rank_local].contiguous().cpu()
+            a_tensor = u[:, :rank_left_local].contiguous().cpu()
             v_tensor = v_basis.cpu().contiguous()
-            x_tensor = torch.zeros((rank_local, rank_local), dtype=torch.float32)
+            x_tensor = torch.zeros((rank_left_local, rank_right_local), dtype=torch.float32)
 
             metadata[key] = {
                 'layer_name': str(layer_name),
                 'indices': col_indices.to(dtype=torch.long).cpu().contiguous(),
                 'A': a_tensor,
                 'V': v_tensor,
-                'rank': int(rank_local),
+                'rank': int(rank_left_local),  # backward-compatible alias
+                'rank_left': int(rank_left_local),
+                'rank_right': int(rank_right_local),
                 'seed': int(seed),
                 'flat_id': int(flat_id),
             }

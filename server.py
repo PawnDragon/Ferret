@@ -545,36 +545,9 @@ class Server(object):
             return
 
         selected_keys = state.get('selected_keys', [])
-        metadata = state.get('metadata', {})
-        score_state = state.get('score_state', {})
         if not isinstance(selected_keys, (list, tuple)):
             selected_keys = []
         print(f'[fedstructmuon][round {cur_round}] selected subspaces: {len(selected_keys)}')
-
-        round_scores = []
-        for idx, sub_key in enumerate(selected_keys):
-            meta = metadata.get(sub_key, {}) if isinstance(metadata, dict) else {}
-            layer_name = str(meta.get('layer_name', 'unknown'))
-            rank_left = int(meta.get('rank_left', meta.get('rank', -1)))
-            rank_right = int(meta.get('rank_right', -1))
-            idx_tensor = meta.get('indices', None)
-            n_cols = int(idx_tensor.numel()) if isinstance(idx_tensor, torch.Tensor) else -1
-            if isinstance(score_state, dict) and sub_key in score_state:
-                score_val = float(score_state[sub_key])
-            else:
-                score_val = float(self.global_struct_scores.get(sub_key, float('nan')))
-            round_scores.append(score_val)
-            print(
-                f'  [{idx}] key={sub_key}, layer={layer_name}, '
-                f'rank_left={rank_left}, rank_right={rank_right}, cols={n_cols}, score={score_val:.6e}'
-            )
-        finite_scores = [s for s in round_scores if np.isfinite(s)]
-        if len(finite_scores) > 0:
-            print(
-                f'[fedstructmuon][round {cur_round}] score summary: '
-                f'min={min(finite_scores):.6e}, max={max(finite_scores):.6e}, '
-                f'mean={float(np.mean(finite_scores)):.6e}'
-            )
 
     def get_fedit_broadcast_state(self):
         if self.algo != 'fedit':

@@ -58,11 +58,14 @@ def initialize_struct_subspaces(
         if module is None or (not hasattr(module, 'weight')):
             continue
         weight = module.weight.detach().cpu().float()
+        out_dim = int(weight.shape[0])
+        in_dim = int(weight.shape[1])
         subspace_columns = partition_subspaces(
             weight,
             num_subspaces=num_subspaces,
             spectral_rank=int(svd_rank),
         )
+        layer_debug_rows = []
 
         for sub_idx, col_indices in enumerate(subspace_columns):
             n_sub = int(col_indices.numel())
@@ -104,6 +107,29 @@ def initialize_struct_subspaces(
             x_state[key] = x_tensor
             score_state[key] = 0.0
             flat_id += 1
+            layer_debug_rows.append(
+                (
+                    sub_idx,
+                    n_sub,
+                    rank_left_local,
+                    rank_right_local,
+                )
+            )
+
+        if len(layer_debug_rows) > 0:
+            detail_text = ", ".join(
+                [
+                    (
+                        f"sub{sub_idx}: block=({out_dim},{n_sub}), "
+                        f"A=({out_dim},{r_left}), X=({r_left},{r_right}), V=({n_sub},{r_right})"
+                    )
+                    for sub_idx, n_sub, r_left, r_right in layer_debug_rows
+                ]
+            )
+            print(
+                f"[fedstructmuon][init] layer={layer_name} W=({out_dim},{in_dim}) "
+                f"splits={len(layer_debug_rows)} -> {detail_text}"
+            )
 
     if len(metadata) == 0:
         raise RuntimeError('[fedstructmuon] failed to initialize any subspace')

@@ -53,6 +53,8 @@ def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
         return server.save_best_submuon_ckpt(metric, cur_round)
     if args.algo == 'fedmultisubmuon':
         return server.save_best_multisub_ckpt(metric, cur_round)
+    if args.algo == 'fedstructmuon':
+        return server.save_best_struct_ckpt(metric, cur_round)
     if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
@@ -100,6 +102,7 @@ if __name__ == '__main__':
         'fedsubadam',
         'fedsubsgd',
         'fedmultisubmuon',
+        'fedstructmuon',
         'fedit',
         'flora',
         'fedsalora',
@@ -185,6 +188,10 @@ if __name__ == '__main__':
     parser.add_argument('--multisub_score_interval', type=int, default=10, help='AdaMSS score update interval in local steps')
     parser.add_argument('--multisub_score_beta1', type=float, default=0.9, help='beta1 for FedMultiSubMuon AdaMSS score EMA')
     parser.add_argument('--multisub_score_beta2', type=float, default=0.999, help='beta2 for FedMultiSubMuon AdaMSS score EMA')
+    parser.add_argument('--struct_num_subspaces', type=int, default=4, help='number of subspaces per target layer for FedStructMuon')
+    parser.add_argument('--struct_topk', type=int, default=50, help='number of globally selected subspaces each round in FedStructMuon; <=0 means all')
+    parser.add_argument('--struct_seed_base', type=int, default=0, help='base seed for FedStructMuon subspace initialization; 0 means seed+24680')
+    parser.add_argument('--struct_score_interval', type=int, default=10, help='score update interval in local steps for FedStructMuon')
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')
@@ -223,12 +230,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if int(getattr(args, 'multisub_seed_base', 0)) == 0:
         args.multisub_seed_base = int(args.seed) + 13579
+    if int(getattr(args, 'struct_seed_base', 0)) == 0:
+        args.struct_seed_base = int(args.seed) + 24680
     if args.optimizer is None:
-        if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon']:
+        if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo in ['fedsubmuon', 'fedmultisubmuon']:
+    if args.algo in ['fedsubmuon', 'fedmultisubmuon', 'fedstructmuon']:
         print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps Muon-style update rule).')
 
     eval_avg_acc = []
@@ -440,6 +449,76 @@ if __name__ == '__main__':
                 )
 
             server.aggregate_fedmultisubmuon(client_payloads, selected_client, cur_round=r)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo == 'fedstructmuon':
+            broadcast_state = server.get_struct_broadcast_state()
+            server.log_struct_selection(cur_round=r, broadcast_state=broadcast_state)
+            # Communication accounting policy for fixed basis in FedStructMuon:
+            # round-1 (warmup): count full downlink once (includes basis metadata A/V/indices)
+            # round>=2: count only adaptive payload (X/scores).
+            if int(r) <= 1:
+                comm_down_state = broadcast_state
+            else:
+                comm_down_state = {
+                    'x_global': broadcast_state.get('x_global', {}),
+                    'score_state': broadcast_state.get('score_state', {}),
+                    'selected_keys': broadcast_state.get('selected_keys', []),
+                }
+            total_comm_down_bytes = compute_comm_size(comm_down_state) * len(selected_client)
+
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(
+                    server.model,
+                    cur_round=r,
+                    struct_state=broadcast_state,
+                )
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size(
+                    {
+                        'x': payload.get('x', {}),
+                        'scores': payload.get('scores', {}),
+                        'selected_keys': list(payload.get('x', {}).keys()),
+                    }
+                )
+
+            server.aggregate_fedstructmuon(client_payloads, selected_client, cur_round=r)
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
 
@@ -1007,6 +1086,10 @@ if __name__ == '__main__':
             'multisub_score_beta1': args.multisub_score_beta1,
             'multisub_score_beta2': args.multisub_score_beta2,
             'multisub_seed_base': args.multisub_seed_base,
+            'struct_num_subspaces': args.struct_num_subspaces,
+            'struct_topk': args.struct_topk,
+            'struct_seed_base': args.struct_seed_base,
+            'struct_score_interval': args.struct_score_interval,
             'lr': args.lr,
             'beta': args.beta,
             'ns_steps': args.ns_steps,

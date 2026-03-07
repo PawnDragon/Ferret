@@ -156,6 +156,7 @@ class Client(object):
         cur_round,
         submuon_state=None,
         multisub_state=None,
+        struct_state=None,
         lora_state=None,
         lora_A_state=None,
         lora_B_state=None,
@@ -219,6 +220,59 @@ class Client(object):
             return {
                 'b': b_local,
                 'c': c_local,
+                'scores': score_local,
+                'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+            }
+
+        if getattr(self.args, 'algo', 'ferret') == 'fedstructmuon':
+            if not isinstance(struct_state, dict):
+                raise RuntimeError('[fedstructmuon] missing struct_state in client local train')
+            self._set_runtime_debug_context(cur_round)
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_struct_state(struct_state=struct_state, trainable=True)
+            self.model.train()
+
+            loss_total_train = 0.0
+            num_trained = 0
+
+            if self.args.batch_or_epoch == 'epoch':
+                iter_steps = len(self.train_loader)
+                progress_bar = tqdm(range(iter_steps))
+                for cur_step, batch in enumerate(self.train_loader):
+                    batch = {
+                        'input_ids': batch['input_ids'].to(self.device),
+                        'labels': batch['labels'].to(self.device),
+                        'attention_mask': batch['attention_mask'].to(self.device),
+                    }
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                    progress_bar.update(1)
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+            else:
+                iter_steps = max(int(self.args.local_step), 1)
+                progress_bar = tqdm(range(iter_steps))
+                for cur_step in range(iter_steps):
+                    batch = self._next_batch()
+                    apply_optim_step = (cur_step % self.args.n_accum == self.args.n_accum - 1) or (cur_step == iter_steps - 1)
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                    progress_bar.update(1)
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+
+            x_local, score_local = framework.export_struct_state()
+            framework.clear_struct_state()
+            self.model = None
+            return {
+                'x': x_local,
                 'scores': score_local,
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }

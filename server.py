@@ -33,6 +33,7 @@ from optimizers.florg_utils import (
     sample_florg_delta_norm,
 )
 from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subspaces
+from optimizers.fedstruct_utils import initialize_struct_subspaces
 from optimizers.submuon_utils import init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
@@ -219,6 +220,11 @@ class Server(object):
         self.global_multisub_c_state = {}
         self.global_multisub_scores = {}
         self.global_multisub_selected_keys = []
+        self.global_struct_metadata = {}
+        self.global_struct_x_state = {}
+        self.global_struct_scores = {}
+        self.global_struct_selected_keys = []
+        self._struct_debug_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
@@ -278,6 +284,27 @@ class Server(object):
             print(
                 f'[fedmultisubmuon] initialized {len(self.global_multisub_b_state)} subspaces; '
                 f'round-1 warmup uses all={len(self.global_multisub_selected_keys)}'
+            )
+        if self.algo == 'fedstructmuon':
+            base_seed = int(getattr(self.args, 'struct_seed_base', int(self.args.seed) + 24680))
+            (
+                self.global_struct_metadata,
+                self.global_struct_x_state,
+                self.global_struct_scores,
+            ) = initialize_struct_subspaces(
+                self.model,
+                rank_r=int(self.args.rank_r),
+                svd_rank=int(getattr(self.args, 'svd_rank', 500)),
+                num_subspaces=int(getattr(self.args, 'struct_num_subspaces', 4)),
+                base_seed=base_seed,
+                target_modules=getattr(self.args, 'lora_target_modules', None),
+            )
+            # Warmup policy:
+            # round-1 uses all subspaces so every subspace can collect score at least once.
+            self.global_struct_selected_keys = list(self.global_struct_x_state.keys())
+            print(
+                f'[fedstructmuon] initialized {len(self.global_struct_x_state)} subspaces; '
+                f'round-1 warmup uses all={len(self.global_struct_selected_keys)}'
             )
 
     def _get_ckpt_dir(self):
@@ -372,6 +399,8 @@ class Server(object):
             return self.get_submuon_broadcast_state()
         if self.algo == 'fedmultisubmuon':
             return self.get_multisub_broadcast_state()
+        if self.algo == 'fedstructmuon':
+            return self.get_struct_broadcast_state()
         if self.algo == 'fedit':
             return {
                 'backbone_state_dict': self.model.state_dict(),
@@ -435,6 +464,34 @@ class Server(object):
             'score_state': score_state,
         }
 
+    def get_struct_broadcast_state(self):
+        if self.algo != 'fedstructmuon':
+            return None
+        selected_keys = list(self.global_struct_selected_keys)
+        metadata = {}
+        x_global = {}
+        score_state = {}
+        for key in selected_keys:
+            if key not in self.global_struct_metadata or key not in self.global_struct_x_state:
+                continue
+            meta = self.global_struct_metadata[key]
+            metadata[key] = {
+                'layer_name': str(meta['layer_name']),
+                'indices': meta['indices'].clone(),
+                'A': meta['A'].clone(),
+                'V': meta['V'].clone(),
+                'rank': int(meta.get('rank', int(self.global_struct_x_state[key].shape[0]))),
+                'flat_id': int(meta.get('flat_id', -1)),
+            }
+            x_global[key] = self.global_struct_x_state[key].clone()
+            score_state[key] = float(self.global_struct_scores.get(key, 0.0))
+        return {
+            'x_global': x_global,
+            'metadata': metadata,
+            'selected_keys': selected_keys,
+            'score_state': score_state,
+        }
+
     def log_multisub_selection(self, cur_round, broadcast_state=None):
         if self.algo != 'fedmultisubmuon':
             return
@@ -471,6 +528,45 @@ class Server(object):
         if len(finite_scores) > 0:
             print(
                 f'[fedmultisubmuon][round {cur_round}] score summary: '
+                f'min={min(finite_scores):.6e}, max={max(finite_scores):.6e}, '
+                f'mean={float(np.mean(finite_scores)):.6e}'
+            )
+
+    def log_struct_selection(self, cur_round, broadcast_state=None):
+        if self.algo != 'fedstructmuon':
+            return
+        state = broadcast_state if isinstance(broadcast_state, dict) else self.get_struct_broadcast_state()
+        if not isinstance(state, dict):
+            print(f'[fedstructmuon][round {cur_round}] selected subspaces: 0')
+            return
+
+        selected_keys = state.get('selected_keys', [])
+        metadata = state.get('metadata', {})
+        score_state = state.get('score_state', {})
+        if not isinstance(selected_keys, (list, tuple)):
+            selected_keys = []
+        print(f'[fedstructmuon][round {cur_round}] selected subspaces: {len(selected_keys)}')
+
+        round_scores = []
+        for idx, sub_key in enumerate(selected_keys):
+            meta = metadata.get(sub_key, {}) if isinstance(metadata, dict) else {}
+            layer_name = str(meta.get('layer_name', 'unknown'))
+            rank = int(meta.get('rank', -1))
+            idx_tensor = meta.get('indices', None)
+            n_cols = int(idx_tensor.numel()) if isinstance(idx_tensor, torch.Tensor) else -1
+            if isinstance(score_state, dict) and sub_key in score_state:
+                score_val = float(score_state[sub_key])
+            else:
+                score_val = float(self.global_struct_scores.get(sub_key, float('nan')))
+            round_scores.append(score_val)
+            print(
+                f'  [{idx}] key={sub_key}, layer={layer_name}, '
+                f'rank={rank}, cols={n_cols}, score={score_val:.6e}'
+            )
+        finite_scores = [s for s in round_scores if np.isfinite(s)]
+        if len(finite_scores) > 0:
+            print(
+                f'[fedstructmuon][round {cur_round}] score summary: '
                 f'min={min(finite_scores):.6e}, max={max(finite_scores):.6e}, '
                 f'mean={float(np.mean(finite_scores)):.6e}'
             )
@@ -666,6 +762,55 @@ class Server(object):
             )[:3]
             print(f'[debug][fedmultisubmuon][server] round={cur_round} top_scores={top_items}')
             self._multisub_debug_logged = True
+
+    def aggregate_fedstructmuon(self, client_payloads, selected_client_list, cur_round=1):
+        if self.algo != 'fedstructmuon' or len(client_payloads) == 0:
+            return
+        weight_array = self._get_client_weight_array(selected_client_list)
+        active_keys = list(self.global_struct_selected_keys)
+        if len(active_keys) == 0:
+            active_keys = list(self.global_struct_x_state.keys())
+
+        for sub_key in active_keys:
+            if sub_key not in self.global_struct_x_state:
+                continue
+            accum_x = torch.zeros_like(self.global_struct_x_state[sub_key], dtype=torch.float32)
+            score_acc = 0.0
+            x_w = 0.0
+            score_w = 0.0
+            for client_idx, payload in enumerate(client_payloads):
+                weight = float(weight_array[client_idx])
+                x_local = payload.get('x', {})
+                if isinstance(x_local, dict) and sub_key in x_local:
+                    x_tensor = x_local[sub_key]
+                    if isinstance(x_tensor, torch.Tensor):
+                        accum_x.add_(x_tensor.to(dtype=torch.float32), alpha=weight)
+                        x_w += weight
+                score_local = payload.get('scores', {})
+                if isinstance(score_local, dict) and sub_key in score_local:
+                    score_val = float(score_local[sub_key])
+                    if np.isfinite(score_val):
+                        score_acc += score_val * weight
+                        score_w += weight
+
+            if x_w > 0.0:
+                self.global_struct_x_state[sub_key] = (accum_x / x_w).cpu().contiguous()
+            if score_w > 0.0:
+                self.global_struct_scores[sub_key] = float(score_acc / score_w)
+
+        self.global_struct_selected_keys = select_topk_subspaces(
+            self.global_struct_scores,
+            int(getattr(self.args, 'struct_topk', 0)),
+        )
+        if len(self.global_struct_selected_keys) == 0:
+            self.global_struct_selected_keys = list(self.global_struct_x_state.keys())
+        if (not self._struct_debug_logged) and int(cur_round) >= 1:
+            top_items = sorted(
+                self.global_struct_scores.items(),
+                key=lambda kv: (-float(kv[1]), kv[0]),
+            )[:3]
+            print(f'[debug][fedstructmuon][server] round={cur_round} top_scores={top_items}')
+            self._struct_debug_logged = True
 
     def aggregate_lora(self, client_payloads, selected_client_list):
         if len(client_payloads) == 0:
@@ -1140,6 +1285,57 @@ class Server(object):
         print(f'[ckpt] saved to: {ckpt_path}')
         return True
 
+    def save_best_struct_ckpt(self, metric, cur_round):
+        if self.algo != 'fedstructmuon' or not self.args.save:
+            return False
+
+        improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
+        if not improved:
+            return False
+
+        self.best_metric = metric
+        metadata_cpu = {}
+        for key, meta in self.global_struct_metadata.items():
+            metadata_cpu[key] = {
+                'layer_name': str(meta['layer_name']),
+                'indices': meta['indices'].cpu(),
+                'A': meta['A'].cpu(),
+                'V': meta['V'].cpu(),
+                'rank': int(meta.get('rank', int(self.global_struct_x_state[key].shape[0]))),
+                'seed': int(meta.get('seed', -1)),
+                'flat_id': int(meta.get('flat_id', -1)),
+            }
+
+        ckpt_path = os.path.join(self._get_ckpt_dir(), 'best.pt')
+        torch.save(
+            {
+                'algo': 'fedstructmuon',
+                'backbone_state_dict': self.model.state_dict(),
+                'global_struct_x_state': {k: v.cpu() for k, v in self.global_struct_x_state.items()},
+                'global_struct_metadata': metadata_cpu,
+                'global_struct_scores': {k: float(v) for k, v in self.global_struct_scores.items()},
+                'global_struct_selected_keys': list(self.global_struct_selected_keys),
+                'round': int(cur_round),
+                'best_metric': float(metric),
+                'hparams': {
+                    'algo': self.args.algo,
+                    'rank_r': int(self.args.rank_r),
+                    'svd_rank': int(getattr(self.args, 'svd_rank', 500)),
+                    'beta': float(getattr(self.args, 'beta', 0.95)),
+                    'ns_steps': int(getattr(self.args, 'ns_steps', 5)),
+                    'lr': float(self.args.lr),
+                    'struct_num_subspaces': int(getattr(self.args, 'struct_num_subspaces', 4)),
+                    'struct_topk': int(getattr(self.args, 'struct_topk', 0)),
+                    'struct_score_interval': int(getattr(self.args, 'struct_score_interval', 10)),
+                    'struct_seed_base': int(getattr(self.args, 'struct_seed_base', int(self.args.seed) + 24680)),
+                    'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                },
+            },
+            ckpt_path,
+        )
+        print(f'[ckpt] saved to: {ckpt_path}')
+        return True
+
     def save_best_lora_ckpt(self, metric, cur_round):
         if self.algo not in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg'] or not self.args.save:
             return False
@@ -1299,7 +1495,7 @@ class Server(object):
             load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
-        elif self.algo == 'fedmultisubmuon':
+        elif self.algo in ['fedmultisubmuon', 'fedstructmuon']:
             self.model = self.model.to(self.device)
             self.model.eval()
             eval_model = self.model
@@ -1326,6 +1522,17 @@ class Server(object):
                     'metadata': self.global_multisub_metadata,
                     'selected_keys': list(self.global_multisub_b_state.keys()),
                     'score_state': self.global_multisub_scores,
+                },
+                trainable=False,
+            )
+        elif self.algo == 'fedstructmuon':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_struct_state(
+                {
+                    'x_global': self.global_struct_x_state,
+                    'metadata': self.global_struct_metadata,
+                    'selected_keys': list(self.global_struct_x_state.keys()),
+                    'score_state': self.global_struct_scores,
                 },
                 trainable=False,
             )
@@ -1357,6 +1564,8 @@ class Server(object):
         if framework is not None:
             if self.algo == 'fedmultisubmuon':
                 framework.clear_multisub_state()
+            elif self.algo == 'fedstructmuon':
+                framework.clear_struct_state()
             else:
                 framework.clear_submuon_state()
         if temp_eval_model:
@@ -1401,7 +1610,7 @@ class Server(object):
             load_classifier_state(eval_model, self.global_classifier_state)
             eval_model.eval()
             temp_eval_model = True
-        elif self.algo == 'fedmultisubmuon':
+        elif self.algo in ['fedmultisubmuon', 'fedstructmuon']:
             self.model = self.model.to(self.device)
             self.model.eval()
             eval_model = self.model
@@ -1428,6 +1637,17 @@ class Server(object):
                     'metadata': self.global_multisub_metadata,
                     'selected_keys': list(self.global_multisub_b_state.keys()),
                     'score_state': self.global_multisub_scores,
+                },
+                trainable=False,
+            )
+        elif self.algo == 'fedstructmuon':
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_struct_state(
+                {
+                    'x_global': self.global_struct_x_state,
+                    'metadata': self.global_struct_metadata,
+                    'selected_keys': list(self.global_struct_x_state.keys()),
+                    'score_state': self.global_struct_scores,
                 },
                 trainable=False,
             )
@@ -1460,6 +1680,8 @@ class Server(object):
         if framework is not None:
             if self.algo == 'fedmultisubmuon':
                 framework.clear_multisub_state()
+            elif self.algo == 'fedstructmuon':
+                framework.clear_struct_state()
             else:
                 framework.clear_submuon_state()
         if temp_eval_model:

@@ -76,6 +76,10 @@ def load_checkpoint_into_model(model, ckpt_path):
     global_multisub_metadata = None
     global_multisub_scores = None
     global_multisub_selected_keys = None
+    global_struct_x_state = None
+    global_struct_metadata = None
+    global_struct_scores = None
+    global_struct_selected_keys = None
 
     if isinstance(payload, dict) and "backbone_state_dict" in payload:
         model.load_state_dict(payload["backbone_state_dict"], strict=True)
@@ -96,6 +100,10 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_multisub_metadata = payload.get("global_multisub_metadata", None)
         global_multisub_scores = payload.get("global_multisub_scores", None)
         global_multisub_selected_keys = payload.get("global_multisub_selected_keys", None)
+        global_struct_x_state = payload.get("global_struct_x_state", None)
+        global_struct_metadata = payload.get("global_struct_metadata", None)
+        global_struct_scores = payload.get("global_struct_scores", None)
+        global_struct_selected_keys = payload.get("global_struct_selected_keys", None)
         lora_hparams = (
             payload.get("lora_hparams", {})
             if isinstance(payload.get("lora_hparams", {}), dict)
@@ -138,6 +146,11 @@ def load_checkpoint_into_model(model, ckpt_path):
             )
         ):
             ckpt_type = "fedmultisubmuon_best"
+        elif (
+            saved_algo == "fedstructmuon"
+            or (global_struct_x_state is not None and global_struct_metadata is not None)
+        ):
+            ckpt_type = "fedstructmuon_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
         elif saved_algo == "ferret":
@@ -176,6 +189,10 @@ def load_checkpoint_into_model(model, ckpt_path):
         global_multisub_metadata,
         global_multisub_scores,
         global_multisub_selected_keys,
+        global_struct_x_state,
+        global_struct_metadata,
+        global_struct_scores,
+        global_struct_selected_keys,
     )
 
 
@@ -216,6 +233,7 @@ def build_parser():
             "fedsubadam",
             "fedsubsgd",
             "fedmultisubmuon",
+            "fedstructmuon",
             "fedit",
             "flora",
             "fedexlora",
@@ -279,6 +297,10 @@ def build_parser():
     parser.add_argument("--multisub_score_interval", type=int, default=1)
     parser.add_argument("--multisub_score_beta1", type=float, default=0.9)
     parser.add_argument("--multisub_score_beta2", type=float, default=0.999)
+    parser.add_argument("--struct_num_subspaces", type=int, default=4)
+    parser.add_argument("--struct_topk", type=int, default=64)
+    parser.add_argument("--struct_seed_base", type=int, default=0)
+    parser.add_argument("--struct_score_interval", type=int, default=1)
 
     parser.add_argument("--save_json", type=str, default="")
     return parser
@@ -335,6 +357,10 @@ def run_evaluate(args):
     global_multisub_metadata = None
     global_multisub_scores = None
     global_multisub_selected_keys = None
+    global_struct_x_state = None
+    global_struct_metadata = None
+    global_struct_scores = None
+    global_struct_selected_keys = None
     if args.checkpoint:
         (
             ckpt_type,
@@ -359,6 +385,10 @@ def run_evaluate(args):
             global_multisub_metadata,
             global_multisub_scores,
             global_multisub_selected_keys,
+            global_struct_x_state,
+            global_struct_metadata,
+            global_struct_scores,
+            global_struct_selected_keys,
         ) = load_checkpoint_into_model(model, args.checkpoint)
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
 
@@ -374,6 +404,7 @@ def run_evaluate(args):
             "fedsubadam",
             "fedsubsgd",
             "fedmultisubmuon",
+            "fedstructmuon",
             "fedit",
             "flora",
             "fedexlora",
@@ -397,6 +428,11 @@ def run_evaluate(args):
                 and global_multisub_metadata is not None
             ):
                 eval_algo = "fedmultisubmuon"
+            elif (
+                global_struct_x_state is not None
+                and global_struct_metadata is not None
+            ):
+                eval_algo = "fedstructmuon"
             elif global_deltaW_state is not None:
                 eval_algo = "flora"
             else:
@@ -473,6 +509,22 @@ def run_evaluate(args):
                 "metadata": global_multisub_metadata,
                 "selected_keys": list(global_multisub_b_state.keys()),
                 "score_state": global_multisub_scores if isinstance(global_multisub_scores, dict) else {},
+            },
+            trainable=False,
+        )
+    elif eval_algo == "fedstructmuon":
+        if global_struct_x_state is None or global_struct_metadata is None:
+            raise ValueError(
+                "FedStructMuon eval requires checkpoint with global_struct_x_state and global_struct_metadata"
+            )
+        args.algo = eval_algo
+        framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
+        framework.set_struct_state(
+            {
+                "x_global": global_struct_x_state,
+                "metadata": global_struct_metadata,
+                "selected_keys": list(global_struct_x_state.keys()),
+                "score_state": global_struct_scores if isinstance(global_struct_scores, dict) else {},
             },
             trainable=False,
         )
@@ -580,6 +632,8 @@ def run_evaluate(args):
     if framework is not None:
         if eval_algo == "fedmultisubmuon":
             framework.clear_multisub_state()
+        elif eval_algo == "fedstructmuon":
+            framework.clear_struct_state()
         else:
             framework.clear_submuon_state()
 

@@ -7,8 +7,9 @@ import torch.nn.functional as F
 from optimizers.fedmultisub_utils import (
     build_adamss_allocator,
     compute_adamss_subspace_score,
-    shape_signature,
+    shape_signature as multisub_shape_signature,
 )
+from optimizers.fedstruct_utils import shape_signature as struct_shape_signature
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
@@ -169,6 +170,13 @@ class FerretFramework(object):
         self._orig_multisub_forward = {}
         self._multisub_allocator = None
         self._multisub_debug_logged = False
+        self.struct_x = {}
+        self.struct_m = {}
+        self.struct_meta = {}
+        self.struct_scores = {}
+        self.struct_layer_to_keys = {}
+        self._orig_struct_forward = {}
+        self._struct_debug_logged = False
         self._orig_linear_forward = {}
         self._flora_delta = {}
         self._flora_scaling = 1.0
@@ -194,7 +202,7 @@ class FerretFramework(object):
                     f'rank_r={self.args.rank_r}, '
                     f'lora_target_modules={getattr(self.args, "lora_target_modules", None)}'
                 )
-        elif self.algo == 'fedmultisubmuon':
+        elif self.algo in ['fedmultisubmuon', 'fedstructmuon']:
             self._freeze_backbone_for_submuon()
         else:
             self.optim = self._build_local_optimizer([p for _, p in self.named_parameters_to_optim])
@@ -336,6 +344,40 @@ class FerretFramework(object):
 
             module.forward = patched_forward
 
+    def _install_struct_forward(self):
+        for layer_name, key_list in self.struct_layer_to_keys.items():
+            if len(key_list) == 0:
+                continue
+            module = self._resolve_module(layer_name)
+            if layer_name in self._orig_struct_forward:
+                continue
+            self._orig_struct_forward[layer_name] = module.forward
+
+            def patched_forward(x, _module=module, _layer_name=layer_name, _key_list=tuple(key_list)):
+                input_shape = x.shape
+                x2 = x.reshape(-1, input_shape[-1])
+                y0 = F.linear(x2, _module.weight, _module.bias)
+                y_delta = None
+
+                for sub_key in _key_list:
+                    X = self.struct_x[sub_key].to(dtype=x2.dtype)
+                    meta = self.struct_meta[sub_key]
+                    A = meta['A'].to(dtype=x2.dtype)
+                    V = meta['V'].to(dtype=x2.dtype)
+                    col_idx = meta['indices']
+                    x_sub = torch.index_select(x2, dim=1, index=col_idx)
+                    ax1 = x_sub @ V
+                    ax2 = ax1 @ X.t()
+                    contrib = ax2 @ A.t()
+                    y_delta = contrib if y_delta is None else (y_delta + contrib)
+
+                if y_delta is None:
+                    return y0.reshape(*input_shape[:-1], _module.out_features)
+                y = y0 + y_delta.to(dtype=y0.dtype)
+                return y.reshape(*input_shape[:-1], _module.out_features)
+
+            module.forward = patched_forward
+
     def clear_submuon_state(self):
         for layer_name, orig_forward in self._orig_linear_forward.items():
             module = self._resolve_module(layer_name)
@@ -363,6 +405,17 @@ class FerretFramework(object):
         self.multisub_scores = {}
         self.multisub_layer_to_keys = {}
         self._multisub_allocator = None
+
+    def clear_struct_state(self):
+        for layer_name, orig_forward in self._orig_struct_forward.items():
+            module = self._resolve_module(layer_name)
+            module.forward = orig_forward
+        self._orig_struct_forward = {}
+        self.struct_x = {}
+        self.struct_m = {}
+        self.struct_meta = {}
+        self.struct_scores = {}
+        self.struct_layer_to_keys = {}
 
     def clear_flora_delta_state(self):
         with torch.no_grad():
@@ -544,7 +597,7 @@ class FerretFramework(object):
                 if tuple(delta.shape) != (int(module.out_features), int(col_idx.numel())):
                     raise RuntimeError(
                         f'[fedmultisubmuon] invalid ABC shape for {sub_key}: '
-                        f'{shape_signature(self.multisub_meta[sub_key], b_param, c_param)}'
+                        f'{multisub_shape_signature(self.multisub_meta[sub_key], b_param, c_param)}'
                     )
                 print(
                     f'[debug][fedmultisubmuon][framework] {sub_key} '
@@ -574,6 +627,122 @@ class FerretFramework(object):
             else:
                 score_out[sub_key] = 0.0
         return b_out, c_out, score_out
+
+    def set_struct_state(self, struct_state, trainable=True):
+        if self.algo != 'fedstructmuon':
+            return
+        self.clear_struct_state()
+        if not isinstance(struct_state, dict):
+            return
+
+        x_state = struct_state.get('x_global', {})
+        metadata = struct_state.get('metadata', {})
+        selected_keys = struct_state.get('selected_keys', [])
+        incoming_scores = struct_state.get('score_state', {})
+        if not isinstance(x_state, dict) or not isinstance(metadata, dict):
+            return
+        if not isinstance(selected_keys, (list, tuple)):
+            selected_keys = list(x_state.keys())
+        if len(selected_keys) == 0:
+            selected_keys = list(x_state.keys())
+
+        device = next(self.model.parameters()).device
+        for sub_key in selected_keys:
+            if sub_key not in x_state or sub_key not in metadata:
+                continue
+            x_tensor = x_state[sub_key]
+            meta_entry = metadata[sub_key]
+            if (not isinstance(x_tensor, torch.Tensor)) or (not isinstance(meta_entry, dict)):
+                continue
+
+            layer_name = meta_entry.get('layer_name', None)
+            a_tensor = meta_entry.get('A', None)
+            v_tensor = meta_entry.get('V', None)
+            col_idx = meta_entry.get('indices', None)
+            if (
+                layer_name is None
+                or (not isinstance(a_tensor, torch.Tensor))
+                or (not isinstance(v_tensor, torch.Tensor))
+                or (not isinstance(col_idx, torch.Tensor))
+            ):
+                continue
+
+            module = self._resolve_module(str(layer_name))
+            if a_tensor.ndim != 2 or v_tensor.ndim != 2 or x_tensor.ndim != 2:
+                raise RuntimeError(
+                    f'[fedstructmuon] expected 2D tensors for {sub_key}, '
+                    f'got A={tuple(a_tensor.shape)}, X={tuple(x_tensor.shape)}, V={tuple(v_tensor.shape)}'
+                )
+            if col_idx.ndim != 1:
+                raise RuntimeError(
+                    f'[fedstructmuon] indices must be 1D for {sub_key}, got shape={tuple(col_idx.shape)}'
+                )
+            n_sub = int(col_idx.numel())
+            if n_sub == 0:
+                continue
+            rank = int(a_tensor.shape[1])
+            if tuple(x_tensor.shape) != (rank, rank):
+                raise RuntimeError(
+                    f'[fedstructmuon] X shape mismatch for {sub_key}: '
+                    f'expected {(rank, rank)}, got {tuple(x_tensor.shape)}'
+                )
+            if tuple(v_tensor.shape) != (n_sub, rank):
+                raise RuntimeError(
+                    f'[fedstructmuon] V shape mismatch for {sub_key}: '
+                    f'expected {(n_sub, rank)}, got {tuple(v_tensor.shape)}'
+                )
+            if int(a_tensor.shape[0]) != int(module.out_features):
+                raise RuntimeError(
+                    f'[fedstructmuon] A out-dim mismatch for {sub_key}: '
+                    f'A.shape[0]={int(a_tensor.shape[0])}, layer_out={int(module.out_features)}'
+                )
+            if int(col_idx.max().item()) >= int(module.in_features) or int(col_idx.min().item()) < 0:
+                raise RuntimeError(
+                    f'[fedstructmuon] column indices out of range for {sub_key}: '
+                    f'min={int(col_idx.min().item())}, max={int(col_idx.max().item())}, in_features={int(module.in_features)}'
+                )
+
+            x_param = torch.nn.Parameter(
+                x_tensor.to(device=device, dtype=torch.float32).clone().detach(),
+                requires_grad=trainable,
+            )
+            self.struct_x[sub_key] = x_param
+            self.struct_m[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
+            self.struct_scores[sub_key] = float(incoming_scores.get(sub_key, 0.0))
+            self.struct_meta[sub_key] = {
+                'layer_name': str(layer_name),
+                'A': a_tensor.to(device=device, dtype=torch.float32).contiguous(),
+                'V': v_tensor.to(device=device, dtype=torch.float32).contiguous(),
+                'indices': col_idx.to(device=device, dtype=torch.long).contiguous(),
+                'rank': rank,
+            }
+            self.struct_layer_to_keys.setdefault(str(layer_name), []).append(sub_key)
+
+            if (not self._struct_debug_logged) and trainable:
+                delta = self.struct_meta[sub_key]['A'] @ x_param @ self.struct_meta[sub_key]['V'].t()
+                if tuple(delta.shape) != (int(module.out_features), int(col_idx.numel())):
+                    raise RuntimeError(
+                        f'[fedstructmuon] invalid AXV shape for {sub_key}: '
+                        f'{struct_shape_signature(self.struct_meta[sub_key], x_param)}'
+                    )
+                print(
+                    f'[debug][fedstructmuon][framework] {sub_key} '
+                    f'A_shape={tuple(a_tensor.shape)} X_shape={tuple(x_tensor.shape)} V_shape={tuple(v_tensor.shape)}'
+                )
+                self._struct_debug_logged = True
+
+        if len(self.struct_x) > 0:
+            self._install_struct_forward()
+
+    def export_struct_state(self):
+        x_out = {k: v.detach().cpu().clone() for k, v in self.struct_x.items()}
+        score_out = {}
+        for sub_key in self.struct_x.keys():
+            if sub_key in self.struct_scores:
+                score_out[sub_key] = float(self.struct_scores[sub_key])
+            else:
+                score_out[sub_key] = 0.0
+        return x_out, score_out
 
     def get_named_optim_state(self):
         return export_named_adamw_state(self.model, self.optim)
@@ -766,6 +935,37 @@ class FerretFramework(object):
                                 self.multisub_scores[sub_key] = float(score_val)
                         B.grad = None
                         C.grad = None
+            return logits.detach(), loss.detach()
+
+        if self.algo == 'fedstructmuon':
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                beta = float(getattr(self.args, 'beta', 0.95))
+                score_interval = max(
+                    int(
+                        getattr(
+                            self.args,
+                            'struct_score_interval',
+                            getattr(self.args, 'multisub_score_interval', 1),
+                        )
+                    ),
+                    1,
+                )
+                with torch.no_grad():
+                    for sub_key, X in self.struct_x.items():
+                        grad_x = X.grad
+                        if grad_x is None:
+                            continue
+                        if (self._local_step_counter % score_interval) == 0:
+                            grad_norm = torch.linalg.norm(grad_x.float())
+                            x_norm = torch.linalg.norm(X.data.float())
+                            score_val = float((grad_norm * x_norm).item())
+                            if np.isfinite(score_val):
+                                self.struct_scores[sub_key] = score_val
+                        self.struct_m[sub_key].mul_(beta).add_((1.0 - beta) * grad_x)
+                        delta_x = zeropower_via_newtonschulz5(self.struct_m[sub_key].float(), self.args.ns_steps)
+                        X.data.sub_(self.lr * delta_x.to(dtype=X.data.dtype))
+                        X.grad = None
             return logits.detach(), loss.detach()
 
         if self.algo in ['fedsubadam', 'fedsubsgd']:

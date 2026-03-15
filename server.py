@@ -34,7 +34,7 @@ from optimizers.florg_utils import (
 )
 from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subspaces
 from optimizers.fedstruct_utils import initialize_struct_subspaces
-from optimizers.submuon_utils import init_submuon_state, transport_state
+from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
     is_qwen3_model,
@@ -190,6 +190,7 @@ class Server(object):
         self.v_global = {}
         self.seeds = {}
         self.submuon_layer_dims = {}
+        self._submuonv2_fold_logged = False
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
         self.seed_rng = np.random.RandomState(self.args.seed + 2026)
         self.global_lora_state = {}
@@ -226,7 +227,7 @@ class Server(object):
         self.global_struct_selected_keys = []
         self._struct_debug_logged = False
 
-        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
                 self.model,
                 self.args.rank_r,
@@ -397,7 +398,17 @@ class Server(object):
             'seeds': dict(self.seeds),
         }
 
+    def get_submuonv2_broadcast_state(self):
+        return {
+            'x_global': {k: v.clone() for k, v in self.x_global.items()},
+            'm_global': None,
+            'v_global': None,
+            'seeds': dict(self.seeds),
+        }
+
     def get_broadcast_state(self):
+        if self.algo == 'fedsubmuonv2':
+            return self.get_submuonv2_broadcast_state()
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             return self.get_submuon_broadcast_state()
         if self.algo == 'fedmultisubmuon':
@@ -661,6 +672,52 @@ class Server(object):
             v_global=None,
         )
         self.seeds = new_seeds
+        return True
+
+    def maybe_refresh_submuonv2_seeds(self, cur_round, force=False):
+        if self.algo != 'fedsubmuonv2':
+            return False
+        if (not force) and getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
+            return False
+        if (not force) and self.args.seed_refresh_F <= 0:
+            return False
+        if (not force) and (cur_round % self.args.seed_refresh_F != 0):
+            return False
+
+        old_seeds = dict(self.seeds)
+        old_x_snapshot = {name: tensor.detach().cpu().clone() for name, tensor in self.x_global.items()}
+        fold_stats = fold_submuon_core_into_backbone(
+            model=self.model,
+            x_state=old_x_snapshot,
+            seeds=old_seeds,
+            rank=self.args.rank_r,
+            layer_dims=self.submuon_layer_dims,
+        )
+        self.x_global = {name: torch.zeros_like(tensor) for name, tensor in self.x_global.items()}
+        max_abs = 0.0
+        for tensor in self.x_global.values():
+            if tensor.numel() > 0:
+                max_abs = max(max_abs, float(torch.max(torch.abs(tensor)).item()))
+        if max_abs != 0.0:
+            raise RuntimeError(f'[fedsubmuonv2] server-side X reset failed, max_abs={max_abs}')
+
+        new_seeds = {}
+        for layer_name in self.seeds.keys():
+            new_seeds[layer_name] = int(self.seed_rng.randint(1, 2**31 - 1))
+
+        self.seeds = new_seeds
+        if (not self._submuonv2_fold_logged) and fold_stats.get('num_layers', 0) > 0:
+            refresh_round = int(cur_round)
+            sample_layer = next(iter(old_seeds.keys())) if len(old_seeds) > 0 else 'n/a'
+            old_seed = old_seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
+            new_seed = self.seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
+            print(
+                f'[fedsubmuonv2][server] refresh_round={refresh_round} '
+                f'old_seed={old_seed} new_seed={new_seed} '
+                f'folded_layers={int(fold_stats["num_layers"])} '
+                f'delta_norm={float(fold_stats["delta_norm"]):.6e}'
+            )
+            self._submuonv2_fold_logged = True
         return True
 
     def trigger_rebase(self, cur_round):
@@ -1183,7 +1240,7 @@ class Server(object):
         self.model.to('cpu')
 
     def save_best_submuon_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -1496,7 +1553,7 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
@@ -1611,7 +1668,7 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,

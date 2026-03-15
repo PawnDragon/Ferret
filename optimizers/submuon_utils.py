@@ -126,6 +126,65 @@ def transport_state(x_global, m_global, old_seeds, new_seeds, layer_dims, rank, 
             v_global[name] = R_u @ v_global[name] @ R_v.t()
 
 
+def fold_submuon_core_into_backbone(model, x_state, seeds, rank, layer_dims=None):
+    if not isinstance(x_state, dict) or len(x_state) == 0:
+        return {'num_layers': 0, 'delta_norm': 0.0}
+    if not isinstance(seeds, dict):
+        raise RuntimeError('[fedsubmuonv2] seeds must be a dict when folding UXV^T into backbone')
+
+    name_to_module = dict(model.named_modules())
+    folded_layers = 0
+    total_delta_norm = 0.0
+
+    with torch.no_grad():
+        for layer_name, x_tensor in x_state.items():
+            if layer_name not in seeds:
+                raise RuntimeError(f'[fedsubmuonv2] missing seed for layer={layer_name}')
+            if layer_name not in name_to_module:
+                raise RuntimeError(f'[fedsubmuonv2] layer not found in model: {layer_name}')
+            if not isinstance(x_tensor, torch.Tensor):
+                raise RuntimeError(f'[fedsubmuonv2] expected tensor X for layer={layer_name}')
+
+            module = name_to_module[layer_name]
+            if not isinstance(module, nn.Linear):
+                raise RuntimeError(f'[fedsubmuonv2] layer={layer_name} is not nn.Linear')
+
+            if isinstance(layer_dims, dict) and layer_name in layer_dims:
+                out_dim, in_dim = layer_dims[layer_name]
+            else:
+                out_dim, in_dim = int(module.out_features), int(module.in_features)
+
+            x_local = x_tensor.to(device=module.weight.device, dtype=torch.float32)
+            U, V = make_uv(
+                seed=seeds[layer_name],
+                out_dim=int(out_dim),
+                in_dim=int(in_dim),
+                r=int(rank),
+                device=module.weight.device,
+                dtype=torch.float32,
+            )
+
+            expected_x_shape = (int(U.shape[1]), int(V.shape[1]))
+            if tuple(x_local.shape) != expected_x_shape:
+                raise RuntimeError(
+                    f'[fedsubmuonv2] X shape mismatch @ {layer_name}: '
+                    f'got={tuple(x_local.shape)}, expected={expected_x_shape}'
+                )
+
+            delta = U @ x_local @ V.t()
+            if tuple(delta.shape) != tuple(module.weight.shape):
+                raise RuntimeError(
+                    f'[fedsubmuonv2] UXV^T shape mismatch @ {layer_name}: '
+                    f'got={tuple(delta.shape)}, expected={tuple(module.weight.shape)}'
+                )
+
+            module.weight.data.add_(delta.to(device=module.weight.device, dtype=module.weight.dtype))
+            total_delta_norm += float(torch.linalg.norm(delta.float()).item())
+            folded_layers += 1
+
+    return {'num_layers': int(folded_layers), 'delta_norm': float(total_delta_norm)}
+
+
 def relative_transport_error(X_old, old_seed, new_seed, out_dim, in_dim, rank):
     U_old, V_old = make_uv(old_seed, out_dim, in_dim, rank, device='cpu', dtype=torch.float32)
     U_new, V_new = make_uv(new_seed, out_dim, in_dim, rank, device='cpu', dtype=torch.float32)

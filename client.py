@@ -150,6 +150,17 @@ class Client(object):
             total += float(torch.norm(tensor_a.float() - tensor_b.float()).item())
         return total
 
+    def _prepare_fedsubmuonv2_round_state(self, submuon_state):
+        if not isinstance(submuon_state, dict):
+            raise RuntimeError('[fedsubmuonv2] missing submuon_state in client local train')
+        if 'x_global' not in submuon_state or 'seeds' not in submuon_state:
+            raise RuntimeError('[fedsubmuonv2] submuon_state must contain x_global and seeds')
+        x_global = submuon_state['x_global']
+        seeds = submuon_state['seeds']
+        if not isinstance(x_global, dict) or not isinstance(seeds, dict):
+            raise RuntimeError('[fedsubmuonv2] invalid x_global or seeds type')
+        return x_global, None, seeds
+
     def local_train_with_seed_pool(
         self,
         pulled_model,
@@ -277,13 +288,19 @@ class Client(object):
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuonv2':
+                x_state, m_state, seeds = self._prepare_fedsubmuonv2_round_state(submuon_state)
+            else:
+                x_state = submuon_state['x_global']
+                m_state = submuon_state.get('m_global', None)
+                seeds = submuon_state['seeds']
             framework.set_submuon_state(
-                x_state=submuon_state['x_global'],
-                m_state=submuon_state.get('m_global', None),
-                seeds=submuon_state['seeds'],
+                x_state=x_state,
+                m_state=m_state,
+                seeds=seeds,
                 trainable=True,
                 v_state=submuon_state.get('v_global', None),
             )
@@ -330,7 +347,7 @@ class Client(object):
                 x_local = framework.export_submuon_state(with_m=False)
             elif getattr(self.args, 'algo', 'ferret') == 'fedsubsgd':
                 x_local = framework.export_submuon_state(with_m=False)
-            elif aggregate_muon_state:
+            elif getattr(self.args, 'algo', 'ferret') == 'fedsubmuon' and aggregate_muon_state:
                 x_local, m_local = framework.export_submuon_state()
             else:
                 x_local = framework.export_submuon_state(with_m=False)

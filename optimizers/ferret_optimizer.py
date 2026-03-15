@@ -189,7 +189,7 @@ class FerretFramework(object):
         self.debug_nan_skip_optim = bool(getattr(args, 'debug_nan_skip_optim', False))
         self._local_step_counter = 0
 
-        if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(
                 self.model,
@@ -460,7 +460,7 @@ class FerretFramework(object):
                 self._flora_delta[layer_name] = delta_scaled
 
     def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None):
-        if self.algo not in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             return
         self.clear_submuon_state()
 
@@ -892,7 +892,7 @@ class FerretFramework(object):
                     self.optim.zero_grad()
                 return logits.detach(), loss.detach()
 
-        if self.algo == 'fedsubmuon':
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2']:
             (loss / self.args.n_accum).backward()
             if apply_optim_step:
                 beta = self.args.beta

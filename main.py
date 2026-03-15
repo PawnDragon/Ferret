@@ -49,7 +49,7 @@ def is_finite_scalar(value):
 
 
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
-    if args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
     if args.algo == 'fedmultisubmuon':
         return server.save_best_multisub_ckpt(metric, cur_round)
@@ -99,6 +99,7 @@ if __name__ == '__main__':
     algo_choices = [
         'ferret',
         'fedsubmuon',
+        'fedsubmuonv2',
         'fedsubadam',
         'fedsubsgd',
         'fedmultisubmuon',
@@ -253,7 +254,7 @@ if __name__ == '__main__':
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo in ['fedsubmuon', 'fedmultisubmuon', 'fedstructmuon']:
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedmultisubmuon', 'fedstructmuon']:
         print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps Muon-style update rule).')
 
     eval_avg_acc = []
@@ -582,10 +583,14 @@ if __name__ == '__main__':
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
-        elif args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
-            if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
-                server.maybe_refresh_submuon_seeds(r)
-            broadcast_state = server.get_submuon_broadcast_state()
+        elif args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+            if args.algo == 'fedsubmuonv2':
+                server.maybe_refresh_submuonv2_seeds(r)
+                broadcast_state = server.get_submuonv2_broadcast_state()
+            else:
+                if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
+                    server.maybe_refresh_submuon_seeds(r)
+                broadcast_state = server.get_submuon_broadcast_state()
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
 
             client_payloads = []

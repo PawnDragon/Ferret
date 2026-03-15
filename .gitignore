@@ -4,4 +4,4 @@ logs/
 data/
 wandb/
 outputs/
-.vscode/settings.json
+.vscode/

@@ -325,16 +325,19 @@ class Client(object):
                         f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                     )
 
+            aggregate_muon_state = bool(getattr(self.args, 'aggregate_muon_state', False))
             if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
                 x_local = framework.export_submuon_state(with_m=False)
             elif getattr(self.args, 'algo', 'ferret') == 'fedsubsgd':
                 x_local = framework.export_submuon_state(with_m=False)
-            else:
+            elif aggregate_muon_state:
                 x_local, m_local = framework.export_submuon_state()
+            else:
+                x_local = framework.export_submuon_state(with_m=False)
             framework.clear_submuon_state()
             self.model = None
             payload = {'x': x_local, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
-            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuon':
+            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuon' and aggregate_muon_state:
                 payload['m'] = m_local
             return payload
 

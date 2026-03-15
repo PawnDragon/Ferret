@@ -170,6 +170,12 @@ if __name__ == '__main__':
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
+    parser.add_argument(
+        '--aggregate_muon_state',
+        default=False,
+        action='store_true',
+        help='if set, FedSubMuon clients upload momentum state and server aggregates/broadcasts it across rounds',
+    )
     parser.add_argument('--adaptive_rebase', default=False, action='store_true', help='enable adaptive restart-style rebase for FedSubMuon')
     parser.add_argument('--rebase_patience', type=int, default=5, help='no-improve rounds before triggering rebase')
     parser.add_argument('--rebase_cooldown', type=int, default=3, help='cooldown rounds after each rebase')

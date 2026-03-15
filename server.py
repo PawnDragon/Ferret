@@ -389,9 +389,10 @@ class Server(object):
             self._optim_debug_logged = True
 
     def get_submuon_broadcast_state(self):
+        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
-            'm_global': {k: v.clone() for k, v in self.m_global.items()} if self.algo == 'fedsubmuon' else None,
+            'm_global': {k: v.clone() for k, v in self.m_global.items()} if aggregate_muon_state else None,
             'v_global': None,
             'seeds': dict(self.seeds),
         }
@@ -649,9 +650,10 @@ class Server(object):
         for layer_name in self.seeds.keys():
             new_seeds[layer_name] = int(self.seed_rng.randint(1, 2**31 - 1))
 
+        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
         transport_state(
             x_global=self.x_global,
-            m_global=self.m_global if self.algo == 'fedsubmuon' else None,
+            m_global=self.m_global if aggregate_muon_state else None,
             old_seeds=old_seeds,
             new_seeds=new_seeds,
             layer_dims=self.submuon_layer_dims,
@@ -666,19 +668,20 @@ class Server(object):
 
     def aggregate_submuon(self, client_payloads, selected_client_list):
         weight_array = self._get_client_weight_array(selected_client_list)
+        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
-        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if self.algo == 'fedsubmuon' else None
+        new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if aggregate_muon_state else None
 
         for client_idx, payload in enumerate(client_payloads):
             w = float(weight_array[client_idx])
             for name in new_x.keys():
                 new_x[name] += payload['x'][name].to(dtype=new_x[name].dtype) * w
-                if self.algo == 'fedsubmuon':
+                if aggregate_muon_state:
                     new_m[name] += payload['m'][name].to(dtype=new_m[name].dtype) * w
 
         self.x_global = new_x
-        if self.algo == 'fedsubmuon':
+        if aggregate_muon_state:
             self.m_global = new_m
 
     def aggregate_fedmultisubmuon(self, client_payloads, selected_client_list, cur_round=1):
@@ -1208,6 +1211,7 @@ class Server(object):
                     'lr': self.args.lr,
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
+                    'aggregate_muon_state': bool(getattr(self.args, 'aggregate_muon_state', False)),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },

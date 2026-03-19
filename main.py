@@ -201,6 +201,9 @@ if __name__ == '__main__':
     parser.add_argument('--struct_topk', type=int, default=50, help='number of globally selected subspaces each round in FedStructMuon; <=0 means all')
     parser.add_argument('--struct_seed_base', type=int, default=0, help='base seed for FedStructMuon subspace initialization; 0 means seed+24680')
     parser.add_argument('--struct_score_interval', type=int, default=10, help='score update interval in local steps for FedStructMuon')
+    parser.add_argument('--struct_topk_init_warmup', type=int, default=1, help='AdaMSS-style initial warmup rounds for FedStructMuon top-k scheduling')
+    parser.add_argument('--struct_topk_final_warmup', type=int, default=-1, help='AdaMSS-style final warmup round for FedStructMuon top-k scheduling; <=0 uses total rounds')
+    parser.add_argument('--struct_topk_tt', type=float, default=1.0, help='AdaMSS-style exponent tt for FedStructMuon top-k scheduling')
 
     # Environment
     parser.add_argument('--device', type=int, default=0, help='index of the targeted cuda device')
@@ -249,6 +252,12 @@ if __name__ == '__main__':
         args.multisub_seed_base = int(args.seed) + 13579
     if int(getattr(args, 'struct_seed_base', 0)) == 0:
         args.struct_seed_base = int(args.seed) + 24680
+    if int(getattr(args, 'struct_topk_init_warmup', 0)) < 0:
+        args.struct_topk_init_warmup = 0
+    if int(getattr(args, 'struct_topk_final_warmup', -1)) <= 0:
+        args.struct_topk_final_warmup = int(args.rounds)
+    if float(getattr(args, 'struct_topk_tt', 1.0)) <= 0.0:
+        args.struct_topk_tt = 1e-6
     if args.optimizer is None:
         if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
@@ -1124,6 +1133,9 @@ if __name__ == '__main__':
             'struct_topk': args.struct_topk,
             'struct_seed_base': args.struct_seed_base,
             'struct_score_interval': args.struct_score_interval,
+            'struct_topk_init_warmup': args.struct_topk_init_warmup,
+            'struct_topk_final_warmup': args.struct_topk_final_warmup,
+            'struct_topk_tt': args.struct_topk_tt,
             'lr': args.lr,
             'beta': args.beta,
             'ns_steps': args.ns_steps,

@@ -226,6 +226,7 @@ class Server(object):
         self.global_struct_scores = {}
         self.global_struct_selected_keys = []
         self._struct_debug_logged = False
+        self._struct_topk_schedule_logged = False
 
         if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
@@ -842,9 +843,10 @@ class Server(object):
             if score_w > 0.0:
                 self.global_struct_scores[sub_key] = float(score_acc / score_w)
 
+        struct_topk = self._get_scheduled_struct_topk(cur_round)
         self.global_struct_selected_keys = select_topk_subspaces(
             self.global_struct_scores,
-            int(getattr(self.args, 'struct_topk', 0)),
+            struct_topk,
         )
         if len(self.global_struct_selected_keys) == 0:
             self.global_struct_selected_keys = list(self.global_struct_x_state.keys())
@@ -853,8 +855,46 @@ class Server(object):
                 self.global_struct_scores.items(),
                 key=lambda kv: (-float(kv[1]), kv[0]),
             )[:3]
-            print(f'[debug][fedstructmuon][server] round={cur_round} top_scores={top_items}')
+            print(
+                f'[debug][fedstructmuon][server] round={cur_round} '
+                f'scheduled_topk={struct_topk}, top_scores={top_items}'
+            )
             self._struct_debug_logged = True
+
+    def _get_scheduled_struct_topk(self, cur_round):
+        total_kk = int(len(self.global_struct_scores))
+        if total_kk <= 0:
+            return 0
+
+        target_kk = int(getattr(self.args, 'struct_topk', 0))
+        if target_kk <= 0 or target_kk >= total_kk:
+            return total_kk
+
+        initial_warmup = max(int(getattr(self.args, 'struct_topk_init_warmup', 1)), 0)
+        final_warmup = int(getattr(self.args, 'struct_topk_final_warmup', int(getattr(self.args, 'rounds', 1))))
+        tt = max(float(getattr(self.args, 'struct_topk_tt', 1.0)), 1e-12)
+        step = int(cur_round)
+
+        if final_warmup <= initial_warmup:
+            curr_kk = target_kk
+        elif step < initial_warmup:
+            curr_kk = total_kk
+        elif step > final_warmup:
+            curr_kk = target_kk
+        else:
+            mul_coeff = 1.0 - float(step - initial_warmup) / float(final_warmup - initial_warmup)
+            mul_coeff = min(max(mul_coeff, 0.0), 1.0)
+            curr_kk = int(target_kk + (total_kk - target_kk) * (mul_coeff ** tt))
+
+        curr_kk = int(max(target_kk, min(total_kk, curr_kk)))
+        if not self._struct_topk_schedule_logged:
+            print(
+                f'[fedstructmuon] AdaMSS top-k schedule: '
+                f'total={total_kk}, target={target_kk}, '
+                f'init_warmup={initial_warmup}, final_warmup={final_warmup}, tt={tt}'
+            )
+            self._struct_topk_schedule_logged = True
+        return curr_kk
 
     def aggregate_lora(self, client_payloads, selected_client_list):
         if len(client_payloads) == 0:
@@ -1377,6 +1417,9 @@ class Server(object):
                     'struct_topk': int(getattr(self.args, 'struct_topk', 0)),
                     'struct_score_interval': int(getattr(self.args, 'struct_score_interval', 10)),
                     'struct_seed_base': int(getattr(self.args, 'struct_seed_base', int(self.args.seed) + 24680)),
+                    'struct_topk_init_warmup': int(getattr(self.args, 'struct_topk_init_warmup', 1)),
+                    'struct_topk_final_warmup': int(getattr(self.args, 'struct_topk_final_warmup', int(getattr(self.args, 'rounds', 1)))),
+                    'struct_topk_tt': float(getattr(self.args, 'struct_topk_tt', 1.0)),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },

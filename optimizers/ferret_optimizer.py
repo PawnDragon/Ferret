@@ -174,6 +174,8 @@ class FerretFramework(object):
         self.struct_m = {}
         self.struct_meta = {}
         self.struct_scores = {}
+        self.struct_exp_avg_ipt = {}
+        self.struct_exp_avg_unc = {}
         self.struct_layer_to_keys = {}
         self._orig_struct_forward = {}
         self._struct_debug_logged = False
@@ -415,6 +417,8 @@ class FerretFramework(object):
         self.struct_m = {}
         self.struct_meta = {}
         self.struct_scores = {}
+        self.struct_exp_avg_ipt = {}
+        self.struct_exp_avg_unc = {}
         self.struct_layer_to_keys = {}
 
     def clear_flora_delta_state(self):
@@ -710,6 +714,8 @@ class FerretFramework(object):
             self.struct_x[sub_key] = x_param
             self.struct_m[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
             self.struct_scores[sub_key] = float(incoming_scores.get(sub_key, 0.0))
+            self.struct_exp_avg_ipt[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
+            self.struct_exp_avg_unc[sub_key] = torch.zeros_like(x_param, device=device, dtype=torch.float32)
             self.struct_meta[sub_key] = {
                 'layer_name': str(layer_name),
                 'A': a_tensor.to(device=device, dtype=torch.float32).contiguous(),
@@ -944,6 +950,22 @@ class FerretFramework(object):
             (loss / self.args.n_accum).backward()
             if apply_optim_step:
                 beta = float(getattr(self.args, 'beta', 0.95))
+                score_beta1 = float(
+                    getattr(
+                        self.args,
+                        'struct_score_beta1',
+                        getattr(self.args, 'multisub_score_beta1', 0.9),
+                    )
+                )
+                score_beta2 = float(
+                    getattr(
+                        self.args,
+                        'struct_score_beta2',
+                        getattr(self.args, 'multisub_score_beta2', 0.999),
+                    )
+                )
+                score_beta1 = float(max(min(score_beta1, 1.0 - 1e-6), 1e-6))
+                score_beta2 = float(max(min(score_beta2, 1.0 - 1e-6), 1e-6))
                 score_interval = max(
                     int(
                         getattr(
@@ -960,9 +982,17 @@ class FerretFramework(object):
                         if grad_x is None:
                             continue
                         if (self._local_step_counter % score_interval) == 0:
-                            grad_norm = torch.linalg.norm(grad_x.float())
-                            x_norm = torch.linalg.norm(X.data.float())
-                            score_val = float((grad_norm * x_norm).item())
+                            # AdaMSS-style importance score:
+                            # ipt = |X * grad(X)|
+                            # exp_avg_ipt <- beta1 * exp_avg_ipt + (1-beta1) * ipt
+                            # exp_avg_unc <- beta2 * exp_avg_unc + (1-beta2) * |ipt - exp_avg_ipt|
+                            # score = mean(exp_avg_ipt * exp_avg_unc)
+                            ipt = (X.data.float() * grad_x.float()).abs()
+                            exp_avg_ipt = self.struct_exp_avg_ipt[sub_key]
+                            exp_avg_unc = self.struct_exp_avg_unc[sub_key]
+                            exp_avg_ipt.mul_(score_beta1).add_(ipt, alpha=(1.0 - score_beta1))
+                            exp_avg_unc.mul_(score_beta2).add_((ipt - exp_avg_ipt).abs(), alpha=(1.0 - score_beta2))
+                            score_val = float(torch.mean(exp_avg_ipt * exp_avg_unc).item())
                             if np.isfinite(score_val):
                                 self.struct_scores[sub_key] = score_val
                         self.struct_m[sub_key].mul_(beta).add_((1.0 - beta) * grad_x)

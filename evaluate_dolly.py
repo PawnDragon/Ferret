@@ -59,6 +59,8 @@ def load_checkpoint_into_model(model, ckpt_path):
     m_global = None
     v_global = None
     seeds = None
+    u_global = None
+    v_basis_global = None
     saved_algo = None
     global_lora_state = None
     global_lora_A_state = None
@@ -87,6 +89,8 @@ def load_checkpoint_into_model(model, ckpt_path):
         m_global = payload.get("m_global", None)
         v_global = payload.get("v_global", None)
         seeds = payload.get("seeds", None)
+        u_global = payload.get("u_global", None)
+        v_basis_global = payload.get("v_basis_global", None)
         global_lora_state = payload.get("global_lora_state", None)
         global_lora_A_state = payload.get("global_lora_A_state", None)
         global_lora_B_state = payload.get("global_lora_B_state", None)
@@ -157,6 +161,13 @@ def load_checkpoint_into_model(model, ckpt_path):
             ckpt_type = "ferret_best"
         elif saved_algo == "fedsubmuonv2":
             ckpt_type = "fedsubmuonv2_best"
+        elif saved_algo == "fedsubmuon_gt" or (
+            x_global is not None
+            and seeds is not None
+            and u_global is not None
+            and v_basis_global is not None
+        ):
+            ckpt_type = "fedsubmuon_gt_best"
         elif saved_algo in ["fedsubmuon", "fedsubadam", "fedsubsgd"] or (
             x_global is not None and seeds is not None
         ):
@@ -174,6 +185,8 @@ def load_checkpoint_into_model(model, ckpt_path):
         m_global,
         v_global,
         seeds,
+        u_global,
+        v_basis_global,
         saved_algo,
         global_lora_state,
         global_lora_A_state,
@@ -233,6 +246,7 @@ def build_parser():
             "ferret",
             "fedsubmuon",
             "fedsubmuonv2",
+            "fedsubmuon_gt",
             "fedsubadam",
             "fedsubsgd",
             "fedmultisubmuon",
@@ -353,6 +367,8 @@ def run_evaluate(args):
     m_global = None
     v_global = None
     seeds = None
+    u_global = None
+    v_basis_global = None
     saved_algo = None
     global_lora_state = None
     global_lora_A_state = None
@@ -381,6 +397,8 @@ def run_evaluate(args):
             m_global,
             v_global,
             seeds,
+            u_global,
+            v_basis_global,
             saved_algo,
             global_lora_state,
             global_lora_A_state,
@@ -423,6 +441,7 @@ def run_evaluate(args):
             "ferret",
             "fedsubmuon",
             "fedsubmuonv2",
+            "fedsubmuon_gt",
             "fedsubadam",
             "fedsubsgd",
             "fedmultisubmuon",
@@ -459,9 +478,9 @@ def run_evaluate(args):
                 eval_algo = "flora"
             else:
                 eval_algo = (
-                    "fedsubmuon"
-                    if (x_global is not None and seeds is not None)
-                    else "ferret"
+                    "fedsubmuon_gt"
+                    if (x_global is not None and seeds is not None and u_global is not None and v_basis_global is not None)
+                    else ("fedsubmuon" if (x_global is not None and seeds is not None) else "ferret")
                 )
 
     # Align LoRA eval settings with saved checkpoint when available.
@@ -489,11 +508,14 @@ def run_evaluate(args):
     eval_model = model
 
     framework = None
-    if eval_algo in ["fedsubmuon", "fedsubmuonv2", "fedsubadam", "fedsubsgd"]:
+    if eval_algo in ["fedsubmuon", "fedsubmuonv2", "fedsubmuon_gt", "fedsubadam", "fedsubsgd"]:
         if x_global is None or seeds is None:
             raise ValueError("FedSub eval requires checkpoint with x_global and seeds")
         if eval_algo == "fedsubmuon" and m_global is None:
             raise ValueError("FedSubMuon eval requires checkpoint with m_global")
+        if eval_algo == "fedsubmuon_gt":
+            if not isinstance(u_global, dict) or not isinstance(v_basis_global, dict):
+                raise ValueError("FedSubMuon-GT eval requires checkpoint with u_global and v_basis_global")
         if len(x_global) == 0:
             raise ValueError("FedSub checkpoint contains empty x_global")
         first_key = next(iter(x_global.keys()))
@@ -505,12 +527,16 @@ def run_evaluate(args):
             args.rank_r = ckpt_rank
         args.algo = eval_algo
         framework = FerretFramework(model, args=args, lr=args.lr, candidate_seeds=[])
+        uv_state = None
+        if eval_algo == "fedsubmuon_gt":
+            uv_state = {"u": u_global, "v": v_basis_global}
         framework.set_submuon_state(
             x_global,
             m_global if eval_algo == "fedsubmuon" else None,
             seeds,
             trainable=False,
             v_state=None,
+            uv_state=uv_state,
         )
     elif eval_algo == "fedmultisubmuon":
         if (

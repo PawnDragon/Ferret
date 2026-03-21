@@ -161,6 +161,92 @@ class Client(object):
             raise RuntimeError('[fedsubmuonv2] invalid x_global or seeds type')
         return x_global, None, seeds
 
+    def _compute_fedsubmuon_gt_probe(self, framework, probe_batches):
+        probe_batches = int(max(probe_batches, 0))
+        if probe_batches <= 0:
+            return {}, {}
+        if framework is None or self.model is None:
+            return {}, {}
+
+        target_layers = list(framework.submuon_x.keys())
+        if len(target_layers) == 0:
+            return {}, {}
+
+        module_map = dict(self.model.named_modules())
+        target_modules = {}
+        old_requires_grad = {}
+        h_u = {}
+        h_v = {}
+
+        for layer_name in target_layers:
+            module = module_map.get(layer_name, None)
+            if module is None or (not hasattr(module, 'weight')):
+                continue
+            target_modules[layer_name] = module
+            old_requires_grad[layer_name] = bool(module.weight.requires_grad)
+            module.weight.requires_grad_(True)
+
+        if len(target_modules) == 0:
+            return {}, {}
+
+        for layer_name, module in target_modules.items():
+            U, V = framework.get_submuon_uv(
+                layer_name=layer_name,
+                out_dim=int(module.out_features),
+                in_dim=int(module.in_features),
+                device=module.weight.device,
+                dtype=torch.float32,
+            )
+            h_u[layer_name] = torch.zeros_like(U, dtype=torch.float32, device=module.weight.device)
+            h_v[layer_name] = torch.zeros_like(V, dtype=torch.float32, device=module.weight.device)
+
+        used_batches = 0
+        for _ in range(probe_batches):
+            batch = self._next_batch()
+            try:
+                self.model.zero_grad(set_to_none=True)
+            except TypeError:
+                self.model.zero_grad()
+            outputs = self.model(**batch)
+            loss = outputs.loss
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            used_batches += 1
+            with torch.no_grad():
+                for layer_name, module in target_modules.items():
+                    grad_w = module.weight.grad
+                    if grad_w is None:
+                        continue
+                    U, V = framework.get_submuon_uv(
+                        layer_name=layer_name,
+                        out_dim=int(module.out_features),
+                        in_dim=int(module.in_features),
+                        device=grad_w.device,
+                        dtype=torch.float32,
+                    )
+                    h_u[layer_name].add_(grad_w.detach().float() @ V.float())
+                    h_v[layer_name].add_(grad_w.detach().float().t() @ U.float())
+
+        denom = float(max(used_batches, 1))
+        for layer_name in h_u.keys():
+            h_u[layer_name].div_(denom)
+            h_v[layer_name].div_(denom)
+
+        try:
+            self.model.zero_grad(set_to_none=True)
+        except TypeError:
+            self.model.zero_grad()
+        for x_param in framework.submuon_x.values():
+            if isinstance(x_param, torch.nn.Parameter):
+                x_param.grad = None
+        for layer_name, module in target_modules.items():
+            module.weight.requires_grad_(old_requires_grad[layer_name])
+
+        h_u_out = {k: v.detach().cpu().contiguous() for k, v in h_u.items()}
+        h_v_out = {k: v.detach().cpu().contiguous() for k, v in h_v.items()}
+        return h_u_out, h_v_out
+
     def local_train_with_seed_pool(
         self,
         pulled_model,
@@ -288,11 +374,27 @@ class Client(object):
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
-            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuonv2':
+            algo_name = getattr(self.args, 'algo', 'ferret')
+            uv_state = None
+            is_refresh_round = False
+            if algo_name == 'fedsubmuonv2':
                 x_state, m_state, seeds = self._prepare_fedsubmuonv2_round_state(submuon_state)
+            elif algo_name == 'fedsubmuon_gt':
+                if not isinstance(submuon_state, dict):
+                    raise RuntimeError('[fedsubmuon_gt] missing submuon_state in client local train')
+                if 'x_global' not in submuon_state or 'seeds' not in submuon_state:
+                    raise RuntimeError('[fedsubmuon_gt] submuon_state must contain x_global and seeds')
+                x_state = submuon_state['x_global']
+                m_state = None
+                seeds = submuon_state['seeds']
+                u_state = submuon_state.get('u_global', None)
+                v_state_basis = submuon_state.get('v_basis_global', None)
+                if isinstance(u_state, dict) and isinstance(v_state_basis, dict):
+                    uv_state = {'u': u_state, 'v': v_state_basis}
+                is_refresh_round = bool(submuon_state.get('is_refresh_round', False))
             else:
                 x_state = submuon_state['x_global']
                 m_state = submuon_state.get('m_global', None)
@@ -303,6 +405,7 @@ class Client(object):
                 seeds=seeds,
                 trainable=True,
                 v_state=submuon_state.get('v_global', None),
+                uv_state=uv_state,
             )
             self.model.train()
 
@@ -343,19 +446,30 @@ class Client(object):
                     )
 
             aggregate_muon_state = bool(getattr(self.args, 'aggregate_muon_state', False))
-            if getattr(self.args, 'algo', 'ferret') == 'fedsubadam':
+            h_u_local = None
+            h_v_local = None
+            if algo_name == 'fedsubmuon_gt' and is_refresh_round:
+                h_u_local, h_v_local = self._compute_fedsubmuon_gt_probe(
+                    framework=framework,
+                    probe_batches=int(getattr(self.args, 'gt_probe_batches', 1)),
+                )
+
+            if algo_name == 'fedsubadam':
                 x_local = framework.export_submuon_state(with_m=False)
-            elif getattr(self.args, 'algo', 'ferret') == 'fedsubsgd':
+            elif algo_name == 'fedsubsgd':
                 x_local = framework.export_submuon_state(with_m=False)
-            elif getattr(self.args, 'algo', 'ferret') == 'fedsubmuon' and aggregate_muon_state:
+            elif algo_name == 'fedsubmuon' and aggregate_muon_state:
                 x_local, m_local = framework.export_submuon_state()
             else:
                 x_local = framework.export_submuon_state(with_m=False)
             framework.clear_submuon_state()
             self.model = None
             payload = {'x': x_local, 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0}
-            if getattr(self.args, 'algo', 'ferret') == 'fedsubmuon' and aggregate_muon_state:
+            if algo_name == 'fedsubmuon' and aggregate_muon_state:
                 payload['m'] = m_local
+            if algo_name == 'fedsubmuon_gt' and is_refresh_round:
+                payload['h_u'] = h_u_local if isinstance(h_u_local, dict) else {}
+                payload['h_v'] = h_v_local if isinstance(h_v_local, dict) else {}
             return payload
 
         if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:

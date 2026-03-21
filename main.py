@@ -49,7 +49,7 @@ def is_finite_scalar(value):
 
 
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
-    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
     if args.algo == 'fedmultisubmuon':
         return server.save_best_multisub_ckpt(metric, cur_round)
@@ -100,6 +100,7 @@ if __name__ == '__main__':
         'ferret',
         'fedsubmuon',
         'fedsubmuonv2',
+        'fedsubmuon_gt',
         'fedsubadam',
         'fedsubsgd',
         'fedmultisubmuon',
@@ -171,6 +172,9 @@ if __name__ == '__main__':
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
+    parser.add_argument('--gt_probe_batches', type=int, default=1, help='number of local mini-batches used to estimate probe gradients on fedsubmuon_gt refresh rounds')
+    parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
+    parser.add_argument('--gt_merge_residual', default=False, action='store_true', help='if set, merge projection residual into server backbone after fedsubmuon_gt refresh')
     parser.add_argument(
         '--aggregate_muon_state',
         default=False,
@@ -263,7 +267,7 @@ if __name__ == '__main__':
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedmultisubmuon', 'fedstructmuon']:
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedmultisubmuon', 'fedstructmuon']:
         print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps Muon-style update rule).')
 
     eval_avg_acc = []
@@ -587,6 +591,92 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo == 'fedsubmuon_gt':
+            is_refresh_round = bool(server.is_submuon_gt_refresh_round(r))
+            broadcast_state = server.get_submuon_gt_broadcast_state(is_refresh_round=is_refresh_round)
+            if is_refresh_round:
+                comm_down_state = {
+                    'x_global': broadcast_state.get('x_global', {}),
+                    'u_global': broadcast_state.get('u_global', {}),
+                    'v_basis_global': broadcast_state.get('v_basis_global', {}),
+                }
+            else:
+                comm_down_state = {
+                    'x_global': broadcast_state.get('x_global', {}),
+                }
+            total_comm_down_bytes = compute_comm_size(comm_down_state) * len(selected_client)
+
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                if is_refresh_round:
+                    total_comm_up_bytes += compute_comm_size(
+                        {
+                            'x': payload.get('x', {}),
+                            'h_u': payload.get('h_u', {}),
+                            'h_v': payload.get('h_v', {}),
+                        }
+                    )
+                else:
+                    total_comm_up_bytes += compute_comm_size({'x': payload.get('x', {})})
+
+            gt_refresh_metrics = server.aggregate_submuon_gt(
+                client_payloads=client_payloads,
+                selected_client_list=selected_client,
+                cur_round=r,
+                is_refresh_round=is_refresh_round,
+            )
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if isinstance(gt_refresh_metrics, dict):
+                for key in [
+                    'gt_refresh_round',
+                    'gt_u_res_norm',
+                    'gt_v_res_norm',
+                    'gt_u_step_norm',
+                    'gt_v_step_norm',
+                    'gt_x_inherit_norm',
+                    'gt_residual_norm',
+                    'gt_basis_orth_err',
+                ]:
+                    if key in gt_refresh_metrics:
+                        log_items[key] = float(gt_refresh_metrics[key])
             if torch.cuda.is_available():
                 log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
@@ -1139,6 +1229,9 @@ if __name__ == '__main__':
             'lr': args.lr,
             'beta': args.beta,
             'ns_steps': args.ns_steps,
+            'gt_probe_batches': args.gt_probe_batches,
+            'gt_sub_lr': args.gt_sub_lr,
+            'gt_merge_residual': args.gt_merge_residual,
             'weight_decay': args.weight_decay,
             'optimizer': args.optimizer,
             'model_dtype': args.model_dtype,

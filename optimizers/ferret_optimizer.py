@@ -157,6 +157,8 @@ class FerretFramework(object):
         self.submuon_m = {}
         self.submuon_v = {}
         self.submuon_seeds = {}
+        self.submuon_u_basis = {}
+        self.submuon_v_basis = {}
         self.subadam_step = 0
         self.target_linear_layers = []
         self._submuon_uv_cache = {}
@@ -191,7 +193,7 @@ class FerretFramework(object):
         self.debug_nan_skip_optim = bool(getattr(args, 'debug_nan_skip_optim', False))
         self._local_step_counter = 0
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(
                 self.model,
@@ -270,6 +272,10 @@ class FerretFramework(object):
         return module
 
     def _get_uv(self, layer_name, out_dim, in_dim, device, dtype):
+        if layer_name in self.submuon_u_basis and layer_name in self.submuon_v_basis:
+            U = self.submuon_u_basis[layer_name].to(device=device, dtype=dtype)
+            V = self.submuon_v_basis[layer_name].to(device=device, dtype=dtype)
+            return U, V
         key = (layer_name, self.submuon_seeds[layer_name], out_dim, in_dim, self.args.rank_r, str(device), str(dtype))
         if key not in self._submuon_uv_cache:
             self._submuon_uv_cache[key] = make_uv(
@@ -281,6 +287,9 @@ class FerretFramework(object):
                 dtype=dtype,
             )
         return self._submuon_uv_cache[key]
+
+    def get_submuon_uv(self, layer_name, out_dim, in_dim, device, dtype):
+        return self._get_uv(layer_name, out_dim, in_dim, device, dtype)
 
     def _install_submuon_forward(self):
         for layer_name in self.target_linear_layers:
@@ -390,6 +399,8 @@ class FerretFramework(object):
         self.submuon_m = {}
         self.submuon_v = {}
         self.submuon_seeds = {}
+        self.submuon_u_basis = {}
+        self.submuon_v_basis = {}
         self.subadam_step = 0
         if self.algo in ['fedsubadam', 'fedsubsgd']:
             self.optim = None
@@ -463,8 +474,8 @@ class FerretFramework(object):
                 module.weight.data.add_(delta_scaled)
                 self._flora_delta[layer_name] = delta_scaled
 
-    def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None):
-        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+    def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None, uv_state=None):
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             return
         self.clear_submuon_state()
 
@@ -473,6 +484,13 @@ class FerretFramework(object):
         self.submuon_m = {}
         self.submuon_v = {}
         self.submuon_seeds = dict(seeds)
+        u_state = {}
+        v_basis_state = {}
+        if isinstance(uv_state, dict):
+            if isinstance(uv_state.get('u', None), dict):
+                u_state = uv_state['u']
+            if isinstance(uv_state.get('v', None), dict):
+                v_basis_state = uv_state['v']
 
         for layer_name in self.target_linear_layers:
             if layer_name not in x_state:
@@ -487,6 +505,18 @@ class FerretFramework(object):
                 self.submuon_v[layer_name] = v_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
             else:
                 self.submuon_v[layer_name] = torch.zeros_like(self.submuon_m[layer_name])
+            if layer_name in u_state and layer_name in v_basis_state:
+                u_tensor = u_state[layer_name]
+                v_tensor = v_basis_state[layer_name]
+                if isinstance(u_tensor, torch.Tensor) and isinstance(v_tensor, torch.Tensor):
+                    self.submuon_u_basis[layer_name] = u_tensor.to(
+                        device=device,
+                        dtype=torch.float32,
+                    ).clone().detach()
+                    self.submuon_v_basis[layer_name] = v_tensor.to(
+                        device=device,
+                        dtype=torch.float32,
+                    ).clone().detach()
 
         self._install_submuon_forward()
         if self.algo in ['fedsubadam', 'fedsubsgd'] and trainable:
@@ -898,7 +928,7 @@ class FerretFramework(object):
                     self.optim.zero_grad()
                 return logits.detach(), loss.detach()
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt']:
             (loss / self.args.n_accum).backward()
             if apply_optim_step:
                 beta = self.args.beta

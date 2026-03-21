@@ -34,7 +34,7 @@ from optimizers.florg_utils import (
 )
 from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subspaces
 from optimizers.fedstruct_utils import initialize_struct_subspaces
-from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, transport_state
+from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, make_uv, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.model_loader import (
     is_qwen3_model,
@@ -189,6 +189,8 @@ class Server(object):
         self.m_global = {}
         self.v_global = {}
         self.seeds = {}
+        self.u_global = {}
+        self.v_basis_global = {}
         self.submuon_layer_dims = {}
         self._submuonv2_fold_logged = False
         self.best_metric = math.inf if self.args.eval_metric == 'loss' else -math.inf
@@ -228,7 +230,7 @@ class Server(object):
         self._struct_debug_logged = False
         self._struct_topk_schedule_logged = False
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
                 self.model,
                 self.args.rank_r,
@@ -242,6 +244,20 @@ class Server(object):
             for layer_name in self.seeds.keys():
                 module = name_to_module[layer_name]
                 self.submuon_layer_dims[layer_name] = (module.out_features, module.in_features)
+            if self.algo == 'fedsubmuon_gt':
+                self.u_global = {}
+                self.v_basis_global = {}
+                for layer_name, (out_dim, in_dim) in self.submuon_layer_dims.items():
+                    U, V = make_uv(
+                        seed=self.seeds[layer_name],
+                        out_dim=int(out_dim),
+                        in_dim=int(in_dim),
+                        r=int(self.args.rank_r),
+                        device='cpu',
+                        dtype=torch.float32,
+                    )
+                    self.u_global[layer_name] = U.cpu().contiguous()
+                    self.v_basis_global[layer_name] = V.cpu().contiguous()
 
         if self.algo == 'fedit':
             init_model = build_lora_model(deepcopy(self.model), self.args)
@@ -407,9 +423,33 @@ class Server(object):
             'seeds': dict(self.seeds),
         }
 
+    def is_submuon_gt_refresh_round(self, cur_round, force=False):
+        if self.algo != 'fedsubmuon_gt':
+            return False
+        if (not force) and getattr(self.args, 'stop_F', -1) > 0 and cur_round >= int(self.args.stop_F):
+            return False
+        if (not force) and int(getattr(self.args, 'seed_refresh_F', 0)) <= 0:
+            return False
+        if (not force) and (int(cur_round) % int(self.args.seed_refresh_F) != 0):
+            return False
+        return True
+
+    def get_submuon_gt_broadcast_state(self, is_refresh_round=False):
+        return {
+            'x_global': {k: v.clone() for k, v in self.x_global.items()},
+            'm_global': None,
+            'v_global': None,
+            'seeds': dict(self.seeds),
+            'u_global': {k: v.clone() for k, v in self.u_global.items()},
+            'v_basis_global': {k: v.clone() for k, v in self.v_basis_global.items()},
+            'is_refresh_round': bool(is_refresh_round),
+        }
+
     def get_broadcast_state(self):
         if self.algo == 'fedsubmuonv2':
             return self.get_submuonv2_broadcast_state()
+        if self.algo == 'fedsubmuon_gt':
+            return self.get_submuon_gt_broadcast_state(is_refresh_round=False)
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
             return self.get_submuon_broadcast_state()
         if self.algo == 'fedmultisubmuon':
@@ -720,6 +760,185 @@ class Server(object):
             )
             self._submuonv2_fold_logged = True
         return True
+
+    def _orthonormalize_columns(self, mat):
+        if not isinstance(mat, torch.Tensor) or mat.ndim != 2:
+            raise RuntimeError('[fedsubmuon_gt] orthonormalize expects a 2D tensor')
+        q_mat, _ = torch.linalg.qr(mat.float(), mode='reduced')
+        return q_mat.contiguous()
+
+    def _merge_layer_residual_to_backbone(self, layer_name, residual):
+        module = dict(self.model.named_modules()).get(layer_name, None)
+        if module is None or (not hasattr(module, 'weight')):
+            raise RuntimeError(f'[fedsubmuon_gt] cannot find target layer for residual merge: {layer_name}')
+        if tuple(module.weight.shape) != tuple(residual.shape):
+            raise RuntimeError(
+                f'[fedsubmuon_gt] residual shape mismatch at {layer_name}: '
+                f'residual={tuple(residual.shape)}, weight={tuple(module.weight.shape)}'
+            )
+        module.weight.data.add_(residual.to(device=module.weight.device, dtype=module.weight.dtype))
+
+    def aggregate_submuon_gt(self, client_payloads, selected_client_list, cur_round, is_refresh_round):
+        if self.algo != 'fedsubmuon_gt':
+            return {}
+        if len(client_payloads) == 0:
+            return {
+                'gt_refresh_round': int(bool(is_refresh_round)),
+                'gt_u_res_norm': 0.0,
+                'gt_v_res_norm': 0.0,
+                'gt_u_step_norm': 0.0,
+                'gt_v_step_norm': 0.0,
+                'gt_x_inherit_norm': 0.0,
+                'gt_residual_norm': 0.0,
+                'gt_basis_orth_err': 0.0,
+            }
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+        new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
+        for client_idx, payload in enumerate(client_payloads):
+            w = float(weight_array[client_idx])
+            for name in new_x.keys():
+                if name not in payload.get('x', {}):
+                    continue
+                new_x[name] += payload['x'][name].to(dtype=new_x[name].dtype) * w
+
+        metrics = {
+            'gt_refresh_round': int(bool(is_refresh_round)),
+            'gt_u_res_norm': 0.0,
+            'gt_v_res_norm': 0.0,
+            'gt_u_step_norm': 0.0,
+            'gt_v_step_norm': 0.0,
+            'gt_x_inherit_norm': 0.0,
+            'gt_residual_norm': 0.0,
+            'gt_basis_orth_err': 0.0,
+        }
+        if not bool(is_refresh_round):
+            self.x_global = new_x
+            return metrics
+
+        h_u_bar = {name: torch.zeros_like(self.u_global[name], dtype=torch.float32) for name in self.u_global.keys()}
+        h_v_bar = {name: torch.zeros_like(self.v_basis_global[name], dtype=torch.float32) for name in self.v_basis_global.keys()}
+        for client_idx, payload in enumerate(client_payloads):
+            w = float(weight_array[client_idx])
+            h_u_local = payload.get('h_u', {})
+            h_v_local = payload.get('h_v', {})
+            if not isinstance(h_u_local, dict):
+                h_u_local = {}
+            if not isinstance(h_v_local, dict):
+                h_v_local = {}
+            for layer_name in h_u_bar.keys():
+                if layer_name in h_u_local and isinstance(h_u_local[layer_name], torch.Tensor):
+                    h_u_bar[layer_name].add_(h_u_local[layer_name].to(dtype=torch.float32), alpha=w)
+                if layer_name in h_v_local and isinstance(h_v_local[layer_name], torch.Tensor):
+                    h_v_bar[layer_name].add_(h_v_local[layer_name].to(dtype=torch.float32), alpha=w)
+
+        x_next = {}
+        u_next = {}
+        v_next = {}
+        gt_sub_lr = float(getattr(self.args, 'gt_sub_lr', 0.1))
+        merge_residual = bool(getattr(self.args, 'gt_merge_residual', False))
+
+        for layer_name in new_x.keys():
+            if layer_name not in self.u_global or layer_name not in self.v_basis_global:
+                raise RuntimeError(f'[fedsubmuon_gt] missing persistent basis for layer={layer_name}')
+            if layer_name not in self.seeds:
+                raise RuntimeError(f'[fedsubmuon_gt] missing old seed for layer={layer_name} at refresh round')
+            U_old = self.u_global[layer_name].float()
+            V_old = self.v_basis_global[layer_name].float()
+            X_agg = new_x[layer_name].float()
+            expected_x_shape = (int(U_old.shape[1]), int(V_old.shape[1]))
+            if tuple(X_agg.shape) != expected_x_shape:
+                raise RuntimeError(
+                    f'[fedsubmuon_gt] X shape mismatch @ {layer_name}: '
+                    f'got={tuple(X_agg.shape)}, expected={expected_x_shape}'
+                )
+
+            H_u = h_u_bar[layer_name].float()
+            H_v = h_v_bar[layer_name].float()
+            if tuple(H_u.shape) != tuple(U_old.shape):
+                raise RuntimeError(
+                    f'[fedsubmuon_gt] H_u shape mismatch @ {layer_name}: '
+                    f'got={tuple(H_u.shape)}, expected={tuple(U_old.shape)}'
+                )
+            if tuple(H_v.shape) != tuple(V_old.shape):
+                raise RuntimeError(
+                    f'[fedsubmuon_gt] H_v shape mismatch @ {layer_name}: '
+                    f'got={tuple(H_v.shape)}, expected={tuple(V_old.shape)}'
+                )
+
+            B_u = U_old.t() @ H_u
+            R_u = H_u - U_old @ B_u
+            u_step = R_u @ B_u.t()
+            U_new_raw = U_old + gt_sub_lr * u_step
+            U_new = self._orthonormalize_columns(U_new_raw)
+
+            B_v = V_old.t() @ H_v
+            R_v = H_v - V_old @ B_v
+            v_step = R_v @ B_v.t()
+            V_new_raw = V_old + gt_sub_lr * v_step
+            V_new = self._orthonormalize_columns(V_new_raw)
+
+            delta_old = U_old @ X_agg @ V_old.t()
+            layer_shape = self.submuon_layer_dims.get(layer_name, (int(U_old.shape[0]), int(V_old.shape[0])))
+            if tuple(delta_old.shape) != tuple(layer_shape):
+                raise RuntimeError(
+                    f'[fedsubmuon_gt] UXV^T shape mismatch @ {layer_name}: '
+                    f'got={tuple(delta_old.shape)}, expected={tuple(layer_shape)}'
+                )
+
+            X_new = U_new.t() @ delta_old @ V_new
+            residual = delta_old - (U_new @ X_new @ V_new.t())
+            if merge_residual:
+                self._merge_layer_residual_to_backbone(layer_name, residual)
+
+            x_next[layer_name] = X_new.cpu().contiguous()
+            u_next[layer_name] = U_new.cpu().contiguous()
+            v_next[layer_name] = V_new.cpu().contiguous()
+
+            eye_u = torch.eye(U_new.shape[1], dtype=torch.float32, device=U_new.device)
+            eye_v = torch.eye(V_new.shape[1], dtype=torch.float32, device=V_new.device)
+            u_orth_err = torch.linalg.norm(U_new.t() @ U_new - eye_u)
+            v_orth_err = torch.linalg.norm(V_new.t() @ V_new - eye_v)
+
+            metrics['gt_u_res_norm'] += float(torch.linalg.norm(R_u).item())
+            metrics['gt_v_res_norm'] += float(torch.linalg.norm(R_v).item())
+            metrics['gt_u_step_norm'] += float(torch.linalg.norm(u_step).item())
+            metrics['gt_v_step_norm'] += float(torch.linalg.norm(v_step).item())
+            metrics['gt_x_inherit_norm'] += float(torch.linalg.norm(X_new).item())
+            metrics['gt_residual_norm'] += float(torch.linalg.norm(residual).item())
+            metrics['gt_basis_orth_err'] = max(
+                float(metrics['gt_basis_orth_err']),
+                float(u_orth_err.item()),
+                float(v_orth_err.item()),
+            )
+
+        max_x_abs = 0.0
+        for tensor in x_next.values():
+            if tensor.numel() > 0:
+                max_x_abs = max(max_x_abs, float(torch.max(torch.abs(tensor)).item()))
+        if not np.isfinite(max_x_abs):
+            raise RuntimeError('[fedsubmuon_gt] inherited X contains non-finite values after refresh')
+
+        old_seeds = dict(self.seeds)
+        new_seeds = {}
+        for layer_name in self.seeds.keys():
+            new_seeds[layer_name] = int(self.seed_rng.randint(1, 2**31 - 1))
+
+        self.x_global = x_next
+        self.u_global = u_next
+        self.v_basis_global = v_next
+        self.seeds = new_seeds
+
+        if bool(getattr(self.args, 'log', False)):
+            sample_layer = next(iter(self.seeds.keys())) if len(self.seeds) > 0 else 'n/a'
+            old_seed = old_seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
+            new_seed = self.seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
+            print(
+                f'[fedsubmuon_gt][server] refresh_round={int(cur_round)} old_seed={old_seed} new_seed={new_seed} '
+                f'u_res={metrics["gt_u_res_norm"]:.6e} v_res={metrics["gt_v_res_norm"]:.6e} '
+                f'x_inherit={metrics["gt_x_inherit_norm"]:.6e} residual={metrics["gt_residual_norm"]:.6e}'
+            )
+        return metrics
 
     def trigger_rebase(self, cur_round):
         return self.maybe_refresh_submuon_seeds(cur_round=cur_round, force=True)
@@ -1280,7 +1499,7 @@ class Server(object):
         self.model.to('cpu')
 
     def save_best_submuon_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -1296,6 +1515,8 @@ class Server(object):
                 'm_global': {k: v.cpu() for k, v in self.m_global.items()} if self.algo == 'fedsubmuon' else None,
                 'v_global': None,
                 'seeds': dict(self.seeds),
+                'u_global': {k: v.cpu() for k, v in self.u_global.items()} if self.algo == 'fedsubmuon_gt' else None,
+                'v_basis_global': {k: v.cpu() for k, v in self.v_basis_global.items()} if self.algo == 'fedsubmuon_gt' else None,
                 'round': int(cur_round),
                 'best_metric': float(metric),
                 'hparams': {
@@ -1309,6 +1530,9 @@ class Server(object):
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
                     'aggregate_muon_state': bool(getattr(self.args, 'aggregate_muon_state', False)),
+                    'gt_probe_batches': int(getattr(self.args, 'gt_probe_batches', 1)),
+                    'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
+                    'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },
@@ -1596,7 +1820,10 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+            uv_state = None
+            if self.algo == 'fedsubmuon_gt':
+                uv_state = {'u': self.u_global, 'v': self.v_basis_global}
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
@@ -1604,6 +1831,7 @@ class Server(object):
                 self.seeds,
                 trainable=False,
                 v_state=None,
+                uv_state=uv_state,
             )
         elif self.algo == 'fedmultisubmuon':
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
@@ -1711,7 +1939,10 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+            uv_state = None
+            if self.algo == 'fedsubmuon_gt':
+                uv_state = {'u': self.u_global, 'v': self.v_basis_global}
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
@@ -1719,6 +1950,7 @@ class Server(object):
                 self.seeds,
                 trainable=False,
                 v_state=None,
+                uv_state=uv_state,
             )
         elif self.algo == 'fedmultisubmuon':
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)

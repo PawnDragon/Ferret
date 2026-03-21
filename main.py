@@ -1229,6 +1229,7 @@ if __name__ == '__main__':
             'lr': args.lr,
             'beta': args.beta,
             'ns_steps': args.ns_steps,
+            'stop_F': args.stop_F,
             'gt_probe_batches': args.gt_probe_batches,
             'gt_sub_lr': args.gt_sub_lr,
             'gt_merge_residual': args.gt_merge_residual,

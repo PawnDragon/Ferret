@@ -1529,6 +1529,7 @@ class Server(object):
                     'lr': self.args.lr,
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
+                    'stop_F': int(getattr(self.args, 'stop_F', -1)),
                     'aggregate_muon_state': bool(getattr(self.args, 'aggregate_muon_state', False)),
                     'gt_probe_batches': int(getattr(self.args, 'gt_probe_batches', 1)),
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),

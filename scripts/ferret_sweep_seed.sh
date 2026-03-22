@@ -5,13 +5,13 @@ set -euo pipefail
 seeds=(494 495 496 497)
 
 for seed in "${seeds[@]}"; do
-  run_name="ferret_dolly_qwen_seed${seed}"
+  run_name="ferret_NI_qwen4B_seed${seed}"
   echo "[ferret sweep] seed=${seed}, run_name=${run_name}"
 
   python main.py \
     --algo ferret \
     --model /root/autodl-tmp/qwen/ \
-    --dataset dolly \
+    -m 0.03 \
     --lr 0.0001 \
     --K 2048 \
     --log \
@@ -22,13 +22,15 @@ for seed in "${seeds[@]}"; do
     --n_accum 4 \
     --equal_weight \
     --seed "${seed}" \
-    --rounds 30 \
+    --rounds 20 \
     --use_wandb \
     --wandb_project ferret \
     --wandb_run_name "${run_name}" \
-    --batch_or_epoch epoch \
+    --batch_or_epoch batch \
+    --local_step 100 \
     --optimizer sgd \
     --early_stop \
     --early_stop_patience 5 \
+    --ni_root /root/autodl-tmp/natural-instructions/ \
     "$@"
 done

@@ -137,7 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--zerotask', default=7, type=int, help='the index of the task for evaluation in dolly-15K')
     parser.add_argument('--dataset_subsample', type=float, default=1.0, help='used for sampling a subset from the original dataset, only effective for dolly-15K')
     parser.add_argument('--ni_root', type=str, default='./data/NI', help='root directory for Natural Instructions dataset')
-    parser.add_argument('--gsm8k_root', type=str, default='./data/gsm8k', help='root directory for local GSM8K dataset files')
+    parser.add_argument('--gsm8k_root', type=str, default='./data/gsm8k/main', help='root directory for local GSM8K dataset files')
 
     # Model
     parser.add_argument('--model', type=str, default='datajuicer/LLaMA-1B-dj-refine-150B')

@@ -24,7 +24,11 @@ from optimizers.florg_utils import (
     sample_florg_delta_norm,
 )
 from utils_data.load_data import get_loaders
-from utils_data.gsm8k_metrics import compute_gsm8k_metrics
+from utils_data.gsm8k_metrics import (
+    compute_gsm8k_metrics,
+    extract_gsm8k_gold_final_answer,
+    extract_gsm8k_pred_final_answer,
+)
 from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
 
@@ -687,6 +691,7 @@ def run_evaluate(args, eval_metric_explicit=False):
         pred_texts = []
         ref_texts = []
         num_eval = 0
+        running_correct = 0
         pbar = tqdm(range(len(eval_loader)))
         with torch.inference_mode():
             for batch in eval_loader:
@@ -710,11 +715,19 @@ def run_evaluate(args, eval_metric_explicit=False):
                     ref_ids = label_ids[i]
                     if ref_ids.numel() > 0:
                         ref_ids = ref_ids[ref_ids >= 0]
-                    pred_texts.append(tokenizer.decode(pred_ids, skip_special_tokens=True))
-                    ref_texts.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
+                    pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+                    ref_text = tokenizer.decode(ref_ids, skip_special_tokens=True)
+                    pred_texts.append(pred_text)
+                    ref_texts.append(ref_text)
+
+                    pred_final, pred_invalid = extract_gsm8k_pred_final_answer(pred_text)
+                    gold_final = extract_gsm8k_gold_final_answer(ref_text)
+                    if (not pred_invalid) and (pred_final is not None) and (gold_final is not None) and (pred_final == gold_final):
+                        running_correct += 1
                 num_eval += bs
                 pbar.update(1)
-                pbar.set_description(f"eval gsm8k samples: {num_eval}")
+                denom = float(max(num_eval, 1))
+                pbar.set_description(f"eval gsm8k_acc: {running_correct / denom:.6f}")
 
         gsm8k_metrics = compute_gsm8k_metrics(pred_texts, ref_texts)
         if args.eval_metric == "gsm8k_acc":

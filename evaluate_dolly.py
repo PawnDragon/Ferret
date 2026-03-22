@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import sys
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from optimizers.florg_utils import (
     sample_florg_delta_norm,
 )
 from utils_data.load_data import get_loaders
+from utils_data.gsm8k_metrics import compute_gsm8k_metrics
 from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
 
@@ -227,6 +229,12 @@ def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
     return left_input_ids, left_attention_mask
 
 
+def maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=False):
+    if args.dataset == "gsm8k" and args.eval_metric == "rouge" and (not eval_metric_explicit):
+        args.eval_metric = "gsm8k_acc"
+        print("[info] dataset=gsm8k and --eval_metric not set; defaulting eval metric to gsm8k_acc")
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
@@ -261,7 +269,7 @@ def build_parser():
 
     # Data/eval args to keep dolly processing aligned with main.py
     parser.add_argument(
-        "--dataset", type=str, default="dolly", choices=["dolly", "instruct"]
+        "--dataset", type=str, default="dolly", choices=["dolly", "instruct", "gsm8k"]
     )
     parser.add_argument("--zerotask", type=int, default=7)
     parser.add_argument("--dataset_subsample", type=float, default=1.0)
@@ -272,12 +280,18 @@ def build_parser():
         default="./data/NI",
         help="root directory for Natural Instructions dataset",
     )
+    parser.add_argument(
+        "--gsm8k_root",
+        type=str,
+        default="./data/gsm8k",
+        help="root directory for local GSM8K dataset files",
+    )
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--use_prompts", default=True)
     parser.add_argument(
-        "--eval_metric", type=str, default="rouge", choices=["loss", "rouge"]
+        "--eval_metric", type=str, default="rouge", choices=["loss", "rouge", "gsm8k_acc"]
     )
 
     # Runtime/model args used by framework/server-style behavior
@@ -325,9 +339,12 @@ def build_parser():
     return parser
 
 
-def run_evaluate(args):
+def run_evaluate(args, eval_metric_explicit=False):
     device, _ = resolve_runtime_device(args.device)
     setup_seed(args.seed)
+    maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=eval_metric_explicit)
+    if args.dataset != "gsm8k" and args.eval_metric == "gsm8k_acc":
+        raise ValueError("--eval_metric gsm8k_acc is only valid for --dataset gsm8k")
     if getattr(args, "rank_left", None) is None:
         args.rank_left = int(args.rank_r)
     if getattr(args, "rank_right", None) is None:
@@ -620,6 +637,7 @@ def run_evaluate(args):
         eval_model = model
 
     result = None
+    gsm8k_metrics = {}
     if args.eval_metric == "loss":
         loss_total = 0.0
         num_eval = 0
@@ -643,6 +661,56 @@ def run_evaluate(args):
                 pbar.set_description(f"eval loss: {loss_total / num_eval}")
         result = float((loss_total / num_eval).item())
         print(f"[result] eval_loss={result}")
+    elif args.dataset == "gsm8k":
+        pred_texts = []
+        ref_texts = []
+        num_eval = 0
+        pbar = tqdm(range(len(eval_loader)))
+        with torch.inference_mode():
+            for batch in eval_loader:
+                input_ids = batch["input_ids"].to(device)
+                label_ids = batch["labels"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                bs = input_ids.size(0)
+                for i in range(bs):
+                    valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
+                    valid_mask = torch.ones_like(valid_input, device=device)
+                    output_ids = eval_model.generate(
+                        input_ids=valid_input,
+                        attention_mask=valid_mask,
+                        pad_token_id=tokenizer.pad_token_id,
+                        do_sample=False,
+                        num_beams=1,
+                        max_new_tokens=256,
+                    )
+                    prompt_len = int(valid_mask[0].sum().item())
+                    pred_ids = output_ids[0][prompt_len:]
+                    ref_ids = label_ids[i]
+                    if ref_ids.numel() > 0:
+                        ref_ids = ref_ids[ref_ids >= 0]
+                    pred_texts.append(tokenizer.decode(pred_ids, skip_special_tokens=True))
+                    ref_texts.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
+                num_eval += bs
+                pbar.update(1)
+                pbar.set_description(f"eval gsm8k samples: {num_eval}")
+
+        gsm8k_metrics = compute_gsm8k_metrics(pred_texts, ref_texts)
+        if args.eval_metric == "gsm8k_acc":
+            result = float(gsm8k_metrics["gsm8k_acc"])
+            print(
+                f"[result] gsm8k_acc={gsm8k_metrics['gsm8k_acc']:.6f}, "
+                f"gsm8k_rougeL={gsm8k_metrics['gsm8k_rougeL']:.6f}, "
+                f"gsm8k_invalid_rate={gsm8k_metrics['gsm8k_invalid_rate']:.6f}"
+            )
+        elif args.eval_metric == "rouge":
+            result = float(gsm8k_metrics["gsm8k_rougeL"])
+            print(
+                f"[result] gsm8k_rougeL={gsm8k_metrics['gsm8k_rougeL']:.6f}, "
+                f"gsm8k_acc={gsm8k_metrics['gsm8k_acc']:.6f}, "
+                f"gsm8k_invalid_rate={gsm8k_metrics['gsm8k_invalid_rate']:.6f}"
+            )
+        else:
+            raise ValueError(f"unsupported eval_metric={args.eval_metric} for dataset=gsm8k")
     else:
         metric_total = 0.0
         num_eval = 0
@@ -695,6 +763,8 @@ def run_evaluate(args):
         "eval_samples": len(eval_loader.dataset),
         "ckpt_type": ckpt_type,
     }
+    if args.dataset == "gsm8k":
+        metrics.update(gsm8k_metrics)
     if args.save_json:
         with open(args.save_json, "w") as f:
             json.dump(metrics, f, indent=2)
@@ -729,9 +799,17 @@ def run_evaluate_from_checkpoint(
     parser = build_parser()
     args = parser.parse_args(["--model", str(model_name_or_path)])
 
-    for key, value in _to_plain_dict(data_args).items():
+    data_args_dict = _to_plain_dict(data_args)
+    eval_args_dict = _to_plain_dict(eval_args)
+    eval_metric_explicit = (
+        ("eval_metric" in data_args_dict)
+        or ("eval_metric" in eval_args_dict)
+        or ("eval_metric" in kwargs)
+    )
+
+    for key, value in data_args_dict.items():
         setattr(args, key, value)
-    for key, value in _to_plain_dict(eval_args).items():
+    for key, value in eval_args_dict.items():
         setattr(args, key, value)
     for key, value in kwargs.items():
         setattr(args, key, value)
@@ -747,13 +825,17 @@ def run_evaluate_from_checkpoint(
             "[warn] tokenizer_name_or_path is ignored; tokenizer follows model_name_or_path in current pipeline"
         )
 
-    return run_evaluate(args)
+    return run_evaluate(args, eval_metric_explicit=eval_metric_explicit)
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    run_evaluate(args)
+    eval_metric_explicit = any(
+        token == "--eval_metric" or token.startswith("--eval_metric=")
+        for token in sys.argv[1:]
+    )
+    run_evaluate(args, eval_metric_explicit=eval_metric_explicit)
 
 
 if __name__ == "__main__":

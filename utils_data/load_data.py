@@ -79,6 +79,66 @@ def get_loaders(args, only_eval=False):
             eval_set, batch_size=args.batch_size, collate_fn=data_collator
         )
         
+    elif args.dataset == 'gsm8k':
+        from utils_data.gsm8k_loader import load_gsm8k_local_splits
+        from utils_data.gsm8k_metrics import gsm8k_partition_bucket_from_gold
+        from utils_data.natural_instruction_loader import LLMDataset, LLMDataCollator
+
+        train_examples, test_examples = load_gsm8k_local_splits(getattr(args, 'gsm8k_root', './data/gsm8k'))
+        train_data = [(item['instruction'], item['input'], item['output']) for item in train_examples]
+        eval_data = [(item['instruction'], item['input'], item['output']) for item in test_examples]
+        train_labels = np.array([gsm8k_partition_bucket_from_gold(item['output']) for item in train_examples], dtype=np.int64)
+
+        data_collator = LLMDataCollator(tokenizer=tokenizer)
+        list_train_loader = []
+        if not only_eval:
+            train_dataset = LLMDataset(
+                train_data,
+                tokenizer=tokenizer,
+                use_prompts=args.use_prompts,
+                generation=False,
+            )
+
+            noniid = args.iid
+            if 'dir' in noniid:
+                split_dic = partition_idx_labeldir(
+                    train_labels,
+                    n_parties=args.num_clients,
+                    alpha=float(noniid[3:]),
+                    num_classes=10,
+                )
+                split_trainsets = []
+                for _, sample_indices in split_dic.items():
+                    split_trainsets.append(Subset(train_dataset, indices=sample_indices))
+            else:
+                n_parts = [int(len(train_dataset) / args.num_clients) for _ in range(args.num_clients - 1)]
+                n_parts.append(len(train_dataset) - sum(n_parts))
+                split_trainsets = torch.utils.data.dataset.random_split(train_dataset, n_parts)
+
+            list_train_loader = [
+                DataLoader(
+                    subset,
+                    shuffle=True,
+                    batch_size=args.batch_size,
+                    collate_fn=data_collator,
+                )
+                for subset in split_trainsets
+            ]
+
+        eval_generation = bool(args.eval_metric != 'loss')
+        eval_dataset = LLMDataset(
+            eval_data,
+            tokenizer=tokenizer,
+            use_prompts=args.use_prompts,
+            generation=eval_generation,
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            shuffle=False,
+            batch_size=args.batch_size,
+            collate_fn=data_collator,
+        )
+
     elif args.dataset in ['instruct']:
         from utils_data.natural_instruction_loader import get_instruction_dataset
         list_train_loader, eval_loader = get_instruction_dataset(args, tokenizer, only_eval=only_eval)

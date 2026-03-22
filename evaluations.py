@@ -4,6 +4,17 @@ import numpy as np
 rouge = Rouge()
 
 
+def rouge_l_text(hyp_text, ref_text):
+    hyp = str(hyp_text) if hyp_text is not None else ''
+    ref = str(ref_text) if ref_text is not None else ''
+    if len(hyp.strip()) == 0:
+        return 0.0
+    try:
+        return rouge.get_scores([hyp], [ref])[0]['rouge-l']['f']
+    except ValueError:
+        return 0.0
+
+
 def rouge_score(hyp_ids, ref_ids, tokenizer):
     hyps = [tokenizer.decode(hyp_ids, skip_special_tokens=True)]
     if len(hyps[0]) == 0:

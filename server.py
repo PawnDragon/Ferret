@@ -36,6 +36,7 @@ from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subsp
 from optimizers.fedstruct_utils import initialize_struct_subspaces
 from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, make_uv, transport_state
 from utils_data.default_tokens import DefaultToken
+from utils_data.gsm8k_metrics import compute_gsm8k_metrics
 from utils_data.model_loader import (
     is_qwen3_model,
     maybe_print_qwen3_selfcheck,
@@ -1978,27 +1979,67 @@ class Server(object):
             )
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
-        acc_total_eval = 0.0
-        num_eval = 0
-
-        with torch.inference_mode():
-            for batch in self.eval_loader:
-                input_ids = batch['input_ids'].to(self.device)
-                label_ids = batch['labels'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                output_ids = eval_model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    max_new_tokens=128,
-                    num_beams=1,
-                )
-                acc_total_eval += rouge_score(output_ids[0][len(input_ids[0]):], label_ids[0], self.tokenizer)
-                progress_bar_eval.update(1)
-                num_eval += len(batch['input_ids'])
-                if num_eval == 0:
-                    num_eval = 1e-10
-                progress_bar_eval.set_description(f'eval at round {cur_round}, metric: {acc_total_eval / num_eval}')
+        if self.args.dataset == 'gsm8k':
+            pred_texts = []
+            ref_texts = []
+            num_eval = 0
+            with torch.inference_mode():
+                for batch in self.eval_loader:
+                    input_ids = batch['input_ids'].to(self.device)
+                    label_ids = batch['labels'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    bs = input_ids.size(0)
+                    for i in range(bs):
+                        valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
+                        valid_mask = torch.ones_like(valid_input, device=self.device)
+                        output_ids = eval_model.generate(
+                            input_ids=valid_input,
+                            attention_mask=valid_mask,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            do_sample=False,
+                            num_beams=1,
+                            max_new_tokens=256,
+                        )
+                        prompt_len = int(valid_mask[0].sum().item())
+                        pred_ids = output_ids[0][prompt_len:]
+                        ref_ids = label_ids[i]
+                        if ref_ids.numel() > 0:
+                            ref_ids = ref_ids[ref_ids >= 0]
+                        pred_texts.append(self.tokenizer.decode(pred_ids, skip_special_tokens=True))
+                        ref_texts.append(self.tokenizer.decode(ref_ids, skip_special_tokens=True))
+                    progress_bar_eval.update(1)
+                    num_eval += bs
+                    progress_bar_eval.set_description(f'eval at round {cur_round}, gsm8k samples: {num_eval}')
+            gsm8k_metrics = compute_gsm8k_metrics(pred_texts, ref_texts)
+            print(
+                f'[eval][gsm8k] round={cur_round} '
+                f'acc={float(gsm8k_metrics["gsm8k_acc"]):.6f} '
+                f'rougeL={float(gsm8k_metrics["gsm8k_rougeL"]):.6f} '
+                f'invalid_rate={float(gsm8k_metrics["gsm8k_invalid_rate"]):.6f}'
+            )
+            eval_metric = float(gsm8k_metrics['gsm8k_acc'])
+        else:
+            acc_total_eval = 0.0
+            num_eval = 0
+            with torch.inference_mode():
+                for batch in self.eval_loader:
+                    input_ids = batch['input_ids'].to(self.device)
+                    label_ids = batch['labels'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    output_ids = eval_model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        max_new_tokens=128,
+                        num_beams=1,
+                    )
+                    acc_total_eval += rouge_score(output_ids[0][len(input_ids[0]):], label_ids[0], self.tokenizer)
+                    progress_bar_eval.update(1)
+                    num_eval += len(batch['input_ids'])
+                    if num_eval == 0:
+                        num_eval = 1e-10
+                    progress_bar_eval.set_description(f'eval at round {cur_round}, metric: {acc_total_eval / num_eval}')
+            eval_metric = acc_total_eval / num_eval
         print()
         print()
 
@@ -2013,4 +2054,4 @@ class Server(object):
             eval_model = eval_model.cpu()
             del eval_model
         self.model = self.model.cpu()
-        return acc_total_eval / num_eval
+        return eval_metric

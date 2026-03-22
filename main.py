@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -126,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--equal_weight', default=False, action='store_true', help='if `true`, the weights among clients for aggregation are the same')
 
     # Data
-    parser.add_argument('--dataset', type=str, default='instruct', choices=['instruct', 'dolly'])
+    parser.add_argument('--dataset', type=str, default='instruct', choices=['instruct', 'dolly', 'gsm8k'])
     parser.add_argument('--batch_size', type=int, default=1, help='batch size > 1 may cause error during running')
     parser.add_argument('--max_length', type=int, default=1024, help='the max number of tokens of a data instance')
     parser.add_argument('--use_prompts', default=True, help='if `true`, the prompt template from alpaca is adopted')
@@ -136,6 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--zerotask', default=7, type=int, help='the index of the task for evaluation in dolly-15K')
     parser.add_argument('--dataset_subsample', type=float, default=1.0, help='used for sampling a subset from the original dataset, only effective for dolly-15K')
     parser.add_argument('--ni_root', type=str, default='./data/NI', help='root directory for Natural Instructions dataset')
+    parser.add_argument('--gsm8k_root', type=str, default='./data/gsm8k', help='root directory for local GSM8K dataset files')
 
     # Model
     parser.add_argument('--model', type=str, default='datajuicer/LLaMA-1B-dj-refine-150B')
@@ -218,7 +220,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='outputs')
 
     # Evaluation
-    parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss'], help='metric to evaluate global model in the last round')
+    parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss', 'gsm8k_acc'], help='metric to evaluate global model in the last round')
     parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
     parser.add_argument('--early_stop', default=False, action='store_true', help='if true, stop training early when eval metric does not improve')
     parser.add_argument('--early_stop_patience', type=int, default=8, help='number of rounds without significant improvement before stopping')
@@ -244,6 +246,13 @@ if __name__ == '__main__':
 
     time_stamp = str(time.time())
     args = parser.parse_args()
+    eval_metric_explicit = any(
+        token == '--eval_metric' or token.startswith('--eval_metric=')
+        for token in sys.argv[1:]
+    )
+    if args.dataset == 'gsm8k' and args.eval_metric == 'rouge' and (not eval_metric_explicit):
+        args.eval_metric = 'gsm8k_acc'
+        print('[info] dataset=gsm8k and --eval_metric not set; defaulting eval metric to gsm8k_acc')
     if args.rank_left is None:
         args.rank_left = int(args.rank_r)
     if args.rank_right is None:
@@ -1204,6 +1213,7 @@ if __name__ == '__main__':
             'max_length': args.max_length,
             'use_prompts': args.use_prompts,
             'ni_root': args.ni_root,
+            'gsm8k_root': args.gsm8k_root,
         }
         eval_args = {
             'eval_metric': previous_metric,
@@ -1256,33 +1266,51 @@ if __name__ == '__main__':
         )
         final_metric_name = previous_metric
         final_metric_val = float(final_eval['result'])
+        final_eval_payload = {
+            f'final_eval_{final_metric_name}': final_metric_val,
+            'checkpoint': final_eval_ckpt_path,
+            'round_end': final_round_idx,
+            'early_stopped': bool(early_stopped),
+            'early_stop_best_round': int(early_state['best_round']),
+            'early_stop_best_loss': float(early_state['best_val_loss']),
+        }
+        for key in [
+            'gsm8k_acc',
+            'gsm8k_rougeL',
+            'gsm8k_invalid_rate',
+            'gsm8k_avg_pred_len',
+            'gsm8k_num_eval_samples',
+        ]:
+            if key in final_eval:
+                final_eval_payload[key] = final_eval[key]
         if args.log:
             with open(os.path.join(log_dir, 'final_eval.json'), 'w') as writer:
-                json.dump(
-                    {
-                        f'final_eval_{final_metric_name}': final_metric_val,
-                        'checkpoint': final_eval_ckpt_path,
-                        'round_end': final_round_idx,
-                        'early_stopped': bool(early_stopped),
-                        'early_stop_best_round': int(early_state['best_round']),
-                        'early_stop_best_loss': float(early_state['best_val_loss']),
-                    },
-                    writer,
-                )
+                json.dump(final_eval_payload, writer)
         print(f'final round {final_metric_name} (best ckpt): {final_metric_val}')
         if wandb_run is not None:
-            wandb.log(
-                {
-                    f'final/{final_metric_name}': final_metric_val,
-                    'final/eval_samples': int(final_eval.get('eval_samples', 0)),
-                    'final/used_best_checkpoint': 1,
-                    'final/round_end': int(final_round_idx),
-                    'final/early_stopped': int(bool(early_stopped)),
-                    'final/early_stop_best_round': int(early_state['best_round']),
-                    'final/early_stop_best_loss': float(early_state['best_val_loss']),
-                },
-                step=final_round_idx,
-            )
+            wandb_payload = {
+                f'final/{final_metric_name}': final_metric_val,
+                'final/eval_samples': int(final_eval.get('eval_samples', 0)),
+                'final/used_best_checkpoint': 1,
+                'final/round_end': int(final_round_idx),
+                'final/early_stopped': int(bool(early_stopped)),
+                'final/early_stop_best_round': int(early_state['best_round']),
+                'final/early_stop_best_loss': float(early_state['best_val_loss']),
+            }
+            for key in [
+                'gsm8k_acc',
+                'gsm8k_rougeL',
+                'gsm8k_invalid_rate',
+                'gsm8k_avg_pred_len',
+                'gsm8k_num_eval_samples',
+            ]:
+                if key in final_eval:
+                    value = final_eval[key]
+                    if key == 'gsm8k_num_eval_samples':
+                        wandb_payload[f'final/{key}'] = int(value)
+                    else:
+                        wandb_payload[f'final/{key}'] = float(value)
+            wandb.log(wandb_payload, step=final_round_idx)
 
     if not user_keep_ckpt:
         removed_ckpt = 0

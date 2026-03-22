@@ -229,6 +229,27 @@ def to_left_padded_inputs(input_ids, attention_mask, pad_token_id):
     return left_input_ids, left_attention_mask
 
 
+def sanitize_greedy_generation_config(model):
+    """
+    Normalize generation_config to greedy defaults to avoid repeated warnings
+    about sampling-only flags when do_sample=False.
+    """
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is None:
+        return
+    try:
+        gen_cfg.do_sample = False
+        gen_cfg.num_beams = 1
+        if hasattr(gen_cfg, "temperature"):
+            gen_cfg.temperature = 1.0
+        if hasattr(gen_cfg, "top_p"):
+            gen_cfg.top_p = 1.0
+        if hasattr(gen_cfg, "top_k"):
+            gen_cfg.top_k = 50
+    except Exception:
+        return
+
+
 def maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=False):
     if args.dataset == "gsm8k" and args.eval_metric == "rouge" and (not eval_metric_explicit):
         args.eval_metric = "gsm8k_acc"
@@ -662,6 +683,7 @@ def run_evaluate(args, eval_metric_explicit=False):
         result = float((loss_total / num_eval).item())
         print(f"[result] eval_loss={result}")
     elif args.dataset == "gsm8k":
+        sanitize_greedy_generation_config(eval_model)
         pred_texts = []
         ref_texts = []
         num_eval = 0

@@ -72,6 +72,27 @@ def _is_finite_tensor(tensor):
     return isinstance(tensor, torch.Tensor) and bool(torch.isfinite(tensor).all().item())
 
 
+def sanitize_greedy_generation_config(model):
+    """
+    Normalize generation_config to greedy defaults to avoid repeated warnings
+    about sampling-only flags when do_sample=False.
+    """
+    gen_cfg = getattr(model, 'generation_config', None)
+    if gen_cfg is None:
+        return
+    try:
+        gen_cfg.do_sample = False
+        gen_cfg.num_beams = 1
+        if hasattr(gen_cfg, 'temperature'):
+            gen_cfg.temperature = 1.0
+        if hasattr(gen_cfg, 'top_p'):
+            gen_cfg.top_p = 1.0
+        if hasattr(gen_cfg, 'top_k'):
+            gen_cfg.top_k = 50
+    except Exception:
+        return
+
+
 def aggregate_named_adamw_states(named_states_list, weights):
     aggregated_state = {}
     weight_sums = {}
@@ -1980,6 +2001,7 @@ class Server(object):
 
         progress_bar_eval = tqdm(range(len(self.eval_loader)))
         if self.args.dataset == 'gsm8k':
+            sanitize_greedy_generation_config(eval_model)
             pred_texts = []
             ref_texts = []
             num_eval = 0

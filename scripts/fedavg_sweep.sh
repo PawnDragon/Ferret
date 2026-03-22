@@ -5,15 +5,19 @@ set -euo pipefail
 seeds=(494 495 496 497)
 
 for seed in "${seeds[@]}"; do
-  run_name="fedavg_dolly_qwen_seed${seed}"
+  run_name="fedavg_NI_qwen4B_seed${seed}"
   echo "[fedavg sweep] seed=${seed}, run_name=${run_name}"
 
   python main.py \
     --algo fedavg \
     --model /root/autodl-tmp/qwen/ \
-    --dataset dolly \
+    -m 0.03 \
     --lr 0.00001 \
     --log \
+    --slr_max 3 \
+    --anneal no \
+    --device 0 \
+    --momentum 0.0 \
     --n_accum 4 \
     --equal_weight \
     --seed "${seed}" \
@@ -21,9 +25,11 @@ for seed in "${seeds[@]}"; do
     --use_wandb \
     --wandb_project ferret \
     --wandb_run_name "${run_name}" \
-    --batch_or_epoch epoch \
+    --batch_or_epoch batch \
+    --local_step 100 \
     --optimizer adamw \
     --early_stop \
     --early_stop_patience 5 \
+    --ni_root /root/autodl-tmp/natural-instructions/ \
     "$@"
 done

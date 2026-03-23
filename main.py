@@ -1188,20 +1188,8 @@ if __name__ == '__main__':
             if not isinstance(best_payload['global_classifier_state'], dict):
                 raise RuntimeError('[fedexlora] global_classifier_state must be a dict in best checkpoint')
 
-            eval_ready_payload = {
-                'algo': 'fedexlora',
-                'backbone_state_dict': best_payload['backbone_state_dict'],
-                'global_lora_A_state': best_payload['global_lora_A_state'],
-                'global_lora_B_state': best_payload['global_lora_B_state'],
-                'global_classifier_state': best_payload['global_classifier_state'],
-                'lora_hparams': best_payload.get('lora_hparams', {}),
-                'round': int(best_payload.get('round', final_round_idx)),
-                'best_metric': float(best_payload.get('best_metric', float('nan'))),
-                'metric': float(best_payload.get('metric', float('nan'))),
-            }
-            final_eval_ckpt_path = os.path.join(log_dir, 'best_eval_ready.pt')
-            torch.save(eval_ready_payload, final_eval_ckpt_path)
-            print(f'[info][fedexlora] Prepared eval-ready checkpoint: {final_eval_ckpt_path}')
+            # Use the same best.pt for final eval; no extra eval-only checkpoint file.
+            final_eval_ckpt_path = best_ckpt_path
 
         data_args = {
             'dataset': args.dataset,

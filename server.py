@@ -801,11 +801,13 @@ class Server(object):
         module.weight.data.add_(residual.to(device=module.weight.device, dtype=module.weight.dtype))
 
     def aggregate_submuon_gt(self, client_payloads, selected_client_list, cur_round, is_refresh_round):
+        gt_topk = int(getattr(self.args, 'gt_topk', 0))
         if self.algo != 'fedsubmuon_gt':
             return {}
         if len(client_payloads) == 0:
             return {
                 'gt_refresh_round': int(bool(is_refresh_round)),
+                'gt_topk': int(gt_topk),
                 'gt_u_res_norm': 0.0,
                 'gt_v_res_norm': 0.0,
                 'gt_u_step_norm': 0.0,
@@ -813,6 +815,10 @@ class Server(object):
                 'gt_x_inherit_norm': 0.0,
                 'gt_residual_norm': 0.0,
                 'gt_basis_orth_err': 0.0,
+                'gt_u_topk_active': 0.0,
+                'gt_v_topk_active': 0.0,
+                'gt_u_topk_score_sum': 0.0,
+                'gt_v_topk_score_sum': 0.0,
             }
 
         weight_array = self._get_client_weight_array(selected_client_list)
@@ -826,6 +832,7 @@ class Server(object):
 
         metrics = {
             'gt_refresh_round': int(bool(is_refresh_round)),
+            'gt_topk': int(gt_topk),
             'gt_u_res_norm': 0.0,
             'gt_v_res_norm': 0.0,
             'gt_u_step_norm': 0.0,
@@ -833,6 +840,10 @@ class Server(object):
             'gt_x_inherit_norm': 0.0,
             'gt_residual_norm': 0.0,
             'gt_basis_orth_err': 0.0,
+            'gt_u_topk_active': 0.0,
+            'gt_v_topk_active': 0.0,
+            'gt_u_topk_score_sum': 0.0,
+            'gt_v_topk_score_sum': 0.0,
         }
         if not bool(is_refresh_round):
             self.x_global = new_x
@@ -891,13 +902,47 @@ class Server(object):
             B_u = U_old.t() @ H_u
             R_u = H_u - U_old @ B_u
             u_step = R_u @ B_u.t()
-            U_new_raw = U_old + gt_sub_lr * u_step
+            u_scores = torch.linalg.norm(u_step, dim=0)
+            if gt_topk > 0:
+                k_eff_u = min(int(gt_topk), int(u_step.shape[1]))
+                if k_eff_u > 0:
+                    idx_u = torch.topk(u_scores, k=k_eff_u, largest=True).indices
+                    u_step_applied = torch.zeros_like(u_step)
+                    u_step_applied[:, idx_u] = u_step[:, idx_u]
+                    metrics['gt_u_topk_score_sum'] += float(u_scores[idx_u].sum().item())
+                else:
+                    idx_u = None
+                    u_step_applied = torch.zeros_like(u_step)
+            else:
+                k_eff_u = int(u_step.shape[1])
+                idx_u = None
+                u_step_applied = u_step
+                metrics['gt_u_topk_score_sum'] += float(u_scores.sum().item())
+            metrics['gt_u_topk_active'] += float(k_eff_u)
+            U_new_raw = U_old + gt_sub_lr * u_step_applied
             U_new = self._orthonormalize_columns(U_new_raw)
 
             B_v = V_old.t() @ H_v
             R_v = H_v - V_old @ B_v
             v_step = R_v @ B_v.t()
-            V_new_raw = V_old + gt_sub_lr * v_step
+            v_scores = torch.linalg.norm(v_step, dim=0)
+            if gt_topk > 0:
+                k_eff_v = min(int(gt_topk), int(v_step.shape[1]))
+                if k_eff_v > 0:
+                    idx_v = torch.topk(v_scores, k=k_eff_v, largest=True).indices
+                    v_step_applied = torch.zeros_like(v_step)
+                    v_step_applied[:, idx_v] = v_step[:, idx_v]
+                    metrics['gt_v_topk_score_sum'] += float(v_scores[idx_v].sum().item())
+                else:
+                    idx_v = None
+                    v_step_applied = torch.zeros_like(v_step)
+            else:
+                k_eff_v = int(v_step.shape[1])
+                idx_v = None
+                v_step_applied = v_step
+                metrics['gt_v_topk_score_sum'] += float(v_scores.sum().item())
+            metrics['gt_v_topk_active'] += float(k_eff_v)
+            V_new_raw = V_old + gt_sub_lr * v_step_applied
             V_new = self._orthonormalize_columns(V_new_raw)
 
             delta_old = U_old @ X_agg @ V_old.t()
@@ -924,8 +969,8 @@ class Server(object):
 
             metrics['gt_u_res_norm'] += float(torch.linalg.norm(R_u).item())
             metrics['gt_v_res_norm'] += float(torch.linalg.norm(R_v).item())
-            metrics['gt_u_step_norm'] += float(torch.linalg.norm(u_step).item())
-            metrics['gt_v_step_norm'] += float(torch.linalg.norm(v_step).item())
+            metrics['gt_u_step_norm'] += float(torch.linalg.norm(u_step_applied).item())
+            metrics['gt_v_step_norm'] += float(torch.linalg.norm(v_step_applied).item())
             metrics['gt_x_inherit_norm'] += float(torch.linalg.norm(X_new).item())
             metrics['gt_residual_norm'] += float(torch.linalg.norm(residual).item())
             metrics['gt_basis_orth_err'] = max(
@@ -957,7 +1002,10 @@ class Server(object):
             new_seed = self.seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
             print(
                 f'[fedsubmuon_gt][server] refresh_round={int(cur_round)} old_seed={old_seed} new_seed={new_seed} '
+                f'gt_topk={int(gt_topk)} '
                 f'u_res={metrics["gt_u_res_norm"]:.6e} v_res={metrics["gt_v_res_norm"]:.6e} '
+                f'u_topk_active={int(metrics["gt_u_topk_active"])} '
+                f'v_topk_active={int(metrics["gt_v_topk_active"])} '
                 f'x_inherit={metrics["gt_x_inherit_norm"]:.6e} residual={metrics["gt_residual_norm"]:.6e}'
             )
         return metrics
@@ -1555,6 +1603,7 @@ class Server(object):
                     'aggregate_muon_state': bool(getattr(self.args, 'aggregate_muon_state', False)),
                     'gt_probe_batches': int(getattr(self.args, 'gt_probe_batches', 1)),
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
+                    'gt_topk': int(getattr(self.args, 'gt_topk', 0)),
                     'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },

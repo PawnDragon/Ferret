@@ -335,6 +335,7 @@ def build_parser():
     )
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument("--ns_steps", type=int, default=5)
+    parser.add_argument("--gt_topk", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--n_accum", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=-100.0)

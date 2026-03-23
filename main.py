@@ -176,6 +176,7 @@ if __name__ == '__main__':
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
     parser.add_argument('--gt_probe_batches', type=int, default=1, help='number of local mini-batches used to estimate probe gradients on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
+    parser.add_argument('--gt_topk', type=int, default=0, help='if >0, only top-k basis columns are updated on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_merge_residual', default=False, action='store_true', help='if set, merge projection residual into server backbone after fedsubmuon_gt refresh')
     parser.add_argument(
         '--aggregate_muon_state',
@@ -676,6 +677,7 @@ if __name__ == '__main__':
             if isinstance(gt_refresh_metrics, dict):
                 for key in [
                     'gt_refresh_round',
+                    'gt_topk',
                     'gt_u_res_norm',
                     'gt_v_res_norm',
                     'gt_u_step_norm',
@@ -683,6 +685,10 @@ if __name__ == '__main__':
                     'gt_x_inherit_norm',
                     'gt_residual_norm',
                     'gt_basis_orth_err',
+                    'gt_u_topk_active',
+                    'gt_v_topk_active',
+                    'gt_u_topk_score_sum',
+                    'gt_v_topk_score_sum',
                 ]:
                     if key in gt_refresh_metrics:
                         log_items[key] = float(gt_refresh_metrics[key])
@@ -1230,6 +1236,7 @@ if __name__ == '__main__':
             'stop_F': args.stop_F,
             'gt_probe_batches': args.gt_probe_batches,
             'gt_sub_lr': args.gt_sub_lr,
+            'gt_topk': args.gt_topk,
             'gt_merge_residual': args.gt_merge_residual,
             'weight_decay': args.weight_decay,
             'optimizer': args.optimizer,

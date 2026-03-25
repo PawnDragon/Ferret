@@ -3,6 +3,7 @@ import math
 import numpy as np
 import torch
 from copy import deepcopy
+from torch.utils.data import DataLoader, Subset
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
@@ -165,6 +166,10 @@ class Server(object):
     def __init__(self, args, eval_loader, candidate_seeds, log_dir):
         self.args = args
         self.eval_loader = eval_loader
+        self.round_eval_sample = float(getattr(args, 'round_eval_sample', 1.0))
+        self.round_eval_rng = np.random.RandomState(int(getattr(args, 'seed', 42)) + 2027)
+        self._round_eval_sample_logged = False
+        self._fixed_round_eval_loader = None
         self.candidate_seeds = candidate_seeds
         model_source = resolve_model_source(args.model)
         is_qwen3 = is_qwen3_model(model_source)
@@ -348,6 +353,46 @@ class Server(object):
                 f'[fedstructmuon] initialized {len(self.global_struct_x_state)} subspaces; '
                 f'round-1 warmup uses all={len(self.global_struct_selected_keys)}'
             )
+
+    def _build_round_eval_loader(self, cur_round):
+        ratio = float(getattr(self.args, 'round_eval_sample', 1.0))
+        if ratio >= 1.0:
+            return self.eval_loader
+        if self._fixed_round_eval_loader is not None:
+            return self._fixed_round_eval_loader
+        if self.eval_loader is None:
+            return self.eval_loader
+        dataset = getattr(self.eval_loader, 'dataset', None)
+        if dataset is None:
+            return self.eval_loader
+        total = int(len(dataset))
+        if total <= 0:
+            return self.eval_loader
+
+        sample_n = int(total * ratio)
+        if ratio <= 0.0:
+            sample_n = 1
+        else:
+            sample_n = max(sample_n, 1)
+        sample_n = min(sample_n, total)
+        if sample_n >= total:
+            return self.eval_loader
+
+        indices = self.round_eval_rng.choice(total, size=sample_n, replace=False).tolist()
+        if bool(getattr(self.args, 'log', False)) and (not self._round_eval_sample_logged):
+            print(
+                f'[info] round eval sampling enabled: ratio={ratio:.4f}, '
+                f'sampled={sample_n}/{total}'
+            )
+            self._round_eval_sample_logged = True
+        subset = Subset(dataset, indices=indices)
+        self._fixed_round_eval_loader = DataLoader(
+            subset,
+            shuffle=False,
+            batch_size=getattr(self.eval_loader, 'batch_size', 1),
+            collate_fn=getattr(self.eval_loader, 'collate_fn', None),
+        )
+        return self._fixed_round_eval_loader
 
     def _get_ckpt_dir(self):
         os.makedirs(self.log_dir, exist_ok=True)
@@ -1929,12 +1974,13 @@ class Server(object):
                 trainable=False,
             )
 
-        progress_bar_eval = tqdm(range(len(self.eval_loader)))
+        round_eval_loader = self._build_round_eval_loader(cur_round)
+        progress_bar_eval = tqdm(range(len(round_eval_loader)))
         loss_total_eval = 0.0
         num_eval = 0
 
         with torch.inference_mode():
-            for batch in self.eval_loader:
+            for batch in round_eval_loader:
                 batch = {
                     'input_ids': batch['input_ids'].to(self.device),
                     'labels': batch['labels'].to(self.device),
@@ -2048,14 +2094,15 @@ class Server(object):
                 trainable=False,
             )
 
-        progress_bar_eval = tqdm(range(len(self.eval_loader)))
+        round_eval_loader = self._build_round_eval_loader(cur_round)
+        progress_bar_eval = tqdm(range(len(round_eval_loader)))
         if self.args.dataset == 'gsm8k':
             sanitize_greedy_generation_config(eval_model)
             pred_texts = []
             ref_texts = []
             num_eval = 0
             with torch.inference_mode():
-                for batch in self.eval_loader:
+                for batch in round_eval_loader:
                     input_ids = batch['input_ids'].to(self.device)
                     label_ids = batch['labels'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)
@@ -2093,7 +2140,7 @@ class Server(object):
             acc_total_eval = 0.0
             num_eval = 0
             with torch.inference_mode():
-                for batch in self.eval_loader:
+                for batch in round_eval_loader:
                     input_ids = batch['input_ids'].to(self.device)
                     label_ids = batch['labels'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)

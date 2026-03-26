@@ -132,7 +132,7 @@ def load_checkpoint_into_model(model, ckpt_path):
             saved_algo = payload.get("algo", None)
 
         if (
-            saved_algo in ["fedit", "flora"]
+            saved_algo in ["fedit", "federa", "flora"]
             or global_lora_state is not None
             or global_deltaW_state is not None
         ):
@@ -285,6 +285,7 @@ def build_parser():
             "fedmultisubmuon",
             "fedstructmuon",
             "fedit",
+            "federa",
             "flora",
             "fedexlora",
             "florg",
@@ -342,6 +343,7 @@ def build_parser():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=16.0)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--federa_svd_dtype", type=str, default="fp32", choices=["fp32", "fp64"])
     parser.add_argument(
         "--lora_target_modules",
         type=str,
@@ -490,6 +492,7 @@ def run_evaluate(args, eval_metric_explicit=False):
             "fedmultisubmuon",
             "fedstructmuon",
             "fedit",
+            "federa",
             "flora",
             "fedexlora",
             "florg",
@@ -619,9 +622,9 @@ def run_evaluate(args, eval_metric_explicit=False):
             },
             trainable=False,
         )
-    elif eval_algo == "fedit":
+    elif eval_algo in ["fedit", "federa"]:
         if global_lora_state is None:
-            raise ValueError("FedIT eval requires checkpoint with global_lora_state")
+            raise ValueError("LoRA eval requires checkpoint with global_lora_state")
         eval_model = build_lora_model(model, args)
         load_lora_state(eval_model, global_lora_state)
         eval_model = eval_model.to(device)

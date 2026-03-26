@@ -472,7 +472,7 @@ class Client(object):
                 payload['h_v'] = h_v_local if isinstance(h_v_local, dict) else {}
             return payload
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg']:
             if getattr(self.args, 'algo', 'ferret') == 'florg':
                 if florg_basis_state is None:
                     raise RuntimeError('[florg] missing basis_state in client local train')
@@ -485,7 +485,7 @@ class Client(object):
             else:
                 self.model = build_lora_model(self.model, self.args)
             self.model.to(self.device)
-            if getattr(self.args, 'algo', 'ferret') == 'fedit':
+            if getattr(self.args, 'algo', 'ferret') in ['fedit', 'federa']:
                 load_lora_state(self.model, lora_state)
             elif getattr(self.args, 'algo', 'ferret') == 'fedsalora':
                 load_lora_A_state(self.model, lora_A_state)

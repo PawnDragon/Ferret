@@ -56,7 +56,7 @@ def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
         return server.save_best_multisub_ckpt(metric, cur_round)
     if args.algo == 'fedstructmuon':
         return server.save_best_struct_ckpt(metric, cur_round)
-    if args.algo in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg']:
+    if args.algo in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
         return server.save_best_fedavg_ckpt(metric, cur_round)
@@ -107,6 +107,7 @@ if __name__ == '__main__':
         'fedmultisubmuon',
         'fedstructmuon',
         'fedit',
+        'federa',
         'flora',
         'fedsalora',
         'fedexlora',
@@ -196,6 +197,7 @@ if __name__ == '__main__':
     parser.add_argument('--lora_dropout', type=float, default=0.0)
     parser.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
     parser.add_argument('--lora_bias', type=str, default='none', choices=['none', 'all', 'lora_only'])
+    parser.add_argument('--federa_svd_dtype', type=str, default='fp32', choices=['fp32', 'fp64'], help='dtype used for FeDeRA SVD initialization')
     parser.add_argument('--florg_rank_r', type=int, default=16, help='rank r for FLoRG A matrix')
     parser.add_argument('--florg_seed_base', type=int, default=95317, help='base seed for deterministic FLoRG L/R generation')
     parser.add_argument('--multisub_num_subspaces', type=int, default=4, help='number of subspaces per target layer for FedMultiSubMuon')
@@ -757,8 +759,8 @@ if __name__ == '__main__':
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
                 log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
 
-        elif args.algo in ['fedit', 'flora']:
-            broadcast_lora = server.get_fedit_broadcast_state() if args.algo == 'fedit' else None
+        elif args.algo in ['fedit', 'federa', 'flora']:
+            broadcast_lora = server.get_fedit_broadcast_state() if args.algo in ['fedit', 'federa'] else None
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             client_payloads = []
             for client in selected_client:
@@ -1251,6 +1253,7 @@ if __name__ == '__main__':
             'lora_dropout': args.lora_dropout,
             'lora_target_modules': args.lora_target_modules,
             'lora_bias': args.lora_bias,
+            'federa_svd_dtype': args.federa_svd_dtype,
             'florg_rank_r': args.florg_rank_r,
             'florg_seed_base': args.florg_seed_base,
         }

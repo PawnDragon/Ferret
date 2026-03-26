@@ -22,6 +22,7 @@ from optimizers.lora_utils import (
     load_lora_A_state,
     load_lora_B_state,
     load_lora_state,
+    initialize_federa_lora_state,
     lora_scaling,
     resolve_layer_name_for_model,
 )
@@ -290,6 +291,22 @@ class Server(object):
             init_model = build_lora_model(deepcopy(self.model), self.args)
             self.global_lora_state = extract_lora_state(init_model)
             del init_model
+        if self.algo == 'federa':
+            self.global_lora_state, federa_logs = initialize_federa_lora_state(self.model, self.args)
+            if bool(getattr(self.args, 'log', False)):
+                total_layers = len(federa_logs)
+                total_delta_norm = float(np.sum([item['delta_norm'] for item in federa_logs])) if total_layers > 0 else 0.0
+                max_recon_err = float(np.max([item['recon_err'] for item in federa_logs])) if total_layers > 0 else 0.0
+                print(
+                    f'[federa][init] layers={total_layers}, '
+                    f'delta_norm_sum={total_delta_norm:.6e}, max_recon_err={max_recon_err:.6e}'
+                )
+                for item in federa_logs[:3]:
+                    print(
+                        f'[federa][init] layer={item["layer"]} rank={item["rank"]} '
+                        f'rank_eff={item["rank_eff"]} delta_norm={item["delta_norm"]:.6e} '
+                        f'recon_err={item["recon_err"]:.6e}'
+                    )
         if self.algo == 'fedsalora':
             init_model = build_lora_model(deepcopy(self.model), self.args)
             self.global_lora_A_state = extract_lora_A_state(init_model)
@@ -523,7 +540,7 @@ class Server(object):
             return self.get_multisub_broadcast_state()
         if self.algo == 'fedstructmuon':
             return self.get_struct_broadcast_state()
-        if self.algo == 'fedit':
+        if self.algo in ['fedit', 'federa']:
             return {
                 'backbone_state_dict': self.model.state_dict(),
                 'global_lora_state': self.get_fedit_broadcast_state(),
@@ -670,7 +687,7 @@ class Server(object):
         print(f'[fedstructmuon][round {cur_round}] selected subspaces: {len(selected_keys)}')
 
     def get_fedit_broadcast_state(self):
-        if self.algo != 'fedit':
+        if self.algo not in ['fedit', 'federa']:
             return None
         return {k: v.clone() for k, v in self.global_lora_state.items()}
 
@@ -1236,7 +1253,7 @@ class Server(object):
 
         weight_array = self._get_client_weight_array(selected_client_list)
 
-        if self.algo == 'fedit':
+        if self.algo in ['fedit', 'federa']:
             state_keys = list(client_payloads[0]['lora_state'].keys())
             new_global_lora = {key: torch.zeros_like(client_payloads[0]['lora_state'][key], dtype=torch.float32) for key in state_keys}
 
@@ -1770,7 +1787,7 @@ class Server(object):
         return True
 
     def save_best_lora_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedit', 'flora', 'fedsalora', 'fedexlora', 'florg'] or not self.args.save:
+        if self.algo not in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -1788,7 +1805,7 @@ class Server(object):
             'metric': float(metric),
         }
 
-        if self.algo == 'fedit':
+        if self.algo in ['fedit', 'federa']:
             ckpt_payload['lora_hparams'] = {
                 'lora_r': int(getattr(self.args, 'lora_r', 16)),
                 'lora_alpha': float(getattr(self.args, 'lora_alpha', 16.0)),
@@ -1796,6 +1813,7 @@ class Server(object):
                 'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 'lora_bias': getattr(self.args, 'lora_bias', 'none'),
                 'scaling': float(self.flora_scaling),
+                'federa_svd_dtype': str(getattr(self.args, 'federa_svd_dtype', 'fp32')),
             }
             ckpt_payload['global_lora_state'] = {k: v.cpu() for k, v in self.global_lora_state.items()}
         elif self.algo == 'flora':
@@ -1896,7 +1914,7 @@ class Server(object):
         eval_model = None
         framework = None
         temp_eval_model = False
-        if self.algo == 'fedit':
+        if self.algo in ['fedit', 'federa']:
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_state(eval_model, self.global_lora_state)
             eval_model.eval()
@@ -2016,7 +2034,7 @@ class Server(object):
         eval_model = None
         framework = None
         temp_eval_model = False
-        if self.algo == 'fedit':
+        if self.algo in ['fedit', 'federa']:
             eval_model = build_lora_model(deepcopy(self.model), self.args).to(self.device)
             load_lora_state(eval_model, self.global_lora_state)
             eval_model.eval()

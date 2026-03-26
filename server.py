@@ -39,6 +39,11 @@ from optimizers.fedstruct_utils import initialize_struct_subspaces
 from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, make_uv, transport_state
 from utils_data.default_tokens import DefaultToken
 from utils_data.gsm8k_metrics import compute_gsm8k_metrics
+from utils_data.math_metrics import (
+    compute_math_metrics,
+    extract_math_gold_final_answer,
+    extract_math_pred_final_answer,
+)
 from utils_data.model_loader import (
     is_qwen3_model,
     maybe_print_qwen3_selfcheck,
@@ -2154,6 +2159,92 @@ class Server(object):
                 f'invalid_rate={float(gsm8k_metrics["gsm8k_invalid_rate"]):.6f}'
             )
             eval_metric = float(gsm8k_metrics['gsm8k_acc'])
+        elif self.args.dataset == 'math':
+            sanitize_greedy_generation_config(eval_model)
+            pred_texts = []
+            ref_texts = []
+            gold_finals = []
+            subjects = []
+            levels = []
+            num_eval = 0
+            running_correct = 0
+            with torch.inference_mode():
+                for batch in round_eval_loader:
+                    input_ids = batch['input_ids'].to(self.device)
+                    label_ids = batch['labels'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    bs = input_ids.size(0)
+                    meta_ref_solution = batch.get('meta_ref_solution', None)
+                    meta_final_answer = batch.get('meta_final_answer', None)
+                    meta_subject = batch.get('meta_subject', None)
+                    meta_level = batch.get('meta_level', None)
+                    for i in range(bs):
+                        valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
+                        valid_mask = torch.ones_like(valid_input, device=self.device)
+                        output_ids = eval_model.generate(
+                            input_ids=valid_input,
+                            attention_mask=valid_mask,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            do_sample=False,
+                            num_beams=1,
+                            max_new_tokens=512,
+                        )
+                        prompt_len = int(valid_mask[0].sum().item())
+                        pred_ids = output_ids[0][prompt_len:]
+                        pred_text = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
+
+                        ref_text = None
+                        if isinstance(meta_ref_solution, list) and i < len(meta_ref_solution):
+                            ref_text = meta_ref_solution[i]
+                        if ref_text is None:
+                            ref_ids = label_ids[i]
+                            if ref_ids.numel() > 0:
+                                ref_ids = ref_ids[ref_ids >= 0]
+                            ref_text = self.tokenizer.decode(ref_ids, skip_special_tokens=True)
+
+                        gold_final = None
+                        if isinstance(meta_final_answer, list) and i < len(meta_final_answer):
+                            gold_final = meta_final_answer[i]
+                        subject = 'unknown'
+                        if isinstance(meta_subject, list) and i < len(meta_subject) and meta_subject[i] is not None:
+                            subject = str(meta_subject[i])
+                        level = 'unknown'
+                        if isinstance(meta_level, list) and i < len(meta_level) and meta_level[i] is not None:
+                            level = str(meta_level[i])
+
+                        pred_texts.append(pred_text)
+                        ref_texts.append(ref_text)
+                        gold_finals.append(gold_final)
+                        subjects.append(subject)
+                        levels.append(level)
+
+                        pred_final, pred_invalid = extract_math_pred_final_answer(pred_text)
+                        gold_final_norm = extract_math_gold_final_answer(gold_final)
+                        if (not pred_invalid) and (pred_final is not None) and (gold_final_norm is not None) and (pred_final == gold_final_norm):
+                            running_correct += 1
+                    progress_bar_eval.update(1)
+                    num_eval += bs
+                    denom = float(max(num_eval, 1))
+                    progress_bar_eval.set_description(f'eval at round {cur_round}, math_acc: {running_correct / denom:.6f}')
+            math_metrics = compute_math_metrics(
+                pred_texts=pred_texts,
+                ref_texts=ref_texts,
+                gold_finals=gold_finals,
+                subjects=subjects,
+                levels=levels,
+            )
+            print(
+                f'[eval][math] round={cur_round} '
+                f'acc={float(math_metrics["math_acc"]):.6f} '
+                f'rougeL={float(math_metrics["math_rougeL"]):.6f} '
+                f'invalid_rate={float(math_metrics["math_invalid_rate"]):.6f}'
+            )
+            print(
+                f'[eval][math] round={cur_round} '
+                f'acc_by_subject={math_metrics.get("math_acc_by_subject", {})} '
+                f'acc_by_level={math_metrics.get("math_acc_by_level", {})}'
+            )
+            eval_metric = float(math_metrics['math_acc'])
         else:
             acc_total_eval = 0.0
             num_eval = 0

@@ -25,7 +25,8 @@ class LLMDataset(Dataset):
                  data,
                  tokenizer,
                  use_prompts,
-                 generation=False):
+                 generation=False,
+                 metadata_list=None):
         super(LLMDataset, self).__init__()
 
         model_name = getattr(tokenizer, 'name_or_path', '')
@@ -59,6 +60,14 @@ class LLMDataset(Dataset):
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
+        if metadata_list is not None:
+            if len(metadata_list) != len(data):
+                raise RuntimeError(
+                    f'metadata_list size mismatch: len(metadata)={len(metadata_list)}, len(data)={len(data)}'
+                )
+            self.metadata_list = list(metadata_list)
+        else:
+            self.metadata_list = None
 
 
     def _tokenize_fn(self, strings, tokenizer):
@@ -110,8 +119,13 @@ class LLMDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i):
-        return dict(input_ids=self.input_ids[i],
-                    labels=self.labels[i])
+        out = dict(input_ids=self.input_ids[i], labels=self.labels[i])
+        if self.metadata_list is not None:
+            metadata = self.metadata_list[i]
+            if isinstance(metadata, dict):
+                for key, value in metadata.items():
+                    out[key] = value
+        return out
 
 
 @dataclass
@@ -131,11 +145,20 @@ class LLMDataCollator(object):
             labels,
             batch_first=True,
             padding_value=IGNORE_INDEX)
-        return dict(
+        batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
+        extra_keys = set()
+        for instance in instances:
+            for key in instance.keys():
+                if key in ['input_ids', 'labels']:
+                    continue
+                extra_keys.add(key)
+        for key in sorted(extra_keys):
+            batch[key] = [instance.get(key, None) for instance in instances]
+        return batch
         
 
 def _get_task_splits(ni_root):

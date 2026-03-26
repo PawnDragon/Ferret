@@ -29,6 +29,11 @@ from utils_data.gsm8k_metrics import (
     extract_gsm8k_gold_final_answer,
     extract_gsm8k_pred_final_answer,
 )
+from utils_data.math_metrics import (
+    compute_math_metrics,
+    extract_math_gold_final_answer,
+    extract_math_pred_final_answer,
+)
 from utils_data.model_loader import resolve_model_source, resolve_torch_dtype
 
 
@@ -258,6 +263,9 @@ def maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=False):
     if args.dataset == "gsm8k" and args.eval_metric == "rouge" and (not eval_metric_explicit):
         args.eval_metric = "gsm8k_acc"
         print("[info] dataset=gsm8k and --eval_metric not set; defaulting eval metric to gsm8k_acc")
+    if args.dataset == "math" and args.eval_metric == "rouge" and (not eval_metric_explicit):
+        args.eval_metric = "math_acc"
+        print("[info] dataset=math and --eval_metric not set; defaulting eval metric to math_acc")
 
 
 def build_parser():
@@ -295,7 +303,7 @@ def build_parser():
 
     # Data/eval args to keep dolly processing aligned with main.py
     parser.add_argument(
-        "--dataset", type=str, default="dolly", choices=["dolly", "instruct", "gsm8k"]
+        "--dataset", type=str, default="dolly", choices=["dolly", "instruct", "gsm8k", "math"]
     )
     parser.add_argument("--zerotask", type=int, default=7)
     parser.add_argument("--dataset_subsample", type=float, default=1.0)
@@ -312,12 +320,18 @@ def build_parser():
         default="./data/gsm8k",
         help="root directory for local GSM8K dataset files",
     )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="./data/math",
+        help="root directory for local MATH dataset parquet files",
+    )
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--use_prompts", default=True)
     parser.add_argument(
-        "--eval_metric", type=str, default="rouge", choices=["loss", "rouge", "gsm8k_acc"]
+        "--eval_metric", type=str, default="rouge", choices=["loss", "rouge", "gsm8k_acc", "math_acc"]
     )
 
     # Runtime/model args used by framework/server-style behavior
@@ -373,6 +387,8 @@ def run_evaluate(args, eval_metric_explicit=False):
     maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=eval_metric_explicit)
     if args.dataset != "gsm8k" and args.eval_metric == "gsm8k_acc":
         raise ValueError("--eval_metric gsm8k_acc is only valid for --dataset gsm8k")
+    if args.dataset != "math" and args.eval_metric == "math_acc":
+        raise ValueError("--eval_metric math_acc is only valid for --dataset math")
     if getattr(args, "rank_left", None) is None:
         args.rank_left = int(args.rank_r)
     if getattr(args, "rank_right", None) is None:
@@ -667,6 +683,7 @@ def run_evaluate(args, eval_metric_explicit=False):
 
     result = None
     gsm8k_metrics = {}
+    math_metrics = {}
     if args.eval_metric == "loss":
         loss_total = 0.0
         num_eval = 0
@@ -750,6 +767,98 @@ def run_evaluate(args, eval_metric_explicit=False):
             )
         else:
             raise ValueError(f"unsupported eval_metric={args.eval_metric} for dataset=gsm8k")
+    elif args.dataset == "math":
+        sanitize_greedy_generation_config(eval_model)
+        pred_texts = []
+        ref_texts = []
+        gold_finals = []
+        subjects = []
+        levels = []
+        num_eval = 0
+        running_correct = 0
+        pbar = tqdm(range(len(eval_loader)))
+        with torch.inference_mode():
+            for batch in eval_loader:
+                input_ids = batch["input_ids"].to(device)
+                label_ids = batch["labels"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                bs = input_ids.size(0)
+                meta_ref_solution = batch.get("meta_ref_solution", None)
+                meta_final_answer = batch.get("meta_final_answer", None)
+                meta_subject = batch.get("meta_subject", None)
+                meta_level = batch.get("meta_level", None)
+                for i in range(bs):
+                    valid_input = input_ids[i][attention_mask[i].bool()].unsqueeze(0)
+                    valid_mask = torch.ones_like(valid_input, device=device)
+                    output_ids = eval_model.generate(
+                        input_ids=valid_input,
+                        attention_mask=valid_mask,
+                        pad_token_id=tokenizer.pad_token_id,
+                        do_sample=False,
+                        num_beams=1,
+                        max_new_tokens=512,
+                    )
+                    prompt_len = int(valid_mask[0].sum().item())
+                    pred_ids = output_ids[0][prompt_len:]
+                    pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+
+                    ref_text = None
+                    if isinstance(meta_ref_solution, list) and i < len(meta_ref_solution):
+                        ref_text = meta_ref_solution[i]
+                    if ref_text is None:
+                        ref_ids = label_ids[i]
+                        if ref_ids.numel() > 0:
+                            ref_ids = ref_ids[ref_ids >= 0]
+                        ref_text = tokenizer.decode(ref_ids, skip_special_tokens=True)
+
+                    gold_final = None
+                    if isinstance(meta_final_answer, list) and i < len(meta_final_answer):
+                        gold_final = meta_final_answer[i]
+                    subject = "unknown"
+                    if isinstance(meta_subject, list) and i < len(meta_subject) and meta_subject[i] is not None:
+                        subject = str(meta_subject[i])
+                    level = "unknown"
+                    if isinstance(meta_level, list) and i < len(meta_level) and meta_level[i] is not None:
+                        level = str(meta_level[i])
+
+                    pred_texts.append(pred_text)
+                    ref_texts.append(ref_text)
+                    gold_finals.append(gold_final)
+                    subjects.append(subject)
+                    levels.append(level)
+
+                    pred_final, pred_invalid = extract_math_pred_final_answer(pred_text)
+                    gold_final_norm = extract_math_gold_final_answer(gold_final)
+                    if (not pred_invalid) and (pred_final is not None) and (gold_final_norm is not None) and (pred_final == gold_final_norm):
+                        running_correct += 1
+                num_eval += bs
+                pbar.update(1)
+                denom = float(max(num_eval, 1))
+                pbar.set_description(f"eval math_acc: {running_correct / denom:.6f}")
+
+        math_metrics = compute_math_metrics(
+            pred_texts=pred_texts,
+            ref_texts=ref_texts,
+            gold_finals=gold_finals,
+            subjects=subjects,
+            levels=levels,
+        )
+        if args.eval_metric == "math_acc":
+            result = float(math_metrics["math_acc"])
+            print(
+                f"[result] math_acc={math_metrics['math_acc']:.6f}, "
+                f"math_rougeL={math_metrics['math_rougeL']:.6f}, "
+                f"math_invalid_rate={math_metrics['math_invalid_rate']:.6f}"
+            )
+        elif args.eval_metric == "rouge":
+            result = float(math_metrics["math_rougeL"])
+            print(
+                f"[result] math_rougeL={math_metrics['math_rougeL']:.6f}, "
+                f"math_acc={math_metrics['math_acc']:.6f}, "
+                f"math_invalid_rate={math_metrics['math_invalid_rate']:.6f}"
+            )
+        else:
+            raise ValueError(f"unsupported eval_metric={args.eval_metric} for dataset=math")
     else:
         metric_total = 0.0
         num_eval = 0
@@ -804,6 +913,8 @@ def run_evaluate(args, eval_metric_explicit=False):
     }
     if args.dataset == "gsm8k":
         metrics.update(gsm8k_metrics)
+    if args.dataset == "math":
+        metrics.update(math_metrics)
     if args.save_json:
         with open(args.save_json, "w") as f:
             json.dump(metrics, f, indent=2)

@@ -128,7 +128,7 @@ if __name__ == '__main__':
     parser.add_argument('--equal_weight', default=False, action='store_true', help='if `true`, the weights among clients for aggregation are the same')
 
     # Data
-    parser.add_argument('--dataset', type=str, default='instruct', choices=['instruct', 'dolly', 'gsm8k'])
+    parser.add_argument('--dataset', type=str, default='instruct', choices=['instruct', 'dolly', 'gsm8k', 'math'])
     parser.add_argument('--batch_size', type=int, default=1, help='batch size > 1 may cause error during running')
     parser.add_argument('--max_length', type=int, default=1024, help='the max number of tokens of a data instance')
     parser.add_argument('--use_prompts', default=True, help='if `true`, the prompt template from alpaca is adopted')
@@ -139,6 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_subsample', type=float, default=1.0, help='used for sampling a subset from the original dataset, only effective for dolly-15K')
     parser.add_argument('--ni_root', type=str, default='./data/NI', help='root directory for Natural Instructions dataset')
     parser.add_argument('--gsm8k_root', type=str, default='./data/gsm8k/main', help='root directory for local GSM8K dataset files')
+    parser.add_argument('--dataset_path', type=str, default='./data/math', help='root directory for local MATH dataset parquet files')
 
     # Model
     parser.add_argument('--model', type=str, default='datajuicer/LLaMA-1B-dj-refine-150B')
@@ -223,7 +224,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='outputs')
 
     # Evaluation
-    parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss', 'gsm8k_acc'], help='metric to evaluate global model in the last round')
+    parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss', 'gsm8k_acc', 'math_acc'], help='metric to evaluate global model in the last round')
     parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
     parser.add_argument('--round_eval_sample', type=float, default=1.0, help='sampling ratio (0-1] for per-round evaluation set; final eval always uses full eval set')
     parser.add_argument('--early_stop', default=False, action='store_true', help='if true, stop training early when eval metric does not improve')
@@ -257,6 +258,13 @@ if __name__ == '__main__':
     if args.dataset == 'gsm8k' and args.eval_metric == 'rouge' and (not eval_metric_explicit):
         args.eval_metric = 'gsm8k_acc'
         print('[info] dataset=gsm8k and --eval_metric not set; defaulting eval metric to gsm8k_acc')
+    if args.dataset == 'math' and args.eval_metric == 'rouge' and (not eval_metric_explicit):
+        args.eval_metric = 'math_acc'
+        print('[info] dataset=math and --eval_metric not set; defaulting eval metric to math_acc')
+    if args.dataset != 'gsm8k' and args.eval_metric == 'gsm8k_acc':
+        raise ValueError('--eval_metric gsm8k_acc is only valid for --dataset gsm8k')
+    if args.dataset != 'math' and args.eval_metric == 'math_acc':
+        raise ValueError('--eval_metric math_acc is only valid for --dataset math')
     if args.rank_left is None:
         args.rank_left = int(args.rank_r)
     if args.rank_right is None:
@@ -1213,6 +1221,7 @@ if __name__ == '__main__':
             'use_prompts': args.use_prompts,
             'ni_root': args.ni_root,
             'gsm8k_root': args.gsm8k_root,
+            'dataset_path': args.dataset_path,
         }
         eval_args = {
             'eval_metric': previous_metric,
@@ -1281,7 +1290,15 @@ if __name__ == '__main__':
             'gsm8k_invalid_rate',
             'gsm8k_avg_pred_len',
             'gsm8k_num_eval_samples',
+            'math_acc',
+            'math_rougeL',
+            'math_invalid_rate',
+            'math_avg_pred_len',
+            'math_num_eval_samples',
         ]:
+            if key in final_eval:
+                final_eval_payload[key] = final_eval[key]
+        for key in ['math_acc_by_subject', 'math_acc_by_level']:
             if key in final_eval:
                 final_eval_payload[key] = final_eval[key]
         if args.log:
@@ -1304,10 +1321,15 @@ if __name__ == '__main__':
                 'gsm8k_invalid_rate',
                 'gsm8k_avg_pred_len',
                 'gsm8k_num_eval_samples',
+                'math_acc',
+                'math_rougeL',
+                'math_invalid_rate',
+                'math_avg_pred_len',
+                'math_num_eval_samples',
             ]:
                 if key in final_eval:
                     value = final_eval[key]
-                    if key == 'gsm8k_num_eval_samples':
+                    if key in ['gsm8k_num_eval_samples', 'math_num_eval_samples']:
                         wandb_payload[f'final/{key}'] = int(value)
                     else:
                         wandb_payload[f'final/{key}'] = float(value)

@@ -139,6 +139,89 @@ def get_loaders(args, only_eval=False):
             collate_fn=data_collator,
         )
 
+    elif args.dataset == 'math':
+        from utils_data.math_loader import load_math_local_splits
+        from utils_data.natural_instruction_loader import LLMDataset, LLMDataCollator
+
+        train_examples, dev_examples, test_examples = load_math_local_splits(
+            dataset_path=getattr(args, 'dataset_path', './data/math'),
+            seed=int(getattr(args, 'seed', 42)),
+            dev_size=500,
+        )
+        if (not only_eval) and len(dev_examples) == 0:
+            raise RuntimeError(
+                '[math] dev split is empty for round evaluation; please provide a larger train split'
+            )
+
+        train_data = [(item['instruction'], item['input'], item['output']) for item in train_examples]
+        eval_examples = test_examples if only_eval else dev_examples
+        eval_data = [(item['instruction'], item['input'], item['output']) for item in eval_examples]
+        eval_metadata = [
+            {
+                'meta_ref_solution': item['output'],
+                'meta_final_answer': item['final_answer'],
+                'meta_subject': item['subject'],
+                'meta_level': int(item['level']),
+            }
+            for item in eval_examples
+        ]
+
+        label_keys = [(str(item['subject']), int(item['level'])) for item in train_examples]
+        unique_keys = sorted(set(label_keys))
+        key_to_label = {key: idx for idx, key in enumerate(unique_keys)}
+        train_labels = np.array([key_to_label[key] for key in label_keys], dtype=np.int64)
+        num_classes = max(len(unique_keys), 1)
+
+        data_collator = LLMDataCollator(tokenizer=tokenizer)
+        list_train_loader = []
+        if not only_eval:
+            train_dataset = LLMDataset(
+                train_data,
+                tokenizer=tokenizer,
+                use_prompts=args.use_prompts,
+                generation=False,
+            )
+            noniid = args.iid
+            if 'dir' in noniid:
+                split_dic = partition_idx_labeldir(
+                    train_labels,
+                    n_parties=args.num_clients,
+                    alpha=float(noniid[3:]),
+                    num_classes=num_classes,
+                )
+                split_trainsets = []
+                for _, sample_indices in split_dic.items():
+                    split_trainsets.append(Subset(train_dataset, indices=sample_indices))
+            else:
+                n_parts = [int(len(train_dataset) / args.num_clients) for _ in range(args.num_clients - 1)]
+                n_parts.append(len(train_dataset) - sum(n_parts))
+                split_trainsets = torch.utils.data.dataset.random_split(train_dataset, n_parts)
+
+            list_train_loader = [
+                DataLoader(
+                    subset,
+                    shuffle=True,
+                    batch_size=args.batch_size,
+                    collate_fn=data_collator,
+                )
+                for subset in split_trainsets
+            ]
+
+        eval_generation = bool(args.eval_metric != 'loss')
+        eval_dataset = LLMDataset(
+            eval_data,
+            tokenizer=tokenizer,
+            use_prompts=args.use_prompts,
+            generation=eval_generation,
+            metadata_list=(eval_metadata if eval_generation else None),
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            shuffle=False,
+            batch_size=args.batch_size,
+            collate_fn=data_collator,
+        )
+
     elif args.dataset in ['instruct']:
         from utils_data.natural_instruction_loader import get_instruction_dataset
         list_train_loader, eval_loader = get_instruction_dataset(args, tokenizer, only_eval=only_eval)

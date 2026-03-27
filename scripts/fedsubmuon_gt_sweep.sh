@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Sweep 4 seeds for FedIT on Dolly.
-seeds=(495 496 497)
+seeds=(495)
 
 for seed in "${seeds[@]}"; do
   run_name="fedsubmuon_gt_dolly_Llama1B_seed${seed}"
@@ -29,7 +29,7 @@ for seed in "${seeds[@]}"; do
     --early_stop_patience 5 \
     --stop_F 20 \
     --seed_refresh_F 5 \
-    --gt_probe_batches 1 \
+    --gt_probe_batches 4 \
     --gt_sub_lr 0.05 \
     --lora_target_modules "q_proj,v_proj" \
     "$@"

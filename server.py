@@ -280,7 +280,7 @@ class Server(object):
             if self.algo == 'fedsubmuon_gt':
                 self.u_global = {}
                 self.v_basis_global = {}
-                basis_svd_init = bool(getattr(self.args, 'basis_svd_init', False))
+                basis_init_mode = self._resolve_gt_basis_init_mode()
                 svd_init_logs = []
                 for layer_name, (out_dim, in_dim) in self.submuon_layer_dims.items():
                     module = name_to_module[layer_name]
@@ -290,21 +290,23 @@ class Server(object):
                         seed=int(self.seeds[layer_name]),
                         out_dim=int(out_dim),
                         in_dim=int(in_dim),
+                        basis_init_mode=basis_init_mode,
                     )
                     self.u_global[layer_name] = U.cpu().contiguous()
                     self.v_basis_global[layer_name] = V.cpu().contiguous()
                     if isinstance(svd_meta, dict):
                         svd_init_logs.append(svd_meta)
-                if basis_svd_init and bool(getattr(self.args, 'log', False)):
+                if basis_init_mode != 'random' and bool(getattr(self.args, 'log', False)):
                     max_u_orth = float(np.max([item['u_orth_err'] for item in svd_init_logs])) if len(svd_init_logs) > 0 else 0.0
                     max_v_orth = float(np.max([item['v_orth_err'] for item in svd_init_logs])) if len(svd_init_logs) > 0 else 0.0
                     print(
-                        f'[fedsubmuon_gt][init] basis_svd_init=True layers={len(svd_init_logs)} '
+                        f'[fedsubmuon_gt][init] basis_init_mode={basis_init_mode} layers={len(svd_init_logs)} '
                         f'max_u_orth_err={max_u_orth:.6e} max_v_orth_err={max_v_orth:.6e}'
                     )
                     for item in svd_init_logs[:3]:
                         print(
                             f'[fedsubmuon_gt][init] layer={item["layer"]} '
+                            f'mode={item.get("basis_init_mode", basis_init_mode)} '
                             f'rank={item["rank"]} sigma_max={item["sigma_max"]:.6e} sigma_min={item["sigma_min"]:.6e}'
                         )
 
@@ -872,19 +874,54 @@ class Server(object):
         q_mat, _ = torch.linalg.qr(mat.float(), mode='reduced')
         return q_mat.contiguous()
 
-    def _initialize_submuon_gt_basis(self, layer_name, module, seed, out_dim, in_dim):
-        rank = int(self.args.rank_r)
-        if not bool(getattr(self.args, 'basis_svd_init', False)):
-            U, V = make_uv(
-                seed=int(seed),
-                out_dim=int(out_dim),
-                in_dim=int(in_dim),
-                r=rank,
-                device='cpu',
-                dtype=torch.float32,
-            )
-            return U.cpu().contiguous(), V.cpu().contiguous(), None
+    def _resolve_gt_basis_init_mode(self):
+        mode = str(getattr(self.args, 'basis_init_mode', 'random')).lower()
+        valid_modes = {'random', 'svd_left', 'svd_right', 'svd_both'}
+        if mode not in valid_modes:
+            raise RuntimeError(f'[fedsubmuon_gt] invalid basis_init_mode={mode}')
+        return mode
 
+    def _resolve_gt_update_mode(self):
+        mode = str(getattr(self.args, 'gt_update_mode', 'both')).lower()
+        valid_modes = {'both', 'left', 'right', 'alternate_lr', 'alternate_rl'}
+        if mode not in valid_modes:
+            raise RuntimeError(f'[fedsubmuon_gt] invalid gt_update_mode={mode}')
+        return mode
+
+    def _compute_gt_refresh_index(self, cur_round):
+        refresh_f = int(getattr(self.args, 'seed_refresh_F', 0))
+        if refresh_f <= 0:
+            return 0
+        effective_round = int(max(cur_round, 0))
+        stop_f = int(getattr(self.args, 'stop_F', -1))
+        if stop_f > 0:
+            effective_round = min(effective_round, stop_f - 1)
+        if effective_round <= 0:
+            return 0
+        return int(effective_round // refresh_f)
+
+    def _resolve_gt_refresh_side(self, cur_round):
+        mode = self._resolve_gt_update_mode()
+        refresh_idx = int(self._compute_gt_refresh_index(cur_round))
+        if mode == 'both':
+            return True, True, 'both', refresh_idx, mode
+        if mode == 'left':
+            return True, False, 'left', refresh_idx, mode
+        if mode == 'right':
+            return False, True, 'right', refresh_idx, mode
+        if refresh_idx <= 0:
+            refresh_idx = 1
+        if mode == 'alternate_lr':
+            if (refresh_idx % 2) == 1:
+                return True, False, 'left', refresh_idx, mode
+            return False, True, 'right', refresh_idx, mode
+        if mode == 'alternate_rl':
+            if (refresh_idx % 2) == 1:
+                return False, True, 'right', refresh_idx, mode
+            return True, False, 'left', refresh_idx, mode
+        raise RuntimeError(f'[fedsubmuon_gt] unsupported gt_update_mode={mode}')
+
+    def _compute_submuon_gt_svd_basis(self, layer_name, module, rank):
         if module is None or (not hasattr(module, 'weight')):
             raise RuntimeError(f'[fedsubmuon_gt] SVD init cannot find target weight for layer={layer_name}')
         weight = module.weight.detach().to(device='cpu', dtype=torch.float32)
@@ -920,6 +957,38 @@ class Server(object):
         }
         return U.cpu().contiguous(), V.cpu().contiguous(), meta
 
+    def _initialize_submuon_gt_basis(self, layer_name, module, seed, out_dim, in_dim, basis_init_mode=None):
+        rank = int(self.args.rank_r)
+        mode = str(basis_init_mode or self._resolve_gt_basis_init_mode()).lower()
+        U_rand, V_rand = make_uv(
+            seed=int(seed),
+            out_dim=int(out_dim),
+            in_dim=int(in_dim),
+            r=rank,
+            device='cpu',
+            dtype=torch.float32,
+        )
+        if mode == 'random':
+            return U_rand.cpu().contiguous(), V_rand.cpu().contiguous(), None
+
+        U_svd, V_svd, svd_meta = self._compute_submuon_gt_svd_basis(
+            layer_name=layer_name,
+            module=module,
+            rank=rank,
+        )
+        if mode == 'svd_both':
+            U_out, V_out = U_svd, V_svd
+        elif mode == 'svd_left':
+            U_out, V_out = U_svd, V_rand
+        elif mode == 'svd_right':
+            U_out, V_out = U_rand, V_svd
+        else:
+            raise RuntimeError(f'[fedsubmuon_gt] invalid basis_init_mode={mode}')
+
+        if isinstance(svd_meta, dict):
+            svd_meta['basis_init_mode'] = str(mode)
+        return U_out.cpu().contiguous(), V_out.cpu().contiguous(), svd_meta
+
     def _merge_layer_residual_to_backbone(self, layer_name, residual):
         module = dict(self.model.named_modules()).get(layer_name, None)
         if module is None or (not hasattr(module, 'weight')):
@@ -938,7 +1007,11 @@ class Server(object):
         if len(client_payloads) == 0:
             return {
                 'gt_refresh_round': int(bool(is_refresh_round)),
+                'gt_refresh_index': 0.0,
                 'gt_topk': int(gt_topk),
+                'gt_refresh_side': 0.0,
+                'gt_update_mode_code': 0.0,
+                'gt_basis_init_mode_code': 0.0,
                 'gt_u_res_norm': 0.0,
                 'gt_v_res_norm': 0.0,
                 'gt_u_step_norm': 0.0,
@@ -963,7 +1036,11 @@ class Server(object):
 
         metrics = {
             'gt_refresh_round': int(bool(is_refresh_round)),
+            'gt_refresh_index': 0.0,
             'gt_topk': int(gt_topk),
+            'gt_refresh_side': 0.0,
+            'gt_update_mode_code': 0.0,
+            'gt_basis_init_mode_code': 0.0,
             'gt_u_res_norm': 0.0,
             'gt_v_res_norm': 0.0,
             'gt_u_step_norm': 0.0,
@@ -979,6 +1056,15 @@ class Server(object):
         if not bool(is_refresh_round):
             self.x_global = new_x
             return metrics
+
+        side_to_code = {'none': 0.0, 'left': 1.0, 'right': 2.0, 'both': 3.0}
+        mode_to_code = {'both': 0.0, 'left': 1.0, 'right': 2.0, 'alternate_lr': 3.0, 'alternate_rl': 4.0}
+        basis_init_to_code = {'random': 0.0, 'svd_left': 1.0, 'svd_right': 2.0, 'svd_both': 3.0}
+        update_u, update_v, refresh_side, refresh_idx, update_mode = self._resolve_gt_refresh_side(cur_round)
+        metrics['gt_refresh_index'] = float(refresh_idx)
+        metrics['gt_refresh_side'] = float(side_to_code.get(refresh_side, 0.0))
+        metrics['gt_update_mode_code'] = float(mode_to_code.get(update_mode, 0.0))
+        metrics['gt_basis_init_mode_code'] = float(basis_init_to_code.get(self._resolve_gt_basis_init_mode(), 0.0))
 
         h_u_bar = {name: torch.zeros_like(self.u_global[name], dtype=torch.float32) for name in self.u_global.keys()}
         h_v_bar = {name: torch.zeros_like(self.v_basis_global[name], dtype=torch.float32) for name in self.v_basis_global.keys()}
@@ -1033,48 +1119,60 @@ class Server(object):
             B_u = U_old.t() @ H_u
             R_u = H_u - U_old @ B_u
             u_step = R_u @ B_u.t()
-            u_scores = torch.linalg.norm(u_step, dim=0)
-            if gt_topk > 0:
-                k_eff_u = min(int(gt_topk), int(u_step.shape[1]))
-                if k_eff_u > 0:
-                    idx_u = torch.topk(u_scores, k=k_eff_u, largest=True).indices
-                    u_step_applied = torch.zeros_like(u_step)
-                    u_step_applied[:, idx_u] = u_step[:, idx_u]
-                    metrics['gt_u_topk_score_sum'] += float(u_scores[idx_u].sum().item())
+            if update_u:
+                u_scores = torch.linalg.norm(u_step, dim=0)
+                if gt_topk > 0:
+                    k_eff_u = min(int(gt_topk), int(u_step.shape[1]))
+                    if k_eff_u > 0:
+                        idx_u = torch.topk(u_scores, k=k_eff_u, largest=True).indices
+                        u_step_applied = torch.zeros_like(u_step)
+                        u_step_applied[:, idx_u] = u_step[:, idx_u]
+                        metrics['gt_u_topk_score_sum'] += float(u_scores[idx_u].sum().item())
+                    else:
+                        idx_u = None
+                        u_step_applied = torch.zeros_like(u_step)
                 else:
+                    k_eff_u = int(u_step.shape[1])
                     idx_u = None
-                    u_step_applied = torch.zeros_like(u_step)
+                    u_step_applied = u_step
+                    metrics['gt_u_topk_score_sum'] += float(u_scores.sum().item())
+                U_new_raw = U_old + gt_sub_lr * u_step_applied
+                U_new = self._orthonormalize_columns(U_new_raw)
             else:
-                k_eff_u = int(u_step.shape[1])
+                k_eff_u = 0
                 idx_u = None
-                u_step_applied = u_step
-                metrics['gt_u_topk_score_sum'] += float(u_scores.sum().item())
+                u_step_applied = torch.zeros_like(u_step)
+                U_new = U_old.clone()
             metrics['gt_u_topk_active'] += float(k_eff_u)
-            U_new_raw = U_old + gt_sub_lr * u_step_applied
-            U_new = self._orthonormalize_columns(U_new_raw)
 
             B_v = V_old.t() @ H_v
             R_v = H_v - V_old @ B_v
             v_step = R_v @ B_v.t()
-            v_scores = torch.linalg.norm(v_step, dim=0)
-            if gt_topk > 0:
-                k_eff_v = min(int(gt_topk), int(v_step.shape[1]))
-                if k_eff_v > 0:
-                    idx_v = torch.topk(v_scores, k=k_eff_v, largest=True).indices
-                    v_step_applied = torch.zeros_like(v_step)
-                    v_step_applied[:, idx_v] = v_step[:, idx_v]
-                    metrics['gt_v_topk_score_sum'] += float(v_scores[idx_v].sum().item())
+            if update_v:
+                v_scores = torch.linalg.norm(v_step, dim=0)
+                if gt_topk > 0:
+                    k_eff_v = min(int(gt_topk), int(v_step.shape[1]))
+                    if k_eff_v > 0:
+                        idx_v = torch.topk(v_scores, k=k_eff_v, largest=True).indices
+                        v_step_applied = torch.zeros_like(v_step)
+                        v_step_applied[:, idx_v] = v_step[:, idx_v]
+                        metrics['gt_v_topk_score_sum'] += float(v_scores[idx_v].sum().item())
+                    else:
+                        idx_v = None
+                        v_step_applied = torch.zeros_like(v_step)
                 else:
+                    k_eff_v = int(v_step.shape[1])
                     idx_v = None
-                    v_step_applied = torch.zeros_like(v_step)
+                    v_step_applied = v_step
+                    metrics['gt_v_topk_score_sum'] += float(v_scores.sum().item())
+                V_new_raw = V_old + gt_sub_lr * v_step_applied
+                V_new = self._orthonormalize_columns(V_new_raw)
             else:
-                k_eff_v = int(v_step.shape[1])
+                k_eff_v = 0
                 idx_v = None
-                v_step_applied = v_step
-                metrics['gt_v_topk_score_sum'] += float(v_scores.sum().item())
+                v_step_applied = torch.zeros_like(v_step)
+                V_new = V_old.clone()
             metrics['gt_v_topk_active'] += float(k_eff_v)
-            V_new_raw = V_old + gt_sub_lr * v_step_applied
-            V_new = self._orthonormalize_columns(V_new_raw)
 
             delta_old = U_old @ X_agg @ V_old.t()
             layer_shape = self.submuon_layer_dims.get(layer_name, (int(U_old.shape[0]), int(V_old.shape[0])))
@@ -1133,6 +1231,8 @@ class Server(object):
             new_seed = self.seeds.get(sample_layer, None) if sample_layer != 'n/a' else None
             print(
                 f'[fedsubmuon_gt][server] refresh_round={int(cur_round)} old_seed={old_seed} new_seed={new_seed} '
+                f'basis_init_mode={self._resolve_gt_basis_init_mode()} '
+                f'gt_update_mode={update_mode} refresh_index={int(refresh_idx)} refresh_side={refresh_side} '
                 f'gt_topk={int(gt_topk)} '
                 f'u_res={metrics["gt_u_res_norm"]:.6e} v_res={metrics["gt_v_res_norm"]:.6e} '
                 f'u_topk_active={int(metrics["gt_u_topk_active"])} '
@@ -1736,7 +1836,8 @@ class Server(object):
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
                     'gt_topk': int(getattr(self.args, 'gt_topk', 0)),
                     'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),
-                    'basis_svd_init': bool(getattr(self.args, 'basis_svd_init', False)),
+                    'basis_init_mode': str(getattr(self.args, 'basis_init_mode', 'random')),
+                    'gt_update_mode': str(getattr(self.args, 'gt_update_mode', 'both')),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },

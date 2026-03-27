@@ -180,7 +180,20 @@ if __name__ == '__main__':
     parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_topk', type=int, default=0, help='if >0, only top-k basis columns are updated on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_merge_residual', default=False, action='store_true', help='if set, merge projection residual into server backbone after fedsubmuon_gt refresh')
-    parser.add_argument('--basis_svd_init', default=False, action='store_true', help='if set, initialize fedsubmuon_gt persistent U/V bases from truncated SVD of pretrained backbone weights')
+    parser.add_argument(
+        '--basis_init_mode',
+        type=lambda x: str(x).lower(),
+        default='random',
+        choices=['random', 'svd_left', 'svd_right', 'svd_both'],
+        help='initialization mode of persistent U/V bases for fedsubmuon_gt',
+    )
+    parser.add_argument(
+        '--gt_update_mode',
+        type=lambda x: str(x).lower(),
+        default='both',
+        choices=['both', 'left', 'right', 'alternate_lr', 'alternate_rl'],
+        help='refresh-side update mode for fedsubmuon_gt',
+    )
     parser.add_argument(
         '--aggregate_muon_state',
         default=False,
@@ -307,8 +320,13 @@ if __name__ == '__main__':
     if args.adaptive_rebase and args.algo != 'fedsubmuon':
         print(f'[warn] --adaptive_rebase is only used by fedsubmuon, but current algo={args.algo}; ignore adaptive rebase')
         adaptive_rebase_active = False
-    if bool(getattr(args, 'basis_svd_init', False)) and args.algo != 'fedsubmuon_gt':
-        print(f'[warn] --basis_svd_init is only used by fedsubmuon_gt, but current algo={args.algo}; ignore basis_svd_init')
+    if str(getattr(args, 'basis_init_mode', 'random')).lower() != 'random' and args.algo != 'fedsubmuon_gt':
+        print(
+            f'[warn] --basis_init_mode is only used by fedsubmuon_gt, '
+            f'but current algo={args.algo}; ignore basis_init_mode'
+        )
+    if str(getattr(args, 'gt_update_mode', 'both')).lower() != 'both' and args.algo != 'fedsubmuon_gt':
+        print(f'[warn] --gt_update_mode is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_update_mode')
     if adaptive_rebase_active and args.round_eval_false:
         print('[warn] --adaptive_rebase requires round evaluation; disable adaptive rebase because --round_eval_false is set')
         adaptive_rebase_active = False
@@ -693,7 +711,11 @@ if __name__ == '__main__':
             if isinstance(gt_refresh_metrics, dict):
                 for key in [
                     'gt_refresh_round',
+                    'gt_refresh_index',
                     'gt_topk',
+                    'gt_refresh_side',
+                    'gt_update_mode_code',
+                    'gt_basis_init_mode_code',
                     'gt_u_res_norm',
                     'gt_v_res_norm',
                     'gt_u_step_norm',
@@ -1255,7 +1277,8 @@ if __name__ == '__main__':
             'gt_sub_lr': args.gt_sub_lr,
             'gt_topk': args.gt_topk,
             'gt_merge_residual': args.gt_merge_residual,
-            'basis_svd_init': bool(getattr(args, 'basis_svd_init', False)),
+            'basis_init_mode': str(getattr(args, 'basis_init_mode', 'random')),
+            'gt_update_mode': str(getattr(args, 'gt_update_mode', 'both')),
             'weight_decay': args.weight_decay,
             'optimizer': args.optimizer,
             'model_dtype': args.model_dtype,

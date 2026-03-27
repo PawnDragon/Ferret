@@ -351,6 +351,7 @@ def build_parser():
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument("--ns_steps", type=int, default=5)
     parser.add_argument("--gt_topk", type=int, default=0)
+    parser.add_argument("--basis_svd_init", default=False, action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--n_accum", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=-100.0)
@@ -487,6 +488,8 @@ def run_evaluate(args, eval_metric_explicit=False):
     if isinstance(common_hparams, dict) and len(common_hparams) > 0:
         if "lora_target_modules" in common_hparams:
             args.lora_target_modules = common_hparams["lora_target_modules"]
+        if "basis_svd_init" in common_hparams:
+            args.basis_svd_init = bool(common_hparams["basis_svd_init"])
         if "rank_left" in common_hparams:
             args.rank_left = int(common_hparams["rank_left"])
         elif "rank_r" in common_hparams:

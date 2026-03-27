@@ -280,17 +280,33 @@ class Server(object):
             if self.algo == 'fedsubmuon_gt':
                 self.u_global = {}
                 self.v_basis_global = {}
+                basis_svd_init = bool(getattr(self.args, 'basis_svd_init', False))
+                svd_init_logs = []
                 for layer_name, (out_dim, in_dim) in self.submuon_layer_dims.items():
-                    U, V = make_uv(
-                        seed=self.seeds[layer_name],
+                    module = name_to_module[layer_name]
+                    U, V, svd_meta = self._initialize_submuon_gt_basis(
+                        layer_name=layer_name,
+                        module=module,
+                        seed=int(self.seeds[layer_name]),
                         out_dim=int(out_dim),
                         in_dim=int(in_dim),
-                        r=int(self.args.rank_r),
-                        device='cpu',
-                        dtype=torch.float32,
                     )
                     self.u_global[layer_name] = U.cpu().contiguous()
                     self.v_basis_global[layer_name] = V.cpu().contiguous()
+                    if isinstance(svd_meta, dict):
+                        svd_init_logs.append(svd_meta)
+                if basis_svd_init and bool(getattr(self.args, 'log', False)):
+                    max_u_orth = float(np.max([item['u_orth_err'] for item in svd_init_logs])) if len(svd_init_logs) > 0 else 0.0
+                    max_v_orth = float(np.max([item['v_orth_err'] for item in svd_init_logs])) if len(svd_init_logs) > 0 else 0.0
+                    print(
+                        f'[fedsubmuon_gt][init] basis_svd_init=True layers={len(svd_init_logs)} '
+                        f'max_u_orth_err={max_u_orth:.6e} max_v_orth_err={max_v_orth:.6e}'
+                    )
+                    for item in svd_init_logs[:3]:
+                        print(
+                            f'[fedsubmuon_gt][init] layer={item["layer"]} '
+                            f'rank={item["rank"]} sigma_max={item["sigma_max"]:.6e} sigma_min={item["sigma_min"]:.6e}'
+                        )
 
         if self.algo == 'fedit':
             init_model = build_lora_model(deepcopy(self.model), self.args)
@@ -855,6 +871,54 @@ class Server(object):
             raise RuntimeError('[fedsubmuon_gt] orthonormalize expects a 2D tensor')
         q_mat, _ = torch.linalg.qr(mat.float(), mode='reduced')
         return q_mat.contiguous()
+
+    def _initialize_submuon_gt_basis(self, layer_name, module, seed, out_dim, in_dim):
+        rank = int(self.args.rank_r)
+        if not bool(getattr(self.args, 'basis_svd_init', False)):
+            U, V = make_uv(
+                seed=int(seed),
+                out_dim=int(out_dim),
+                in_dim=int(in_dim),
+                r=rank,
+                device='cpu',
+                dtype=torch.float32,
+            )
+            return U.cpu().contiguous(), V.cpu().contiguous(), None
+
+        if module is None or (not hasattr(module, 'weight')):
+            raise RuntimeError(f'[fedsubmuon_gt] SVD init cannot find target weight for layer={layer_name}')
+        weight = module.weight.detach().to(device='cpu', dtype=torch.float32)
+        if weight.ndim != 2:
+            raise RuntimeError(
+                f'[fedsubmuon_gt] SVD init expects a 2D weight at {layer_name}, got shape={tuple(weight.shape)}'
+            )
+        rank_eff = int(min(rank, int(weight.shape[0]), int(weight.shape[1])))
+        if rank_eff <= 0:
+            raise RuntimeError(
+                f'[fedsubmuon_gt] invalid SVD init rank for {layer_name}: '
+                f'rank_r={rank}, weight_shape={tuple(weight.shape)}'
+            )
+        U_full, S_full, Vh_full = torch.linalg.svd(weight, full_matrices=False)
+        U = U_full[:, :rank_eff].contiguous()
+        V = Vh_full[:rank_eff, :].t().contiguous()
+        if rank_eff != rank:
+            raise RuntimeError(
+                f'[fedsubmuon_gt] SVD init rank mismatch at {layer_name}: '
+                f'rank_r={rank}, rank_eff={rank_eff}. Please reduce --rank_r for this model.'
+            )
+        eye_u = torch.eye(rank_eff, dtype=torch.float32)
+        eye_v = torch.eye(rank_eff, dtype=torch.float32)
+        u_orth_err = torch.linalg.norm(U.t() @ U - eye_u)
+        v_orth_err = torch.linalg.norm(V.t() @ V - eye_v)
+        meta = {
+            'layer': layer_name,
+            'rank': int(rank_eff),
+            'sigma_max': float(S_full[0].item()) if int(S_full.numel()) > 0 else 0.0,
+            'sigma_min': float(S_full[rank_eff - 1].item()) if int(S_full.numel()) >= rank_eff else 0.0,
+            'u_orth_err': float(u_orth_err.item()),
+            'v_orth_err': float(v_orth_err.item()),
+        }
+        return U.cpu().contiguous(), V.cpu().contiguous(), meta
 
     def _merge_layer_residual_to_backbone(self, layer_name, residual):
         module = dict(self.model.named_modules()).get(layer_name, None)
@@ -1672,6 +1736,7 @@ class Server(object):
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
                     'gt_topk': int(getattr(self.args, 'gt_topk', 0)),
                     'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),
+                    'basis_svd_init': bool(getattr(self.args, 'basis_svd_init', False)),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
                 },
             },

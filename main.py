@@ -180,6 +180,8 @@ if __name__ == '__main__':
     parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_topk', type=int, default=0, help='if >0, only top-k basis columns are updated on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_merge_residual', default=False, action='store_true', help='if set, merge projection residual into server backbone after fedsubmuon_gt refresh')
+    parser.add_argument('--gt_rank1_approx', default=False, action='store_true', help='if set, use rank-1 approximation of basis refresh tangents on fedsubmuon_gt refresh rounds')
+    parser.add_argument('--gt_target_rel_step', type=float, default=0.0, help='if >0, use relative-step control for fedsubmuon_gt basis refresh magnitude')
     parser.add_argument(
         '--basis_init_mode',
         type=lambda x: str(x).lower(),
@@ -327,6 +329,10 @@ if __name__ == '__main__':
         )
     if str(getattr(args, 'gt_update_mode', 'both')).lower() != 'both' and args.algo != 'fedsubmuon_gt':
         print(f'[warn] --gt_update_mode is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_update_mode')
+    if bool(getattr(args, 'gt_rank1_approx', False)) and args.algo != 'fedsubmuon_gt':
+        print(f'[warn] --gt_rank1_approx is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_rank1_approx')
+    if float(getattr(args, 'gt_target_rel_step', 0.0)) > 0.0 and args.algo != 'fedsubmuon_gt':
+        print(f'[warn] --gt_target_rel_step is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_target_rel_step')
     if adaptive_rebase_active and args.round_eval_false:
         print('[warn] --adaptive_rebase requires round evaluation; disable adaptive rebase because --round_eval_false is set')
         adaptive_rebase_active = False
@@ -716,6 +722,15 @@ if __name__ == '__main__':
                     'gt_refresh_side',
                     'gt_update_mode_code',
                     'gt_basis_init_mode_code',
+                    'gt_rank1_approx',
+                    'gt_target_rel_step',
+                    'gt_rel_step_active',
+                    'gt_u_tangent_norm',
+                    'gt_v_tangent_norm',
+                    'gt_u_sigma_top',
+                    'gt_v_sigma_top',
+                    'gt_u_effective_step',
+                    'gt_v_effective_step',
                     'gt_u_res_norm',
                     'gt_v_res_norm',
                     'gt_u_step_norm',
@@ -1277,6 +1292,8 @@ if __name__ == '__main__':
             'gt_sub_lr': args.gt_sub_lr,
             'gt_topk': args.gt_topk,
             'gt_merge_residual': args.gt_merge_residual,
+            'gt_rank1_approx': bool(getattr(args, 'gt_rank1_approx', False)),
+            'gt_target_rel_step': float(getattr(args, 'gt_target_rel_step', 0.0)),
             'basis_init_mode': str(getattr(args, 'basis_init_mode', 'random')),
             'gt_update_mode': str(getattr(args, 'gt_update_mode', 'both')),
             'weight_decay': args.weight_decay,

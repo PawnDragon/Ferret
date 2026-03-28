@@ -874,6 +874,37 @@ class Server(object):
         q_mat, _ = torch.linalg.qr(mat.float(), mode='reduced')
         return q_mat.contiguous()
 
+    def _rank1_approx_tangent(self, tangent):
+        if (not isinstance(tangent, torch.Tensor)) or tangent.ndim != 2:
+            raise RuntimeError('[fedsubmuon_gt] rank-1 approximation expects a 2D tensor')
+        tangent_f = tangent.float()
+        if tangent_f.numel() == 0:
+            return torch.zeros_like(tangent_f), 0.0
+        tangent_norm = float(torch.linalg.norm(tangent_f).item())
+        if tangent_norm <= 0.0 or (not np.isfinite(tangent_norm)):
+            return torch.zeros_like(tangent_f), 0.0
+        U_svd, S_svd, Vh_svd = torch.linalg.svd(tangent_f, full_matrices=False)
+        if int(S_svd.numel()) == 0:
+            return torch.zeros_like(tangent_f), 0.0
+        sigma_top = float(S_svd[0].item())
+        if (not np.isfinite(sigma_top)) or sigma_top <= 0.0:
+            return torch.zeros_like(tangent_f), 0.0
+        rank1 = (S_svd[0] * (U_svd[:, :1] @ Vh_svd[:1, :])).contiguous()
+        return rank1, sigma_top
+
+    def _resolve_gt_effective_step(self, basis, tangent_used, sigma_top, rank1_enabled, gt_sub_lr, gt_target_rel_step, eps=1e-8):
+        tau_rel = float(gt_target_rel_step)
+        if tau_rel <= 0.0:
+            return float(gt_sub_lr)
+        basis_norm = float(torch.linalg.norm(basis.float()).item())
+        if rank1_enabled:
+            denom = float(sigma_top)
+        else:
+            denom = float(torch.linalg.norm(tangent_used.float()).item())
+        if (not np.isfinite(denom)) or denom <= float(eps):
+            return 0.0
+        return float(tau_rel * basis_norm / (denom + float(eps)))
+
     def _resolve_gt_basis_init_mode(self):
         mode = str(getattr(self.args, 'basis_init_mode', 'random')).lower()
         valid_modes = {'random', 'svd_left', 'svd_right', 'svd_both'}
@@ -1002,6 +1033,8 @@ class Server(object):
 
     def aggregate_submuon_gt(self, client_payloads, selected_client_list, cur_round, is_refresh_round):
         gt_topk = int(getattr(self.args, 'gt_topk', 0))
+        gt_rank1_approx = bool(getattr(self.args, 'gt_rank1_approx', False))
+        gt_target_rel_step = float(getattr(self.args, 'gt_target_rel_step', 0.0))
         if self.algo != 'fedsubmuon_gt':
             return {}
         if len(client_payloads) == 0:
@@ -1012,6 +1045,15 @@ class Server(object):
                 'gt_refresh_side': 0.0,
                 'gt_update_mode_code': 0.0,
                 'gt_basis_init_mode_code': 0.0,
+                'gt_rank1_approx': float(int(gt_rank1_approx)),
+                'gt_target_rel_step': float(gt_target_rel_step),
+                'gt_rel_step_active': float(int(gt_target_rel_step > 0.0)),
+                'gt_u_tangent_norm': 0.0,
+                'gt_v_tangent_norm': 0.0,
+                'gt_u_sigma_top': 0.0,
+                'gt_v_sigma_top': 0.0,
+                'gt_u_effective_step': 0.0,
+                'gt_v_effective_step': 0.0,
                 'gt_u_res_norm': 0.0,
                 'gt_v_res_norm': 0.0,
                 'gt_u_step_norm': 0.0,
@@ -1041,6 +1083,15 @@ class Server(object):
             'gt_refresh_side': 0.0,
             'gt_update_mode_code': 0.0,
             'gt_basis_init_mode_code': 0.0,
+            'gt_rank1_approx': float(int(gt_rank1_approx)),
+            'gt_target_rel_step': float(gt_target_rel_step),
+            'gt_rel_step_active': float(int(gt_target_rel_step > 0.0)),
+            'gt_u_tangent_norm': 0.0,
+            'gt_v_tangent_norm': 0.0,
+            'gt_u_sigma_top': 0.0,
+            'gt_v_sigma_top': 0.0,
+            'gt_u_effective_step': 0.0,
+            'gt_v_effective_step': 0.0,
             'gt_u_res_norm': 0.0,
             'gt_v_res_norm': 0.0,
             'gt_u_step_norm': 0.0,
@@ -1136,12 +1187,30 @@ class Server(object):
                     idx_u = None
                     u_step_applied = u_step
                     metrics['gt_u_topk_score_sum'] += float(u_scores.sum().item())
-                U_new_raw = U_old + gt_sub_lr * u_step_applied
+
+                if gt_rank1_approx:
+                    u_tangent_use, u_sigma_top = self._rank1_approx_tangent(u_step_applied)
+                else:
+                    u_tangent_use = u_step_applied
+                    u_sigma_top = 0.0
+                eta_u = self._resolve_gt_effective_step(
+                    basis=U_old,
+                    tangent_used=u_tangent_use,
+                    sigma_top=u_sigma_top,
+                    rank1_enabled=gt_rank1_approx,
+                    gt_sub_lr=gt_sub_lr,
+                    gt_target_rel_step=gt_target_rel_step,
+                )
+
+                U_new_raw = U_old + eta_u * u_tangent_use
                 U_new = self._orthonormalize_columns(U_new_raw)
             else:
                 k_eff_u = 0
                 idx_u = None
                 u_step_applied = torch.zeros_like(u_step)
+                u_tangent_use = torch.zeros_like(u_step)
+                u_sigma_top = 0.0
+                eta_u = 0.0
                 U_new = U_old.clone()
             metrics['gt_u_topk_active'] += float(k_eff_u)
 
@@ -1165,12 +1234,30 @@ class Server(object):
                     idx_v = None
                     v_step_applied = v_step
                     metrics['gt_v_topk_score_sum'] += float(v_scores.sum().item())
-                V_new_raw = V_old + gt_sub_lr * v_step_applied
+
+                if gt_rank1_approx:
+                    v_tangent_use, v_sigma_top = self._rank1_approx_tangent(v_step_applied)
+                else:
+                    v_tangent_use = v_step_applied
+                    v_sigma_top = 0.0
+                eta_v = self._resolve_gt_effective_step(
+                    basis=V_old,
+                    tangent_used=v_tangent_use,
+                    sigma_top=v_sigma_top,
+                    rank1_enabled=gt_rank1_approx,
+                    gt_sub_lr=gt_sub_lr,
+                    gt_target_rel_step=gt_target_rel_step,
+                )
+
+                V_new_raw = V_old + eta_v * v_tangent_use
                 V_new = self._orthonormalize_columns(V_new_raw)
             else:
                 k_eff_v = 0
                 idx_v = None
                 v_step_applied = torch.zeros_like(v_step)
+                v_tangent_use = torch.zeros_like(v_step)
+                v_sigma_top = 0.0
+                eta_v = 0.0
                 V_new = V_old.clone()
             metrics['gt_v_topk_active'] += float(k_eff_v)
 
@@ -1198,8 +1285,14 @@ class Server(object):
 
             metrics['gt_u_res_norm'] += float(torch.linalg.norm(R_u).item())
             metrics['gt_v_res_norm'] += float(torch.linalg.norm(R_v).item())
-            metrics['gt_u_step_norm'] += float(torch.linalg.norm(u_step_applied).item())
-            metrics['gt_v_step_norm'] += float(torch.linalg.norm(v_step_applied).item())
+            metrics['gt_u_step_norm'] += float(torch.linalg.norm(u_tangent_use).item())
+            metrics['gt_v_step_norm'] += float(torch.linalg.norm(v_tangent_use).item())
+            metrics['gt_u_tangent_norm'] += float(torch.linalg.norm(u_tangent_use).item())
+            metrics['gt_v_tangent_norm'] += float(torch.linalg.norm(v_tangent_use).item())
+            metrics['gt_u_sigma_top'] += float(u_sigma_top)
+            metrics['gt_v_sigma_top'] += float(v_sigma_top)
+            metrics['gt_u_effective_step'] += float(eta_u)
+            metrics['gt_v_effective_step'] += float(eta_v)
             metrics['gt_x_inherit_norm'] += float(torch.linalg.norm(X_new).item())
             metrics['gt_residual_norm'] += float(torch.linalg.norm(residual).item())
             metrics['gt_basis_orth_err'] = max(
@@ -1234,6 +1327,8 @@ class Server(object):
                 f'basis_init_mode={self._resolve_gt_basis_init_mode()} '
                 f'gt_update_mode={update_mode} refresh_index={int(refresh_idx)} refresh_side={refresh_side} '
                 f'gt_topk={int(gt_topk)} '
+                f'gt_rank1={int(gt_rank1_approx)} gt_target_rel_step={float(gt_target_rel_step):.6e} '
+                f'u_eta={metrics["gt_u_effective_step"]:.6e} v_eta={metrics["gt_v_effective_step"]:.6e} '
                 f'u_res={metrics["gt_u_res_norm"]:.6e} v_res={metrics["gt_v_res_norm"]:.6e} '
                 f'u_topk_active={int(metrics["gt_u_topk_active"])} '
                 f'v_topk_active={int(metrics["gt_v_topk_active"])} '
@@ -1836,6 +1931,8 @@ class Server(object):
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
                     'gt_topk': int(getattr(self.args, 'gt_topk', 0)),
                     'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),
+                    'gt_rank1_approx': bool(getattr(self.args, 'gt_rank1_approx', False)),
+                    'gt_target_rel_step': float(getattr(self.args, 'gt_target_rel_step', 0.0)),
                     'basis_init_mode': str(getattr(self.args, 'basis_init_mode', 'random')),
                     'gt_update_mode': str(getattr(self.args, 'gt_update_mode', 'both')),
                     'lora_target_modules': getattr(self.args, 'lora_target_modules', None),

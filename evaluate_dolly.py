@@ -351,6 +351,8 @@ def build_parser():
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument("--ns_steps", type=int, default=5)
     parser.add_argument("--gt_topk", type=int, default=0)
+    parser.add_argument("--gt_rank1_approx", default=False, action="store_true")
+    parser.add_argument("--gt_target_rel_step", type=float, default=0.0)
     parser.add_argument(
         "--basis_init_mode",
         type=lambda x: str(x).lower(),
@@ -503,6 +505,10 @@ def run_evaluate(args, eval_metric_explicit=False):
             args.basis_init_mode = str(common_hparams["basis_init_mode"]).lower()
         if "gt_update_mode" in common_hparams:
             args.gt_update_mode = str(common_hparams["gt_update_mode"]).lower()
+        if "gt_rank1_approx" in common_hparams:
+            args.gt_rank1_approx = bool(common_hparams["gt_rank1_approx"])
+        if "gt_target_rel_step" in common_hparams:
+            args.gt_target_rel_step = float(common_hparams["gt_target_rel_step"])
         if "rank_left" in common_hparams:
             args.rank_left = int(common_hparams["rank_left"])
         elif "rank_r" in common_hparams:

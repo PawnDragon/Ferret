@@ -894,16 +894,16 @@ class Server(object):
 
     def _resolve_gt_effective_step(self, basis, tangent_used, sigma_top, rank1_enabled, gt_sub_lr, gt_target_rel_step, eps=1e-8):
         tau_rel = float(gt_target_rel_step)
-        if tau_rel <= 0.0:
-            return float(gt_sub_lr)
-        basis_norm = float(torch.linalg.norm(basis.float()).item())
         if rank1_enabled:
             denom = float(sigma_top)
         else:
             denom = float(torch.linalg.norm(tangent_used.float()).item())
+        if tau_rel <= 0.0:
+            return float(gt_sub_lr), float(denom)
+        basis_norm = float(torch.linalg.norm(basis.float()).item())
         if (not np.isfinite(denom)) or denom <= float(eps):
-            return 0.0
-        return float(tau_rel * basis_norm / (denom + float(eps)))
+            return 0.0, float(denom)
+        return float(tau_rel * basis_norm / (denom + float(eps))), float(denom)
 
     def _resolve_gt_basis_init_mode(self):
         mode = str(getattr(self.args, 'basis_init_mode', 'random')).lower()
@@ -1054,6 +1054,8 @@ class Server(object):
                 'gt_v_sigma_top': 0.0,
                 'gt_u_effective_step': 0.0,
                 'gt_v_effective_step': 0.0,
+                'gt_u_denom_min': 0.0,
+                'gt_v_denom_min': 0.0,
                 'gt_u_res_norm': 0.0,
                 'gt_v_res_norm': 0.0,
                 'gt_u_step_norm': 0.0,
@@ -1092,6 +1094,8 @@ class Server(object):
             'gt_v_sigma_top': 0.0,
             'gt_u_effective_step': 0.0,
             'gt_v_effective_step': 0.0,
+            'gt_u_denom_min': 0.0,
+            'gt_v_denom_min': 0.0,
             'gt_u_res_norm': 0.0,
             'gt_v_res_norm': 0.0,
             'gt_u_step_norm': 0.0,
@@ -1136,6 +1140,11 @@ class Server(object):
         x_next = {}
         u_next = {}
         v_next = {}
+
+        u_denom_min = float('inf')
+        v_denom_min = float('inf')
+        u_denom_min_layer = 'n/a'
+        v_denom_min_layer = 'n/a'
         gt_sub_lr = float(getattr(self.args, 'gt_sub_lr', 0.1))
         merge_residual = bool(getattr(self.args, 'gt_merge_residual', False))
 
@@ -1193,7 +1202,7 @@ class Server(object):
                 else:
                     u_tangent_use = u_step_applied
                     u_sigma_top = 0.0
-                eta_u = self._resolve_gt_effective_step(
+                eta_u, denom_u = self._resolve_gt_effective_step(
                     basis=U_old,
                     tangent_used=u_tangent_use,
                     sigma_top=u_sigma_top,
@@ -1201,6 +1210,9 @@ class Server(object):
                     gt_sub_lr=gt_sub_lr,
                     gt_target_rel_step=gt_target_rel_step,
                 )
+                if np.isfinite(denom_u) and (denom_u < u_denom_min):
+                    u_denom_min = float(denom_u)
+                    u_denom_min_layer = str(layer_name)
 
                 U_new_raw = U_old + eta_u * u_tangent_use
                 U_new = self._orthonormalize_columns(U_new_raw)
@@ -1211,6 +1223,7 @@ class Server(object):
                 u_tangent_use = torch.zeros_like(u_step)
                 u_sigma_top = 0.0
                 eta_u = 0.0
+                denom_u = float('inf')
                 U_new = U_old.clone()
             metrics['gt_u_topk_active'] += float(k_eff_u)
 
@@ -1240,7 +1253,7 @@ class Server(object):
                 else:
                     v_tangent_use = v_step_applied
                     v_sigma_top = 0.0
-                eta_v = self._resolve_gt_effective_step(
+                eta_v, denom_v = self._resolve_gt_effective_step(
                     basis=V_old,
                     tangent_used=v_tangent_use,
                     sigma_top=v_sigma_top,
@@ -1248,6 +1261,9 @@ class Server(object):
                     gt_sub_lr=gt_sub_lr,
                     gt_target_rel_step=gt_target_rel_step,
                 )
+                if np.isfinite(denom_v) and (denom_v < v_denom_min):
+                    v_denom_min = float(denom_v)
+                    v_denom_min_layer = str(layer_name)
 
                 V_new_raw = V_old + eta_v * v_tangent_use
                 V_new = self._orthonormalize_columns(V_new_raw)
@@ -1258,6 +1274,7 @@ class Server(object):
                 v_tangent_use = torch.zeros_like(v_step)
                 v_sigma_top = 0.0
                 eta_v = 0.0
+                denom_v = float('inf')
                 V_new = V_old.clone()
             metrics['gt_v_topk_active'] += float(k_eff_v)
 
@@ -1300,6 +1317,8 @@ class Server(object):
                 float(u_orth_err.item()),
                 float(v_orth_err.item()),
             )
+        metrics['gt_u_denom_min'] = 0.0 if (not np.isfinite(u_denom_min)) else float(u_denom_min)
+        metrics['gt_v_denom_min'] = 0.0 if (not np.isfinite(v_denom_min)) else float(v_denom_min)
 
         max_x_abs = 0.0
         for tensor in x_next.values():
@@ -1329,6 +1348,8 @@ class Server(object):
                 f'gt_topk={int(gt_topk)} '
                 f'gt_rank1={int(gt_rank1_approx)} gt_target_rel_step={float(gt_target_rel_step):.6e} '
                 f'u_eta={metrics["gt_u_effective_step"]:.6e} v_eta={metrics["gt_v_effective_step"]:.6e} '
+                f'u_denom_min={metrics["gt_u_denom_min"]:.6e}@{u_denom_min_layer} '
+                f'v_denom_min={metrics["gt_v_denom_min"]:.6e}@{v_denom_min_layer} '
                 f'u_res={metrics["gt_u_res_norm"]:.6e} v_res={metrics["gt_v_res_norm"]:.6e} '
                 f'u_topk_active={int(metrics["gt_u_topk_active"])} '
                 f'v_topk_active={int(metrics["gt_v_topk_active"])} '
@@ -2482,7 +2503,10 @@ class Server(object):
                         levels.append(level)
 
                         pred_final, pred_invalid = extract_math_pred_final_answer(pred_text)
-                        gold_final_norm = extract_math_gold_final_answer(gold_final)
+                        gold_final_norm = extract_math_gold_final_answer(
+                            gold_final,
+                            fallback_solution=ref_text,
+                        )
                         if (not pred_invalid) and (pred_final is not None) and (gold_final_norm is not None) and (pred_final == gold_final_norm):
                             running_correct += 1
                     progress_bar_eval.update(1)

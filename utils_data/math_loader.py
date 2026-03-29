@@ -5,6 +5,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
+from utils_data.math_metrics import extract_math_gold_final_answer
+
 
 MATH_INSTRUCTION = (
     "Solve the following competition math problem. "
@@ -59,8 +61,6 @@ def _normalize_record(row, split_name, row_idx):
         raise RuntimeError(f'[math] empty problem in {split_name} sample index={row_idx}')
     if solution.strip() == '':
         raise RuntimeError(f'[math] empty solution in {split_name} sample index={row_idx}')
-    if extracted_solution.strip() == '':
-        raise RuntimeError(f'[math] empty extracted_solution in {split_name} sample index={row_idx}')
     if subject.strip() == '':
         raise RuntimeError(f'[math] empty type in {split_name} sample index={row_idx}')
 
@@ -68,13 +68,16 @@ def _normalize_record(row, split_name, row_idx):
     row_id = row.get('id', None)
     if row_id is None:
         row_id = f'{split_name}-{row_idx}'
+    final_answer = extract_math_gold_final_answer(extracted_solution)
+    if final_answer is None:
+        return None
 
     return {
         'id': str(row_id),
         'instruction': MATH_INSTRUCTION,
         'input': problem,
         'output': solution,
-        'final_answer': extracted_solution,
+        'final_answer': final_answer,
         'subject': subject.strip(),
         'level': int(level),
         'dataset_name': 'math',
@@ -167,8 +170,22 @@ def load_math_local_splits(dataset_path, seed=42, dev_size=500):
     train_rows = _load_parquet_rows(train_path)
     test_rows = _load_parquet_rows(test_path)
 
-    train_examples = [_normalize_record(row, 'train', idx) for idx, row in enumerate(train_rows)]
-    test_examples = [_normalize_record(row, 'test', idx) for idx, row in enumerate(test_rows)]
+    train_examples = []
+    test_examples = []
+    train_skipped = 0
+    test_skipped = 0
+    for idx, row in enumerate(train_rows):
+        normalized = _normalize_record(row, 'train', idx)
+        if normalized is None:
+            train_skipped += 1
+            continue
+        train_examples.append(normalized)
+    for idx, row in enumerate(test_rows):
+        normalized = _normalize_record(row, 'test', idx)
+        if normalized is None:
+            test_skipped += 1
+            continue
+        test_examples.append(normalized)
     if len(train_examples) == 0:
         raise RuntimeError(f'[math] train split is empty under root: {root}')
     if len(test_examples) == 0:
@@ -181,4 +198,9 @@ def load_math_local_splits(dataset_path, seed=42, dev_size=500):
     )
     if len(train_split) == 0:
         raise RuntimeError('[math] train split became empty after dev split; check dataset size and dev policy')
+    if (train_skipped + test_skipped) > 0:
+        print(
+            f'[math] skipped samples with unparseable extracted_solution: '
+            f'train={train_skipped}, test={test_skipped}'
+        )
     return train_split, dev_split, test_examples

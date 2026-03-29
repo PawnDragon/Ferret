@@ -121,8 +121,16 @@ def normalize_math_answer(text):
     return numeric.strip().lower()
 
 
-def extract_math_gold_final_answer(extracted_solution):
-    return normalize_math_answer(extracted_solution)
+def extract_math_gold_final_answer(extracted_solution, fallback_solution=None):
+    normalized = normalize_math_answer(extracted_solution)
+    if normalized is not None:
+        return normalized
+    if fallback_solution is None:
+        return None
+    inferred, invalid = extract_math_pred_final_answer(fallback_solution)
+    if invalid:
+        return None
+    return inferred
 
 
 def extract_math_pred_final_answer(pred_text):
@@ -196,9 +204,10 @@ def compute_math_metrics(pred_texts, ref_texts, gold_finals=None, subjects=None,
         level = _to_text(levels[idx]).strip() or 'unknown'
 
         pred_final, invalid = extract_math_pred_final_answer(pred_text)
-        gold_final = extract_math_gold_final_answer(gold_finals[idx])
-        if gold_final is None:
-            gold_final = normalize_math_answer(ref_text)
+        gold_final = extract_math_gold_final_answer(
+            gold_finals[idx],
+            fallback_solution=ref_text,
+        )
 
         if invalid or pred_final is None:
             n_invalid += 1

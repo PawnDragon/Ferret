@@ -850,7 +850,10 @@ def run_evaluate(args, eval_metric_explicit=False):
                     levels.append(level)
 
                     pred_final, pred_invalid = extract_math_pred_final_answer(pred_text)
-                    gold_final_norm = extract_math_gold_final_answer(gold_final)
+                    gold_final_norm = extract_math_gold_final_answer(
+                        gold_final,
+                        fallback_solution=ref_text,
+                    )
                     if (not pred_invalid) and (pred_final is not None) and (gold_final_norm is not None) and (pred_final == gold_final_norm):
                         running_correct += 1
                 num_eval += bs

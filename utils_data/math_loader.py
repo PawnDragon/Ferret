@@ -27,16 +27,14 @@ def _parse_level(raw_level, split_name, row_idx):
         return int(raw_level)
     if isinstance(raw_level, float):
         if np.isnan(raw_level):
-            raise RuntimeError(f'[math] empty level in {split_name} sample index={row_idx}')
+            return None
         return int(raw_level)
     level_text = '' if raw_level is None else str(raw_level).strip()
     if level_text == '':
-        raise RuntimeError(f'[math] empty level in {split_name} sample index={row_idx}')
+        return None
     match = re.search(r'(-?\d+)', level_text)
     if match is None:
-        raise RuntimeError(
-            f'[math] invalid level format in {split_name} sample index={row_idx}: {raw_level}'
-        )
+        return None
     return int(match.group(1))
 
 
@@ -58,19 +56,21 @@ def _normalize_record(row, split_name, row_idx):
     extracted_solution = '' if row['extracted_solution'] is None else str(row['extracted_solution'])
     subject = '' if row['type'] is None else str(row['type'])
     if problem.strip() == '':
-        raise RuntimeError(f'[math] empty problem in {split_name} sample index={row_idx}')
+        return None, 'empty_problem'
     if solution.strip() == '':
-        raise RuntimeError(f'[math] empty solution in {split_name} sample index={row_idx}')
+        return None, 'empty_solution'
     if subject.strip() == '':
-        raise RuntimeError(f'[math] empty type in {split_name} sample index={row_idx}')
+        return None, 'empty_type'
 
     level = _parse_level(row['level'], split_name=split_name, row_idx=row_idx)
+    if level is None:
+        return None, 'invalid_level'
     row_id = row.get('id', None)
     if row_id is None:
         row_id = f'{split_name}-{row_idx}'
     final_answer = extract_math_gold_final_answer(extracted_solution)
     if final_answer is None:
-        return None
+        return None, 'unparseable_extracted_solution'
 
     return {
         'id': str(row_id),
@@ -82,7 +82,7 @@ def _normalize_record(row, split_name, row_idx):
         'level': int(level),
         'dataset_name': 'math',
         'split': str(split_name),
-    }
+    }, None
 
 
 def _resolve_math_paths(dataset_path):
@@ -174,16 +174,20 @@ def load_math_local_splits(dataset_path, seed=42, dev_size=500):
     test_examples = []
     train_skipped = 0
     test_skipped = 0
+    train_skip_reasons = defaultdict(int)
+    test_skip_reasons = defaultdict(int)
     for idx, row in enumerate(train_rows):
-        normalized = _normalize_record(row, 'train', idx)
+        normalized, skip_reason = _normalize_record(row, 'train', idx)
         if normalized is None:
             train_skipped += 1
+            train_skip_reasons[str(skip_reason or 'unknown')] += 1
             continue
         train_examples.append(normalized)
     for idx, row in enumerate(test_rows):
-        normalized = _normalize_record(row, 'test', idx)
+        normalized, skip_reason = _normalize_record(row, 'test', idx)
         if normalized is None:
             test_skipped += 1
+            test_skip_reasons[str(skip_reason or 'unknown')] += 1
             continue
         test_examples.append(normalized)
     if len(train_examples) == 0:
@@ -200,7 +204,8 @@ def load_math_local_splits(dataset_path, seed=42, dev_size=500):
         raise RuntimeError('[math] train split became empty after dev split; check dataset size and dev policy')
     if (train_skipped + test_skipped) > 0:
         print(
-            f'[math] skipped samples with unparseable extracted_solution: '
-            f'train={train_skipped}, test={test_skipped}'
+            f'[math] skipped malformed samples: '
+            f'train={train_skipped} reasons={dict(sorted(train_skip_reasons.items()))}, '
+            f'test={test_skipped} reasons={dict(sorted(test_skip_reasons.items()))}'
         )
     return train_split, dev_split, test_examples

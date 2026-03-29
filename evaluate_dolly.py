@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
@@ -268,6 +269,42 @@ def maybe_resolve_gsm8k_eval_metric(args, eval_metric_explicit=False):
         print("[info] dataset=math and --eval_metric not set; defaulting eval metric to math_acc")
 
 
+def maybe_sample_final_eval_loader(args, eval_loader):
+    ratio = float(getattr(args, "final_eval_sample", 1.0))
+    if ratio >= 1.0:
+        return eval_loader
+    if eval_loader is None:
+        return eval_loader
+    dataset = getattr(eval_loader, "dataset", None)
+    if dataset is None:
+        return eval_loader
+    total = int(len(dataset))
+    if total <= 0:
+        return eval_loader
+
+    sample_n = int(total * ratio)
+    if ratio <= 0.0:
+        sample_n = 1
+    else:
+        sample_n = max(sample_n, 1)
+    sample_n = min(sample_n, total)
+    if sample_n >= total:
+        return eval_loader
+
+    rng = np.random.RandomState(int(getattr(args, "seed", 42)) + 4049)
+    indices = rng.choice(total, size=sample_n, replace=False).tolist()
+    print(
+        f"[info] final eval sampling enabled: ratio={ratio:.4f}, sampled={sample_n}/{total}"
+    )
+    subset = Subset(dataset, indices=indices)
+    return DataLoader(
+        subset,
+        shuffle=False,
+        batch_size=getattr(eval_loader, "batch_size", 1),
+        collate_fn=getattr(eval_loader, "collate_fn", None),
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
@@ -330,6 +367,12 @@ def build_parser():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--use_prompts", default=True)
+    parser.add_argument(
+        "--final_eval_sample",
+        type=float,
+        default=1.0,
+        help="sampling ratio (0-1] for final evaluation set; 1.0 uses the full final-eval set",
+    )
     parser.add_argument(
         "--eval_metric", type=str, default="rouge", choices=["loss", "rouge", "gsm8k_acc", "math_acc"]
     )
@@ -403,6 +446,8 @@ def run_evaluate(args, eval_metric_explicit=False):
         raise ValueError("--eval_metric gsm8k_acc is only valid for --dataset gsm8k")
     if args.dataset != "math" and args.eval_metric == "math_acc":
         raise ValueError("--eval_metric math_acc is only valid for --dataset math")
+    if float(getattr(args, "final_eval_sample", 1.0)) < 0.0 or float(getattr(args, "final_eval_sample", 1.0)) > 1.0:
+        raise ValueError(f"--final_eval_sample must be in [0, 1], got {args.final_eval_sample}")
     if getattr(args, "rank_left", None) is None:
         args.rank_left = int(args.rank_r)
     if getattr(args, "rank_right", None) is None:
@@ -415,6 +460,7 @@ def run_evaluate(args, eval_metric_explicit=False):
     # Keep exactly the same final-eval path as main.py.
     setup_seed(args.seed)
     _, eval_loader, tokenizer = get_loaders(args, only_eval=True)
+    eval_loader = maybe_sample_final_eval_loader(args, eval_loader)
     if args.dataset == "dolly":
         print(
             f"[info] Eval dataset=dolly | zerotask={args.zerotask}, eval_samples={len(eval_loader.dataset)}"

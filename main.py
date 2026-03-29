@@ -242,7 +242,8 @@ if __name__ == '__main__':
     # Evaluation
     parser.add_argument('--eval_metric', default='rouge', type=str, choices=['rouge', 'loss', 'gsm8k_acc', 'math_acc'], help='metric to evaluate global model in the last round')
     parser.add_argument('--round_eval_false', default=False, action='store_true', help='if true, skip evaluation during training rounds')
-    parser.add_argument('--round_eval_sample', type=float, default=1.0, help='sampling ratio (0-1] for per-round evaluation set; final eval always uses full eval set')
+    parser.add_argument('--round_eval_sample', type=float, default=1.0, help='sampling ratio (0-1] for per-round evaluation set; 1.0 uses the full round-eval set')
+    parser.add_argument('--final_eval_sample', type=float, default=1.0, help='sampling ratio (0-1] for final evaluation set; 1.0 uses the full final-eval set')
     parser.add_argument('--early_stop', default=False, action='store_true', help='if true, stop training early when eval metric does not improve')
     parser.add_argument('--early_stop_patience', type=int, default=8, help='number of rounds without significant improvement before stopping')
     parser.add_argument('--early_stop_min_delta', type=float, default=1e-4, help='minimum significant improvement in eval metric')
@@ -301,6 +302,8 @@ if __name__ == '__main__':
         args.struct_topk_tt = 1e-6
     if float(getattr(args, 'round_eval_sample', 1.0)) < 0.0 or float(getattr(args, 'round_eval_sample', 1.0)) > 1.0:
         raise ValueError(f'--round_eval_sample must be in [0, 1], got {args.round_eval_sample}')
+    if float(getattr(args, 'final_eval_sample', 1.0)) < 0.0 or float(getattr(args, 'final_eval_sample', 1.0)) > 1.0:
+        raise ValueError(f'--final_eval_sample must be in [0, 1], got {args.final_eval_sample}')
     if args.optimizer is None:
         if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
@@ -1299,6 +1302,7 @@ if __name__ == '__main__':
             'weight_decay': args.weight_decay,
             'optimizer': args.optimizer,
             'model_dtype': args.model_dtype,
+            'final_eval_sample': float(getattr(args, 'final_eval_sample', 1.0)),
             'n_accum': args.n_accum,
             'grad_clip': args.grad_clip,
             'lora_r': args.lora_r,

@@ -5,6 +5,10 @@ import random
 import sys
 import time
 
+from utils_data.runtime_env import sanitize_openmp_env
+
+sanitize_openmp_env(default_threads=1)
+
 import numpy as np
 import torch
 import yaml

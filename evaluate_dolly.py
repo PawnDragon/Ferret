@@ -4,6 +4,10 @@ import os
 import random
 import sys
 
+from utils_data.runtime_env import sanitize_openmp_env
+
+sanitize_openmp_env(default_threads=1)
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset

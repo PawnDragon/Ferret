@@ -36,7 +36,14 @@ from optimizers.florg_utils import (
 )
 from optimizers.fedmultisub_utils import initialize_subspaces, select_topk_subspaces
 from optimizers.fedstruct_utils import initialize_struct_subspaces
-from optimizers.submuon_utils import fold_submuon_core_into_backbone, init_submuon_state, make_uv, transport_state
+from optimizers.fedkrso_utils import make_krso_projection
+from optimizers.submuon_utils import (
+    fold_submuon_core_into_backbone,
+    init_submuon_state,
+    make_uv,
+    select_target_linear_layers,
+    transport_state,
+)
 from utils_data.default_tokens import DefaultToken
 from utils_data.gsm8k_metrics import compute_gsm8k_metrics
 from utils_data.math_metrics import (
@@ -262,6 +269,10 @@ class Server(object):
         self.global_struct_selected_keys = []
         self._struct_debug_logged = False
         self._struct_topk_schedule_logged = False
+        self.krso_seed_pool = []
+        self.krso_global_b = {}
+        self.krso_layer_dims = {}
+        self.krso_target_layers = []
 
         if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
@@ -393,6 +404,26 @@ class Server(object):
                 f'[fedstructmuon] initialized {len(self.global_struct_x_state)} subspaces; '
                 f'round-1 warmup uses all={len(self.global_struct_selected_keys)}'
             )
+        if self.algo == 'fedkrso':
+            self.krso_target_layers = select_target_linear_layers(
+                self.model,
+                self.args.rank_r,
+                raw_target_modules=getattr(self.args, 'lora_target_modules', None),
+            )
+            if len(self.krso_target_layers) == 0:
+                raise RuntimeError(
+                    f'[fedkrso] no target linear layer is selected; '
+                    f'rank_r={self.args.rank_r}, '
+                    f'lora_target_modules={getattr(self.args, "lora_target_modules", None)}'
+                )
+            name_to_module = dict(self.model.named_modules())
+            for layer_name in self.krso_target_layers:
+                module = name_to_module[layer_name]
+                out_dim = int(module.out_features)
+                in_dim = int(module.in_features)
+                rank_eff = int(min(int(self.args.rank_r), out_dim, in_dim))
+                self.krso_layer_dims[layer_name] = (out_dim, in_dim, rank_eff)
+            self.refresh_krso_seed_pool(cur_round=0)
 
     def _build_round_eval_loader(self, cur_round):
         ratio = float(getattr(self.args, 'round_eval_sample', 1.0))
@@ -513,6 +544,50 @@ class Server(object):
             )
             self._optim_debug_logged = True
 
+    def _resolve_krso_num_seeds(self):
+        return int(max(1, min(int(getattr(self.args, 'krso_num_seeds', 10)), len(self.candidate_seeds))))
+
+    def _build_zero_krso_b_state(self, seed_pool):
+        state = {}
+        for layer_name, (out_dim, _, rank_eff) in self.krso_layer_dims.items():
+            state[layer_name] = {
+                int(seed): torch.zeros(int(out_dim), int(rank_eff), dtype=torch.float32)
+                for seed in seed_pool
+            }
+        return state
+
+    def _clone_krso_b_state(self):
+        out = {}
+        for layer_name, seed_map in self.krso_global_b.items():
+            if not isinstance(seed_map, dict):
+                continue
+            out[layer_name] = {
+                int(seed): tensor.clone()
+                for seed, tensor in seed_map.items()
+                if isinstance(tensor, torch.Tensor)
+            }
+        return out
+
+    def refresh_krso_seed_pool(self, cur_round):
+        if self.algo != 'fedkrso':
+            return
+        num_seeds = self._resolve_krso_num_seeds()
+        candidate_array = np.asarray(self.candidate_seeds)
+        if num_seeds >= int(candidate_array.shape[0]):
+            chosen = candidate_array.tolist()
+        else:
+            chosen = self.seed_rng.choice(candidate_array, size=num_seeds, replace=False).tolist()
+        self.krso_seed_pool = [int(seed) for seed in chosen]
+        self.krso_global_b = self._build_zero_krso_b_state(self.krso_seed_pool)
+
+    def get_fedkrso_broadcast_state(self):
+        if self.algo != 'fedkrso':
+            return None
+        return {
+            'seed_pool': list(self.krso_seed_pool),
+            'b_global': self._clone_krso_b_state(),
+        }
+
     def get_submuon_broadcast_state(self):
         aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
         return {
@@ -563,6 +638,8 @@ class Server(object):
             return self.get_multisub_broadcast_state()
         if self.algo == 'fedstructmuon':
             return self.get_struct_broadcast_state()
+        if self.algo == 'fedkrso':
+            return self.get_fedkrso_broadcast_state()
         if self.algo in ['fedit', 'federa']:
             return {
                 'backbone_state_dict': self.model.state_dict(),
@@ -1532,6 +1609,100 @@ class Server(object):
             self._struct_topk_schedule_logged = True
         return curr_kk
 
+    def aggregate_fedkrso(self, client_payloads, selected_client_list, cur_round=1):
+        if self.algo != 'fedkrso' or len(client_payloads) == 0:
+            return {}
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+        aggregated_b = self._build_zero_krso_b_state(self.krso_seed_pool)
+        active_seed_set = set()
+        client_interval_counts = []
+        client_active_seed_counts = []
+
+        for client_idx, payload in enumerate(client_payloads):
+            if not isinstance(payload, dict):
+                continue
+            local_b = payload.get('b', {})
+            if not isinstance(local_b, dict):
+                continue
+            weight = float(weight_array[client_idx])
+            client_interval_counts.append(int(payload.get('num_intervals', 0)))
+            client_active_seed_counts.append(int(payload.get('num_active_seeds', 0)))
+            for layer_name, seed_map in local_b.items():
+                if layer_name not in aggregated_b or not isinstance(seed_map, dict):
+                    continue
+                for seed, b_tensor in seed_map.items():
+                    seed = int(seed)
+                    if seed not in aggregated_b[layer_name] or not isinstance(b_tensor, torch.Tensor):
+                        continue
+                    ref_tensor = aggregated_b[layer_name][seed]
+                    if tuple(b_tensor.shape) != tuple(ref_tensor.shape):
+                        raise RuntimeError(
+                            f'[fedkrso] B shape mismatch @ {layer_name}/seed={seed}: '
+                            f'got={tuple(b_tensor.shape)}, expected={tuple(ref_tensor.shape)}'
+                        )
+                    aggregated_b[layer_name][seed].add_(b_tensor.to(dtype=torch.float32), alpha=weight)
+                    active_seed_set.add(seed)
+
+        name_to_module = dict(self.model.named_modules())
+        total_b_norm = 0.0
+        total_delta_norm = 0.0
+        with torch.no_grad():
+            for layer_name, seed_map in aggregated_b.items():
+                module = name_to_module.get(layer_name, None)
+                if module is None or (not hasattr(module, 'weight')):
+                    continue
+                layer_delta = torch.zeros_like(module.weight.detach().cpu(), dtype=torch.float32)
+                _, in_dim, _ = self.krso_layer_dims[layer_name]
+                for seed, b_tensor in seed_map.items():
+                    total_b_norm += float(torch.linalg.norm(b_tensor).item())
+                    if not bool(torch.count_nonzero(b_tensor).item()):
+                        continue
+                    proj = make_krso_projection(
+                        seed=int(seed),
+                        layer_name=layer_name,
+                        rank=int(b_tensor.shape[1]),
+                        in_dim=int(in_dim),
+                        device='cpu',
+                        dtype=torch.float32,
+                    )
+                    delta = torch.matmul(b_tensor.float(), proj)
+                    if tuple(delta.shape) != tuple(layer_delta.shape):
+                        raise RuntimeError(
+                            f'[fedkrso] BP shape mismatch @ {layer_name}/seed={seed}: '
+                            f'got={tuple(delta.shape)}, expected={tuple(layer_delta.shape)}'
+                        )
+                    layer_delta.add_(delta)
+                module.weight.data.add_(layer_delta.to(device=module.weight.device, dtype=module.weight.dtype))
+                total_delta_norm += float(torch.linalg.norm(layer_delta).item())
+
+        self.krso_global_b = {
+            layer_name: {
+                int(seed): tensor.cpu().contiguous()
+                for seed, tensor in seed_map.items()
+            }
+            for layer_name, seed_map in aggregated_b.items()
+        }
+
+        avg_intervals = float(np.mean(client_interval_counts)) if len(client_interval_counts) > 0 else 0.0
+        avg_active_seeds = float(np.mean(client_active_seed_counts)) if len(client_active_seed_counts) > 0 else 0.0
+        metrics = {
+            'krso_num_seeds': float(len(self.krso_seed_pool)),
+            'krso_interval_len': float(getattr(self.args, 'krso_interval_len', 10)),
+            'krso_num_active_seeds_this_round': float(len(active_seed_set)),
+            'krso_accumulator_norm': float(total_b_norm),
+            'krso_delta_norm': float(total_delta_norm),
+            'krso_avg_intervals_per_client': float(avg_intervals),
+            'krso_avg_active_seeds_per_client': float(avg_active_seeds),
+        }
+        if bool(getattr(self.args, 'log', False)):
+            print(
+                f'[fedkrso][server] round={int(cur_round)} '
+                f'num_seeds={len(self.krso_seed_pool)} active_seeds={len(active_seed_set)} '
+                f'acc_norm={total_b_norm:.6e} delta_norm={total_delta_norm:.6e}'
+            )
+        return metrics
+
     def aggregate_lora(self, client_payloads, selected_client_list):
         if len(client_payloads) == 0:
             return
@@ -2074,6 +2245,88 @@ class Server(object):
         )
         print(f'[ckpt] saved to: {ckpt_path}')
         return True
+
+    def save_best_krso_ckpt(self, metric, cur_round):
+        if self.algo != 'fedkrso' or not self.args.save:
+            return False
+
+        improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
+        if not improved:
+            return False
+
+        self.best_metric = metric
+        ckpt_path = os.path.join(self._get_ckpt_dir(), 'best.pt')
+        torch.save(
+            {
+                'algo': 'fedkrso',
+                'backbone_state_dict': self.model.state_dict(),
+                'krso_seed_pool': list(self.krso_seed_pool),
+                'krso_global_b_state': {
+                    layer_name: {
+                        int(seed): tensor.cpu()
+                        for seed, tensor in seed_map.items()
+                    }
+                    for layer_name, seed_map in self.krso_global_b.items()
+                },
+                'round': int(cur_round),
+                'best_metric': float(metric),
+                'hparams': {
+                    'algo': self.args.algo,
+                    'rank_r': int(self.args.rank_r),
+                    'lr': float(self.args.lr),
+                    'krso_num_seeds': int(getattr(self.args, 'krso_num_seeds', 10)),
+                    'krso_interval_len': int(getattr(self.args, 'krso_interval_len', 10)),
+                    'beta1': float(getattr(self.args, 'beta1', 0.9)),
+                    'beta2': float(getattr(self.args, 'beta2', 0.999)),
+                    'eps': float(getattr(self.args, 'eps', 1e-8)),
+                    'lora_target_modules': getattr(self.args, 'lora_target_modules', None),
+                },
+            },
+            ckpt_path,
+        )
+        print(f'[ckpt] saved to: {ckpt_path}')
+        return True
+
+    def load_fedkrso_checkpoint(self, ckpt_path):
+        if self.algo != 'fedkrso':
+            raise RuntimeError('[fedkrso] load_fedkrso_checkpoint is only valid when algo=fedkrso')
+        payload = torch.load(ckpt_path, map_location='cpu')
+        if not isinstance(payload, dict):
+            raise RuntimeError(f'[fedkrso] invalid checkpoint payload type: {type(payload)}')
+        backbone_state = payload.get('backbone_state_dict', None)
+        if not isinstance(backbone_state, dict):
+            raise RuntimeError('[fedkrso] resume checkpoint missing backbone_state_dict')
+        self.model.load_state_dict(backbone_state, strict=True)
+        seed_pool = payload.get('krso_seed_pool', None)
+        if isinstance(seed_pool, (list, tuple)) and len(seed_pool) > 0:
+            self.krso_seed_pool = [int(seed) for seed in seed_pool]
+        else:
+            self.refresh_krso_seed_pool(cur_round=0)
+        global_b_state = payload.get('krso_global_b_state', None)
+        if isinstance(global_b_state, dict):
+            restored_b = self._build_zero_krso_b_state(self.krso_seed_pool)
+            for layer_name, seed_map in global_b_state.items():
+                if layer_name not in restored_b or not isinstance(seed_map, dict):
+                    continue
+                for seed, tensor in seed_map.items():
+                    seed = int(seed)
+                    if seed not in restored_b[layer_name] or not isinstance(tensor, torch.Tensor):
+                        continue
+                    if tuple(tensor.shape) != tuple(restored_b[layer_name][seed].shape):
+                        raise RuntimeError(
+                            f'[fedkrso] resume B shape mismatch @ {layer_name}/seed={seed}: '
+                            f'got={tuple(tensor.shape)}, expected={tuple(restored_b[layer_name][seed].shape)}'
+                        )
+                    restored_b[layer_name][seed] = tensor.detach().cpu().to(dtype=torch.float32).contiguous()
+            self.krso_global_b = restored_b
+        else:
+            self.krso_global_b = self._build_zero_krso_b_state(self.krso_seed_pool)
+
+        if 'best_metric' in payload and payload['best_metric'] is not None:
+            self.best_metric = float(payload['best_metric'])
+        resume_round = int(payload.get('round', 0))
+        print(f'[fedkrso] resumed checkpoint from {ckpt_path} @ round={resume_round}')
+        return resume_round
 
     def save_best_lora_ckpt(self, metric, cur_round):
         if self.algo not in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg'] or not self.args.save:

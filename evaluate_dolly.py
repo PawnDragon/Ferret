@@ -171,6 +171,8 @@ def load_checkpoint_into_model(model, ckpt_path):
             or (global_struct_x_state is not None and global_struct_metadata is not None)
         ):
             ckpt_type = "fedstructmuon_best"
+        elif saved_algo == "fedkrso":
+            ckpt_type = "fedkrso_best"
         elif saved_algo == "fedavg":
             ckpt_type = "fedavg_best"
         elif saved_algo == "ferret":
@@ -333,6 +335,7 @@ def build_parser():
             "fedsubsgd",
             "fedmultisubmuon",
             "fedstructmuon",
+            "fedkrso",
             "fedit",
             "federa",
             "flora",
@@ -385,6 +388,8 @@ def build_parser():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank_r", type=int, default=8)
+    parser.add_argument("--krso_num_seeds", type=int, default=10)
+    parser.add_argument("--krso_interval_len", type=int, default=10)
     parser.add_argument("--rank_left", type=int, default=None)
     parser.add_argument("--rank_right", type=int, default=None)
     parser.add_argument("--svd_rank", type=int, default=500)
@@ -579,6 +584,7 @@ def run_evaluate(args, eval_metric_explicit=False):
             "fedsubsgd",
             "fedmultisubmuon",
             "fedstructmuon",
+            "fedkrso",
             "fedit",
             "federa",
             "flora",

@@ -60,6 +60,8 @@ def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
         return server.save_best_multisub_ckpt(metric, cur_round)
     if args.algo == 'fedstructmuon':
         return server.save_best_struct_ckpt(metric, cur_round)
+    if args.algo == 'fedkrso':
+        return server.save_best_krso_ckpt(metric, cur_round)
     if args.algo in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg']:
         return server.save_best_lora_ckpt(metric, cur_round)
     if args.algo == 'fedavg':
@@ -110,6 +112,7 @@ if __name__ == '__main__':
         'fedsubsgd',
         'fedmultisubmuon',
         'fedstructmuon',
+        'fedkrso',
         'fedit',
         'federa',
         'flora',
@@ -180,6 +183,8 @@ if __name__ == '__main__':
     parser.add_argument('--ns_steps', type=int, default=5)
     parser.add_argument('--seed_refresh_F', type=int, default=10)
     parser.add_argument('--stop_F', type=int, default=-1, help='stop seed refresh from this round onward; <=0 disables stopping')
+    parser.add_argument('--krso_num_seeds', type=int, default=10, help='number of active sketch seeds in FedKRSO each round')
+    parser.add_argument('--krso_interval_len', type=int, default=20, help='number of mini-batches per interval in FedKRSO local training')
     parser.add_argument('--gt_probe_batches', type=int, default=1, help='number of local mini-batches used to estimate probe gradients on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_topk', type=int, default=0, help='if >0, only top-k basis columns are updated on fedsubmuon_gt refresh rounds')
@@ -255,6 +260,7 @@ if __name__ == '__main__':
 
     # Checkpoints
     parser.add_argument('--save', default=False, action='store_true', help='if `true`, keep checkpoint files after run; otherwise remove them at run end')
+    parser.add_argument('--resume_checkpoint', type=str, default='', help='optional checkpoint path to resume training; currently supported for fedkrso')
 
     # W&B
     parser.add_argument('--use_wandb', default=False, action='store_true')
@@ -308,13 +314,17 @@ if __name__ == '__main__':
         raise ValueError(f'--round_eval_sample must be in [0, 1], got {args.round_eval_sample}')
     if float(getattr(args, 'final_eval_sample', 1.0)) < 0.0 or float(getattr(args, 'final_eval_sample', 1.0)) > 1.0:
         raise ValueError(f'--final_eval_sample must be in [0, 1], got {args.final_eval_sample}')
+    if int(getattr(args, 'krso_num_seeds', 1)) <= 0:
+        raise ValueError(f'--krso_num_seeds must be > 0, got {args.krso_num_seeds}')
+    if int(getattr(args, 'krso_interval_len', 1)) <= 0:
+        raise ValueError(f'--krso_interval_len must be > 0, got {args.krso_interval_len}')
     if args.optimizer is None:
         if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedmultisubmuon', 'fedstructmuon']:
-        print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps Muon-style update rule).')
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedmultisubmuon', 'fedstructmuon', 'fedkrso']:
+        print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps method-specific update rule).')
 
     eval_avg_acc = []
     previous_metric = args.eval_metric
@@ -431,6 +441,13 @@ if __name__ == '__main__':
 
     server = Server(args, eval_loader=eval_loader, candidate_seeds=candidate_seeds, log_dir=log_dir)
     client_list = [Client(idx, args, candidate_seeds, list_train_loader[idx]) for idx in range(args.num_clients)]
+    resume_round = 0
+    if str(getattr(args, 'resume_checkpoint', '')).strip() != '':
+        if args.algo != 'fedkrso':
+            raise ValueError('--resume_checkpoint is currently only supported for --algo fedkrso')
+        resume_round = int(server.load_fedkrso_checkpoint(args.resume_checkpoint))
+        if resume_round < 0:
+            resume_round = 0
 
     if args.debug_transport_check and args.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd'] and len(server.seeds) > 0:
         first_layer = next(iter(server.seeds.keys()))
@@ -441,11 +458,12 @@ if __name__ == '__main__':
         rel_err = relative_transport_error(x_old, old_seed, new_seed, out_dim, in_dim, args.rank_r)
         print(f'[debug] transport relative error @ {first_layer}: {rel_err:.6e}')
 
-    eval_result = server.eval(cur_round=0, eval_avg_acc=eval_avg_acc)
+    init_round = int(resume_round)
+    eval_result = server.eval(cur_round=init_round, eval_avg_acc=eval_avg_acc)
     eval_avg_acc.append(eval_result)
     if wandb_run is not None:
         init_log = {
-            'round': 0,
+            'round': init_round,
             'train/loss_avg': float('nan'),
             'train/wall_clock_time': float('nan'),
             'train/peak_gpu_mem': float('nan'),
@@ -461,19 +479,19 @@ if __name__ == '__main__':
             init_log['system/mem_alloc'] = float(torch.cuda.memory_allocated())
             init_log['system/mem_reserved'] = float(torch.cuda.memory_reserved())
             init_log['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
-        wandb.log(init_log, step=0)
+        wandb.log(init_log, step=init_round)
 
     maybe_save_best_ckpt(
         server=server,
         args=args,
         metric=eval_result,
-        cur_round=0,
+        cur_round=init_round,
         log_dir=log_dir,
     )
 
     early_state = {
         'best_val_loss': float(eval_result) if is_finite_scalar(eval_result) else float('inf'),
-        'best_round': 0,
+        'best_round': int(init_round),
         'no_improve_count': 0,
     }
     rebase_controller = None
@@ -489,14 +507,14 @@ if __name__ == '__main__':
             enable_early_stop=early_stop_active,
             early_stop_patience=int(args.early_stop_patience),
         )
-    last_round = 0
+    last_round = int(init_round)
     early_stopped = False
 
     if args.log:
         with open(os.path.join(log_dir, 'results.json'), 'w') as writer:
             json.dump({'eval_avg_acc': eval_avg_acc}, writer)
 
-    for r in range(1, args.rounds + 1):
+    for r in range(int(init_round) + 1, args.rounds + 1):
         selected_client = [client_list[i] for i in client_indices_rounds[r - 1]]
         train_losses = []
         total_comm_up_bytes = 0
@@ -809,6 +827,83 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
+            if torch.cuda.is_available():
+                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
+                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
+                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+
+        elif args.algo == 'fedkrso':
+            # Round convention: sample the round-r seed pool before client training,
+            # aggregate B against those seeds, then immediately materialize W <- W + sum_k B_k P_k.
+            server.refresh_krso_seed_pool(cur_round=r)
+            broadcast_state = server.get_fedkrso_broadcast_state()
+            total_comm_down_bytes = compute_comm_size(
+                {
+                    'seed_pool': broadcast_state.get('seed_pool', []),
+                    'b_global': broadcast_state.get('b_global', {}),
+                }
+            ) * len(selected_client)
+
+            client_payloads = []
+            for client in selected_client:
+                payload = client.local_train_with_seed_pool(
+                    deepcopy(server.model),
+                    cur_round=r,
+                    krso_state=broadcast_state,
+                )
+                client_payloads.append(payload)
+                train_losses.append(payload['loss'])
+                total_comm_up_bytes += compute_comm_size(
+                    {
+                        'b': payload.get('b', {}),
+                        'used_seeds': payload.get('used_seeds', []),
+                    }
+                )
+
+            krso_metrics = server.aggregate_fedkrso(client_payloads, selected_client, cur_round=r)
+            wall_clock = time.time() - round_start_time
+            peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
+
+            if args.round_eval_false:
+                eval_result = float('nan')
+                improved = 0
+            else:
+                eval_result = server.eval(cur_round=r, eval_avg_acc=eval_avg_acc)
+                eval_avg_acc.append(eval_result)
+                improved = int(
+                    maybe_save_best_ckpt(
+                        server=server,
+                        args=args,
+                        metric=eval_result,
+                        cur_round=r,
+                        log_dir=log_dir,
+                    )
+                )
+
+            log_items = {
+                'round': r,
+                'train/loss_avg': float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0,
+                'train/wall_clock_time': float(wall_clock),
+                'train/peak_gpu_mem': float(peak_gpu_mem),
+                'train/comm_up_bytes': float(total_comm_up_bytes),
+                'train/comm_down_bytes': float(total_comm_down_bytes),
+                'comm/bytes_up': float(total_comm_up_bytes),
+                'comm/bytes_down': float(total_comm_down_bytes),
+                'eval/loss': float(eval_result),
+                'ckpt/improved': int(improved),
+            }
+            if isinstance(krso_metrics, dict):
+                for key in [
+                    'krso_num_seeds',
+                    'krso_interval_len',
+                    'krso_num_active_seeds_this_round',
+                    'krso_accumulator_norm',
+                    'krso_delta_norm',
+                    'krso_avg_intervals_per_client',
+                    'krso_avg_active_seeds_per_client',
+                ]:
+                    if key in krso_metrics:
+                        log_items[key] = float(krso_metrics[key])
             if torch.cuda.is_available():
                 log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
                 log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
@@ -1317,6 +1412,8 @@ if __name__ == '__main__':
             'federa_svd_dtype': args.federa_svd_dtype,
             'florg_rank_r': args.florg_rank_r,
             'florg_seed_base': args.florg_seed_base,
+            'krso_num_seeds': args.krso_num_seeds,
+            'krso_interval_len': args.krso_interval_len,
         }
         final_eval = run_evaluate_from_checkpoint(
             checkpoint_path=final_eval_ckpt_path,

@@ -1,5 +1,6 @@
 import gc
 
+import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
 
@@ -252,6 +253,7 @@ class Client(object):
         pulled_model,
         cur_round,
         submuon_state=None,
+        krso_state=None,
         multisub_state=None,
         struct_state=None,
         lora_state=None,
@@ -471,6 +473,76 @@ class Client(object):
                 payload['h_u'] = h_u_local if isinstance(h_u_local, dict) else {}
                 payload['h_v'] = h_v_local if isinstance(h_v_local, dict) else {}
             return payload
+
+        if getattr(self.args, 'algo', 'ferret') == 'fedkrso':
+            if not isinstance(krso_state, dict):
+                raise RuntimeError('[fedkrso] missing krso_state in client local train')
+            seed_pool = krso_state.get('seed_pool', [])
+            if not isinstance(seed_pool, (list, tuple)) or len(seed_pool) == 0:
+                raise RuntimeError('[fedkrso] krso_state must contain non-empty seed_pool')
+
+            self._set_runtime_debug_context(cur_round)
+            framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
+            framework.set_krso_state(krso_state=krso_state, trainable=True)
+            self.model.train()
+
+            if self.args.batch_or_epoch == 'epoch':
+                iter_steps = len(self.train_loader)
+                loader_iter = iter(self.train_loader)
+            else:
+                iter_steps = max(int(self.args.local_step), 1)
+                loader_iter = None
+            interval_len = max(int(getattr(self.args, 'krso_interval_len', 10)), 1)
+
+            loss_total_train = 0.0
+            num_trained = 0
+            interval_delta_norm_sum = 0.0
+            progress_bar = tqdm(range(iter_steps))
+            cur_step = 0
+            while cur_step < iter_steps:
+                active_seed = int(np.random.choice(seed_pool))
+                framework.begin_krso_interval(active_seed)
+                remaining = int(iter_steps - cur_step)
+                interval_steps = int(min(interval_len, remaining))
+                for interval_step in range(interval_steps):
+                    if loader_iter is not None:
+                        batch_raw = next(loader_iter)
+                        batch = {
+                            'input_ids': batch_raw['input_ids'].to(self.device),
+                            'labels': batch_raw['labels'].to(self.device),
+                            'attention_mask': batch_raw['attention_mask'].to(self.device),
+                        }
+                    else:
+                        batch = self._next_batch()
+                    apply_optim_step = (
+                        (interval_step % self.args.n_accum == self.args.n_accum - 1)
+                        or (interval_step == interval_steps - 1)
+                    )
+                    _, loss = framework.step(batch, apply_optim_step=apply_optim_step)
+                    progress_bar.update(1)
+                    if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
+                        loss_total_train += loss
+                        num_trained += len(batch['input_ids'])
+                    progress_bar.set_description(
+                        f'client {self.idx} train at step {cur_step}, loss: '
+                        f'{loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                    )
+                    cur_step += 1
+                interval_stats = framework.finish_krso_interval()
+                interval_delta_norm_sum += float(interval_stats.get('delta_norm', 0.0))
+
+            b_local, used_seeds = framework.export_krso_state()
+            num_intervals = int(getattr(framework, 'krso_num_intervals', 0))
+            framework.clear_krso_state()
+            self.model = None
+            return {
+                'b': b_local,
+                'used_seeds': list(used_seeds),
+                'num_intervals': num_intervals,
+                'num_active_seeds': int(len(used_seeds)),
+                'interval_delta_norm': float(interval_delta_norm_sum),
+                'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+            }
 
         if getattr(self.args, 'algo', 'ferret') in ['fedit', 'federa', 'flora', 'fedsalora', 'fedexlora', 'florg']:
             if getattr(self.args, 'algo', 'ferret') == 'florg':

@@ -10,6 +10,7 @@ from optimizers.fedmultisub_utils import (
     shape_signature as multisub_shape_signature,
 )
 from optimizers.fedstruct_utils import shape_signature as struct_shape_signature
+from optimizers.fedkrso_utils import make_krso_projection
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
@@ -181,6 +182,18 @@ class FerretFramework(object):
         self.struct_layer_to_keys = {}
         self._orig_struct_forward = {}
         self._struct_debug_logged = False
+        self.krso_seed_pool = []
+        self.krso_seed_set = set()
+        self.krso_local_b = {}
+        self.krso_seed_usage = {}
+        self.krso_interval_seed = None
+        self.krso_interval_b = {}
+        self.krso_interval_p = {}
+        self.krso_interval_m1 = {}
+        self.krso_interval_m2 = {}
+        self.krso_interval_step = {}
+        self.krso_num_intervals = 0
+        self._orig_krso_forward = {}
         self._orig_linear_forward = {}
         self._flora_delta = {}
         self._flora_scaling = 1.0
@@ -193,7 +206,7 @@ class FerretFramework(object):
         self.debug_nan_skip_optim = bool(getattr(args, 'debug_nan_skip_optim', False))
         self._local_step_counter = 0
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd', 'fedkrso']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(
                 self.model,
@@ -321,6 +334,30 @@ class FerretFramework(object):
 
             module.forward = patched_forward
 
+    def _install_krso_forward(self):
+        for layer_name in self.target_linear_layers:
+            module = self._resolve_module(layer_name)
+            if layer_name in self._orig_krso_forward:
+                continue
+            self._orig_krso_forward[layer_name] = module.forward
+
+            def patched_forward(x, _module=module, _layer_name=layer_name):
+                input_shape = x.shape
+                x2 = x.reshape(-1, input_shape[-1])
+                y0 = F.linear(x2, _module.weight, _module.bias)
+
+                B = self.krso_interval_b.get(_layer_name, None)
+                P = self.krso_interval_p.get(_layer_name, None)
+                if B is None or P is None:
+                    return y0.reshape(*input_shape[:-1], _module.out_features)
+
+                a = x2 @ P.to(device=x2.device, dtype=x2.dtype).t()
+                y1 = a @ B.to(device=x2.device, dtype=x2.dtype).t()
+                y = y0 + y1
+                return y.reshape(*input_shape[:-1], _module.out_features)
+
+            module.forward = patched_forward
+
     def _install_multisub_forward(self):
         for layer_name, key_list in self.multisub_layer_to_keys.items():
             if len(key_list) == 0:
@@ -404,6 +441,23 @@ class FerretFramework(object):
         self.subadam_step = 0
         if self.algo in ['fedsubadam', 'fedsubsgd']:
             self.optim = None
+
+    def clear_krso_state(self):
+        for layer_name, orig_forward in self._orig_krso_forward.items():
+            module = self._resolve_module(layer_name)
+            module.forward = orig_forward
+        self._orig_krso_forward = {}
+        self.krso_seed_pool = []
+        self.krso_seed_set = set()
+        self.krso_local_b = {}
+        self.krso_seed_usage = {}
+        self.krso_interval_seed = None
+        self.krso_interval_b = {}
+        self.krso_interval_p = {}
+        self.krso_interval_m1 = {}
+        self.krso_interval_m2 = {}
+        self.krso_interval_step = {}
+        self.krso_num_intervals = 0
 
     def clear_multisub_state(self):
         for layer_name, orig_forward in self._orig_multisub_forward.items():
@@ -523,6 +577,118 @@ class FerretFramework(object):
             self.optim = self._build_local_optimizer(self.submuon_x.values())
             if self.optim is not None:
                 self.optim.zero_grad()
+
+    def set_krso_state(self, krso_state, trainable=True):
+        if self.algo != 'fedkrso':
+            return
+        self.clear_krso_state()
+        if not isinstance(krso_state, dict):
+            return
+        seed_pool = krso_state.get('seed_pool', [])
+        if not isinstance(seed_pool, (list, tuple)) or len(seed_pool) == 0:
+            raise RuntimeError('[fedkrso] krso_state must contain a non-empty seed_pool')
+        self.krso_seed_pool = [int(seed) for seed in seed_pool]
+        self.krso_seed_set = set(self.krso_seed_pool)
+        self.krso_local_b = {}
+        self.krso_seed_usage = {int(seed): 0 for seed in self.krso_seed_pool}
+        self.krso_interval_seed = None
+        self.krso_num_intervals = 0
+        if trainable:
+            self._install_krso_forward()
+
+    def begin_krso_interval(self, seed):
+        if self.algo != 'fedkrso':
+            return
+        seed = int(seed)
+        if seed not in self.krso_seed_set:
+            raise RuntimeError(f'[fedkrso] interval seed={seed} not found in current seed pool')
+        if self.krso_interval_seed is not None:
+            raise RuntimeError('[fedkrso] previous interval is still active when starting a new interval')
+
+        device = next(self.model.parameters()).device
+        self.krso_interval_seed = seed
+        self.krso_num_intervals += 1
+        self.krso_seed_usage[seed] = int(self.krso_seed_usage.get(seed, 0)) + 1
+        self.krso_interval_b = {}
+        self.krso_interval_p = {}
+        self.krso_interval_m1 = {}
+        self.krso_interval_m2 = {}
+        self.krso_interval_step = {}
+
+        for layer_name in self.target_linear_layers:
+            module = self._resolve_module(layer_name)
+            out_dim = int(module.out_features)
+            in_dim = int(module.in_features)
+            rank_eff = int(min(int(self.args.rank_r), out_dim, in_dim))
+            if rank_eff <= 0:
+                continue
+            b_param = torch.nn.Parameter(
+                torch.zeros(out_dim, rank_eff, device=device, dtype=torch.float32),
+                requires_grad=True,
+            )
+            proj = make_krso_projection(
+                seed=seed,
+                layer_name=layer_name,
+                rank=rank_eff,
+                in_dim=in_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+            self.krso_interval_b[layer_name] = b_param
+            self.krso_interval_p[layer_name] = proj
+            self.krso_interval_m1[layer_name] = torch.zeros_like(b_param, device=device, dtype=torch.float32)
+            self.krso_interval_m2[layer_name] = torch.zeros_like(b_param, device=device, dtype=torch.float32)
+            self.krso_interval_step[layer_name] = 0
+
+    def finish_krso_interval(self):
+        if self.algo != 'fedkrso' or self.krso_interval_seed is None:
+            return {'seed': None, 'delta_norm': 0.0}
+
+        seed = int(self.krso_interval_seed)
+        total_delta_norm = 0.0
+        with torch.no_grad():
+            for layer_name, b_param in self.krso_interval_b.items():
+                proj = self.krso_interval_p.get(layer_name, None)
+                if proj is None:
+                    continue
+                if layer_name not in self.krso_local_b:
+                    self.krso_local_b[layer_name] = {}
+                if seed not in self.krso_local_b[layer_name]:
+                    self.krso_local_b[layer_name][seed] = torch.zeros_like(b_param.detach().cpu(), dtype=torch.float32)
+                self.krso_local_b[layer_name][seed].add_(b_param.detach().cpu())
+
+                module = self._resolve_module(layer_name)
+                delta = torch.matmul(b_param.detach().float(), proj.detach().float())
+                if tuple(delta.shape) != tuple(module.weight.shape):
+                    raise RuntimeError(
+                        f'[fedkrso] BP shape mismatch @ {layer_name}: '
+                        f'got={tuple(delta.shape)}, expected={tuple(module.weight.shape)}'
+                    )
+                module.weight.data.add_(delta.to(device=module.weight.device, dtype=module.weight.dtype))
+                total_delta_norm += float(torch.linalg.norm(delta).item())
+
+        self.krso_interval_seed = None
+        self.krso_interval_b = {}
+        self.krso_interval_p = {}
+        self.krso_interval_m1 = {}
+        self.krso_interval_m2 = {}
+        self.krso_interval_step = {}
+        return {'seed': seed, 'delta_norm': float(total_delta_norm)}
+
+    def export_krso_state(self):
+        out_state = {}
+        for layer_name, seed_map in self.krso_local_b.items():
+            if not isinstance(seed_map, dict) or len(seed_map) == 0:
+                continue
+            out_state[layer_name] = {
+                int(seed): tensor.detach().cpu().contiguous()
+                for seed, tensor in seed_map.items()
+                if isinstance(tensor, torch.Tensor)
+            }
+        used_seeds = sorted(
+            [int(seed) for seed, count in self.krso_seed_usage.items() if int(count) > 0]
+        )
+        return out_state, used_seeds
 
     def export_submuon_state(self, with_v=False, with_m=True):
         x_out = {k: v.detach().cpu().clone() for k, v in self.submuon_x.items()}
@@ -927,6 +1093,31 @@ class FerretFramework(object):
                 if self.optim is not None:
                     self.optim.zero_grad()
                 return logits.detach(), loss.detach()
+
+        if self.algo == 'fedkrso':
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                beta1 = float(getattr(self.args, 'beta1', 0.9))
+                beta2 = float(getattr(self.args, 'beta2', 0.999))
+                eps = float(getattr(self.args, 'eps', 1e-8))
+                with torch.no_grad():
+                    for layer_name, b_param in self.krso_interval_b.items():
+                        grad = b_param.grad
+                        if grad is None:
+                            continue
+                        self.krso_interval_step[layer_name] = int(self.krso_interval_step.get(layer_name, 0)) + 1
+                        step_idx = int(self.krso_interval_step[layer_name])
+                        self.krso_interval_m1[layer_name].mul_(beta1).add_(grad.float(), alpha=(1.0 - beta1))
+                        self.krso_interval_m2[layer_name].mul_(beta2).addcmul_(
+                            grad.float(),
+                            grad.float(),
+                            value=(1.0 - beta2),
+                        )
+                        m_hat = self.krso_interval_m1[layer_name] / (1.0 - (beta1 ** step_idx))
+                        v_hat = self.krso_interval_m2[layer_name] / (1.0 - (beta2 ** step_idx))
+                        b_param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + eps))
+                        b_param.grad = None
+            return logits.detach(), loss.detach()
 
         if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt']:
             (loss / self.args.n_accum).backward()

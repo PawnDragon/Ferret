@@ -351,8 +351,12 @@ class FerretFramework(object):
                 if B is None or P is None:
                     return y0.reshape(*input_shape[:-1], _module.out_features)
 
-                a = x2 @ P.to(device=x2.device, dtype=x2.dtype).t()
-                y1 = a @ B.to(device=x2.device, dtype=x2.dtype).t()
+                if P.device != x2.device or P.dtype != x2.dtype:
+                    P = P.to(device=x2.device, dtype=x2.dtype)
+                if B.device != x2.device or B.dtype != x2.dtype:
+                    B = B.to(device=x2.device, dtype=x2.dtype)
+                a = x2 @ P.t()
+                y1 = a @ B.t()
                 y = y0 + y1
                 return y.reshape(*input_shape[:-1], _module.out_features)
 
@@ -622,8 +626,9 @@ class FerretFramework(object):
             rank_eff = int(min(int(self.args.rank_r), out_dim, in_dim))
             if rank_eff <= 0:
                 continue
+            layer_dtype = module.weight.dtype if module.weight.is_floating_point() else torch.float32
             b_param = torch.nn.Parameter(
-                torch.zeros(out_dim, rank_eff, device=device, dtype=torch.float32),
+                torch.zeros(out_dim, rank_eff, device=device, dtype=layer_dtype),
                 requires_grad=True,
             )
             proj = make_krso_projection(
@@ -632,7 +637,7 @@ class FerretFramework(object):
                 rank=rank_eff,
                 in_dim=in_dim,
                 device=device,
-                dtype=torch.float32,
+                dtype=layer_dtype,
             )
             self.krso_interval_b[layer_name] = b_param
             self.krso_interval_p[layer_name] = proj
@@ -655,7 +660,7 @@ class FerretFramework(object):
                     self.krso_local_b[layer_name] = {}
                 if seed not in self.krso_local_b[layer_name]:
                     self.krso_local_b[layer_name][seed] = torch.zeros_like(b_param.detach().cpu(), dtype=torch.float32)
-                self.krso_local_b[layer_name][seed].add_(b_param.detach().cpu())
+                self.krso_local_b[layer_name][seed].add_(b_param.detach().cpu().to(dtype=torch.float32))
 
                 module = self._resolve_module(layer_name)
                 delta = torch.matmul(b_param.detach().float(), proj.detach().float())
@@ -1115,7 +1120,9 @@ class FerretFramework(object):
                         )
                         m_hat = self.krso_interval_m1[layer_name] / (1.0 - (beta1 ** step_idx))
                         v_hat = self.krso_interval_m2[layer_name] / (1.0 - (beta2 ** step_idx))
-                        b_param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + eps))
+                        step_update = self.lr * m_hat / (torch.sqrt(v_hat) + eps)
+                        updated_b = b_param.data.float().sub_(step_update)
+                        b_param.data.copy_(updated_b.to(dtype=b_param.dtype))
                         b_param.grad = None
             return logits.detach(), loss.detach()
 

@@ -53,6 +53,21 @@ def is_finite_scalar(value):
         return False
 
 
+def add_cuda_mem_metrics(log_items):
+    if (not torch.cuda.is_available()) or (not isinstance(log_items, dict)):
+        return
+    mem_alloc = float(torch.cuda.memory_allocated())
+    mem_reserved = float(torch.cuda.memory_reserved())
+    max_mem_alloc = float(torch.cuda.max_memory_allocated())
+    log_items['train/mem_alloc_mb'] = mem_alloc / (1024 ** 2)
+    log_items['train/mem_reserved_mb'] = mem_reserved / (1024 ** 2)
+    log_items['train/max_mem_alloc_mb'] = max_mem_alloc / (1024 ** 2)
+    # Keep legacy keys for backward-compatible dashboards.
+    log_items['system/mem_alloc'] = mem_alloc
+    log_items['system/mem_reserved'] = mem_reserved
+    log_items['system/max_mem_alloc'] = max_mem_alloc
+
+
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
     if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
@@ -475,10 +490,7 @@ if __name__ == '__main__':
             'ctrl/cooldown_left': 0,
             'ctrl/did_rebase': 0,
         }
-        if torch.cuda.is_available():
-            init_log['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-            init_log['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-            init_log['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+        add_cuda_mem_metrics(init_log)
         wandb.log(init_log, step=init_round)
 
     maybe_save_best_ckpt(
@@ -596,10 +608,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedstructmuon':
             broadcast_state = server.get_struct_broadcast_state()
@@ -666,10 +675,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedsubmuon_gt':
             is_refresh_round = bool(server.is_submuon_gt_refresh_round(r))
@@ -770,10 +776,7 @@ if __name__ == '__main__':
                 ]:
                     if key in gt_refresh_metrics:
                         log_items[key] = float(gt_refresh_metrics[key])
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
             if args.algo == 'fedsubmuonv2':
@@ -827,10 +830,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedkrso':
             # Round convention: sample the round-r seed pool before client training,
@@ -904,10 +904,7 @@ if __name__ == '__main__':
                 ]:
                     if key in krso_metrics:
                         log_items[key] = float(krso_metrics[key])
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo in ['fedit', 'federa', 'flora']:
             broadcast_lora = server.get_fedit_broadcast_state() if args.algo in ['fedit', 'federa'] else None
@@ -954,10 +951,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedsalora':
             broadcast_lora_A = server.get_fedsalora_broadcast_state()
@@ -1004,10 +998,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'florg':
             broadcast_florg_A = server.get_florg_broadcast_state()
@@ -1058,10 +1049,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedexlora':
             broadcast_state = server.get_broadcast_state_fedexlora()
@@ -1119,10 +1107,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedavg':
             broadcast_state = server.get_fedavg_broadcast_state()
@@ -1169,10 +1154,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         else:
             total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
@@ -1224,10 +1206,7 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
-            if torch.cuda.is_available():
-                log_items['system/mem_alloc'] = float(torch.cuda.memory_allocated())
-                log_items['system/mem_reserved'] = float(torch.cuda.memory_reserved())
-                log_items['system/max_mem_alloc'] = float(torch.cuda.max_memory_allocated())
+            add_cuda_mem_metrics(log_items)
 
         pending_adaptive_early_stop = False
         did_rebase = 0

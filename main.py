@@ -839,8 +839,8 @@ if __name__ == '__main__':
             broadcast_state = server.get_fedkrso_broadcast_state()
             total_comm_down_bytes = compute_comm_size(
                 {
+                    'backbone_state_dict': server.model.state_dict(),
                     'seed_pool': broadcast_state.get('seed_pool', []),
-                    'b_global': broadcast_state.get('b_global', {}),
                 }
             ) * len(selected_client)
 

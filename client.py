@@ -447,7 +447,7 @@ class Client(object):
                         f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
                     )
 
-            aggregate_muon_state = bool(getattr(self.args, 'aggregate_muon_state', False))
+            aggregate_muon_state = should_aggregate_submuon_m_state(self.args, algo_name)
             h_u_local = None
             h_v_local = None
             if algo_name == 'fedsubmuon_gt' and is_refresh_round:

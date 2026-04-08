@@ -15,7 +15,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
 from evaluations import rouge_score
-from optimizers.ferret_optimizer import FerretFramework
+from optimizers.ferret_optimizer import FerretFramework, should_aggregate_submuon_m_state
 from optimizers.lora_utils import (
     build_lora_model,
     load_classifier_state,
@@ -397,8 +397,8 @@ def build_parser():
     parser.add_argument(
         "--optimizer",
         type=lambda x: x.lower(),
-        default="adamw",
-        choices=["adamw", "sgd"],
+        default="muon",
+        choices=["muon", "adamw", "sgd"],
     )
     parser.add_argument("--beta", type=float, default=0.95)
     parser.add_argument("--ns_steps", type=int, default=5)
@@ -554,6 +554,8 @@ def run_evaluate(args, eval_metric_explicit=False):
         print(f"[info] Loaded checkpoint: {args.checkpoint} ({ckpt_type})")
 
     if isinstance(common_hparams, dict) and len(common_hparams) > 0:
+        if "optimizer" in common_hparams:
+            args.optimizer = str(common_hparams["optimizer"]).lower()
         if "lora_target_modules" in common_hparams:
             args.lora_target_modules = common_hparams["lora_target_modules"]
         if "basis_init_mode" in common_hparams:
@@ -651,8 +653,6 @@ def run_evaluate(args, eval_metric_explicit=False):
     if eval_algo in ["fedsubmuon", "fedsubmuonv2", "fedsubmuon_gt", "fedsubadam", "fedsubsgd"]:
         if x_global is None or seeds is None:
             raise ValueError("FedSub eval requires checkpoint with x_global and seeds")
-        if eval_algo == "fedsubmuon" and m_global is None:
-            raise ValueError("FedSubMuon eval requires checkpoint with m_global")
         if eval_algo == "fedsubmuon_gt":
             if not isinstance(u_global, dict) or not isinstance(v_basis_global, dict):
                 raise ValueError("FedSubMuon-GT eval requires checkpoint with u_global and v_basis_global")
@@ -672,7 +672,7 @@ def run_evaluate(args, eval_metric_explicit=False):
             uv_state = {"u": u_global, "v": v_basis_global}
         framework.set_submuon_state(
             x_global,
-            m_global if eval_algo == "fedsubmuon" else None,
+            m_global if should_aggregate_submuon_m_state(args, eval_algo) else None,
             seeds,
             trainable=False,
             v_state=None,

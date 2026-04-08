@@ -9,7 +9,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from evaluations import *
-from optimizers.ferret_optimizer import FerretFramework
+from optimizers.ferret_optimizer import (
+    FerretFramework,
+    resolve_submuon_optimizer_name,
+    should_aggregate_submuon_m_state,
+)
 from optimizers.lora_utils import (
     build_lora_model,
     compute_deltaw_from_lora_state,
@@ -281,7 +285,7 @@ class Server(object):
                 self.args.seed,
                 raw_target_modules=getattr(self.args, 'lora_target_modules', None),
             )
-            if self.algo != 'fedsubmuon':
+            if self.algo != 'fedsubmuon' or resolve_submuon_optimizer_name(self.args, self.algo) != 'muon':
                 self.m_global = {}
                 self.v_global = {}
             name_to_module = dict(self.model.named_modules())
@@ -589,7 +593,7 @@ class Server(object):
         }
 
     def get_submuon_broadcast_state(self):
-        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
+        aggregate_muon_state = should_aggregate_submuon_m_state(self.args, self.algo)
         return {
             'x_global': {k: v.clone() for k, v in self.x_global.items()},
             'm_global': {k: v.clone() for k, v in self.m_global.items()} if aggregate_muon_state else None,
@@ -886,7 +890,7 @@ class Server(object):
         for layer_name in self.seeds.keys():
             new_seeds[layer_name] = int(self.seed_rng.randint(1, 2**31 - 1))
 
-        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
+        aggregate_muon_state = should_aggregate_submuon_m_state(self.args, self.algo)
         transport_state(
             x_global=self.x_global,
             m_global=self.m_global if aggregate_muon_state else None,
@@ -1439,7 +1443,7 @@ class Server(object):
 
     def aggregate_submuon(self, client_payloads, selected_client_list):
         weight_array = self._get_client_weight_array(selected_client_list)
-        aggregate_muon_state = bool(self.algo == 'fedsubmuon' and getattr(self.args, 'aggregate_muon_state', False))
+        aggregate_muon_state = should_aggregate_submuon_m_state(self.args, self.algo)
 
         new_x = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
         new_m = {name: torch.zeros_like(val) for name, val in self.m_global.items()} if aggregate_muon_state else None
@@ -2100,7 +2104,7 @@ class Server(object):
             {
                 'backbone_state_dict': self.model.state_dict(),
                 'x_global': {k: v.cpu() for k, v in self.x_global.items()},
-                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if self.algo == 'fedsubmuon' else None,
+                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if should_aggregate_submuon_m_state(self.args, self.algo) else None,
                 'v_global': None,
                 'seeds': dict(self.seeds),
                 'u_global': {k: v.cpu() for k, v in self.u_global.items()} if self.algo == 'fedsubmuon_gt' else None,
@@ -2115,6 +2119,7 @@ class Server(object):
                     'beta2': getattr(self.args, 'beta2', None),
                     'eps': getattr(self.args, 'eps', None),
                     'lr': self.args.lr,
+                    'optimizer': str(getattr(self.args, 'optimizer', 'muon')),
                     'ns_steps': self.args.ns_steps,
                     'seed_refresh_F': self.args.seed_refresh_F,
                     'stop_F': int(getattr(self.args, 'stop_F', -1)),
@@ -2504,7 +2509,7 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global if self.algo == 'fedsubmuon' else None,
+                self.m_global if should_aggregate_submuon_m_state(self.args, self.algo) else None,
                 self.seeds,
                 trainable=False,
                 v_state=None,
@@ -2624,7 +2629,7 @@ class Server(object):
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             framework.set_submuon_state(
                 self.x_global,
-                self.m_global if self.algo == 'fedsubmuon' else None,
+                self.m_global if should_aggregate_submuon_m_state(self.args, self.algo) else None,
                 self.seeds,
                 trainable=False,
                 v_state=None,

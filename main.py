@@ -16,6 +16,7 @@ from copy import deepcopy
 
 from client import Client
 from evaluate_dolly import run_evaluate_from_checkpoint
+from optimizers.ferret_optimizer import should_aggregate_submuon_m_state
 from server import Server
 from optimizers.submuon_utils import relative_transport_error
 from utils_data.comm_utils import compute_comm_size
@@ -169,7 +170,7 @@ if __name__ == '__main__':
 
     # Training
     parser.add_argument('--lr', type=float, default=0.001, help=r'learning rate \eta')
-    parser.add_argument('--optimizer', type=lambda x: x.lower(), default=None, choices=['adamw', 'sgd'], help='local optimizer for all non-fedsubmuon algorithms')
+    parser.add_argument('--optimizer', type=lambda x: x.lower(), default=None, choices=['muon', 'adamw', 'sgd'], help='local optimizer; fedsubmuon/fedsubmuon_gt default to muon, others keep their existing defaults')
     parser.add_argument('--momentum', type=float, default=0.9, help=r'momentum for SGD')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay in MeZO')
     parser.add_argument('--adam_beta1', type=float, default=0.9, help='beta1 for AdamW in FedAvg/FedIT')
@@ -334,11 +335,18 @@ if __name__ == '__main__':
     if int(getattr(args, 'krso_interval_len', 1)) <= 0:
         raise ValueError(f'--krso_interval_len must be > 0, got {args.krso_interval_len}')
     if args.optimizer is None:
-        if args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
+        if args.algo in ['fedsubmuon', 'fedsubmuon_gt']:
+            args.optimizer = 'muon'
+        elif args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
-    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedmultisubmuon', 'fedstructmuon', 'fedkrso']:
+    if bool(getattr(args, 'aggregate_muon_state', False)) and (not should_aggregate_submuon_m_state(args, args.algo)):
+        print(
+            f'[warn] --aggregate_muon_state only applies to fedsubmuon with optimizer=muon; '
+            f'current algo={args.algo}, optimizer={args.optimizer}. Ignore momentum aggregation.'
+        )
+    if args.algo in ['fedsubmuonv2', 'fedmultisubmuon', 'fedstructmuon', 'fedkrso']:
         print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps method-specific update rule).')
 
     eval_avg_acc = []

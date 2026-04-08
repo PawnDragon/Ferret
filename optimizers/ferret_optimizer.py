@@ -34,6 +34,25 @@ def _is_classifier_param_name(name):
     return ('classifier' in lowered) or lowered.startswith('score.') or ('.score.' in lowered)
 
 
+def resolve_submuon_optimizer_name(args, algo=None):
+    algo_name = str(algo if algo is not None else getattr(args, 'algo', '')).lower()
+    if algo_name not in ['fedsubmuon', 'fedsubmuon_gt']:
+        return None
+    name = str(getattr(args, 'optimizer', 'muon')).lower()
+    if name not in ['muon', 'adamw', 'sgd']:
+        return 'muon'
+    return name
+
+
+def should_aggregate_submuon_m_state(args, algo=None):
+    algo_name = str(algo if algo is not None else getattr(args, 'algo', '')).lower()
+    return bool(
+        algo_name == 'fedsubmuon'
+        and resolve_submuon_optimizer_name(args, algo_name) == 'muon'
+        and getattr(args, 'aggregate_muon_state', False)
+    )
+
+
 def _build_adamw_step_tensor(optimizer, param_obj, step_int, old_step=None):
     if isinstance(old_step, torch.Tensor):
         return torch.tensor(float(step_int), device=old_step.device, dtype=old_step.dtype)
@@ -235,6 +254,9 @@ class FerretFramework(object):
         if name not in ['adamw', 'sgd']:
             return 'adamw'
         return name
+
+    def _resolve_submuon_optimizer_name(self):
+        return resolve_submuon_optimizer_name(self.args, self.algo)
 
     def _build_local_optimizer(self, params):
         params = list(params)
@@ -443,7 +465,7 @@ class FerretFramework(object):
         self.submuon_u_basis = {}
         self.submuon_v_basis = {}
         self.subadam_step = 0
-        if self.algo in ['fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self.optim = None
 
     def clear_krso_state(self):
@@ -577,7 +599,12 @@ class FerretFramework(object):
                     ).clone().detach()
 
         self._install_submuon_forward()
+        submuon_optimizer = self._resolve_submuon_optimizer_name()
         if self.algo in ['fedsubadam', 'fedsubsgd'] and trainable:
+            self.optim = self._build_local_optimizer(self.submuon_x.values())
+            if self.optim is not None:
+                self.optim.zero_grad()
+        elif self.algo in ['fedsubmuon', 'fedsubmuon_gt'] and trainable and submuon_optimizer in ['adamw', 'sgd']:
             self.optim = self._build_local_optimizer(self.submuon_x.values())
             if self.optim is not None:
                 self.optim.zero_grad()
@@ -1124,6 +1151,14 @@ class FerretFramework(object):
                         updated_b = b_param.data.float().sub_(step_update)
                         b_param.data.copy_(updated_b.to(dtype=b_param.dtype))
                         b_param.grad = None
+            return logits.detach(), loss.detach()
+
+        if self.algo in ['fedsubmuon', 'fedsubmuon_gt'] and self._resolve_submuon_optimizer_name() in ['adamw', 'sgd']:
+            (loss / self.args.n_accum).backward()
+            if apply_optim_step:
+                if self.optim is not None:
+                    self.optim.step()
+                    self.optim.zero_grad()
             return logits.detach(), loss.detach()
 
         if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt']:

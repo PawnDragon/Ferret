@@ -17,6 +17,7 @@ from copy import deepcopy
 from client import Client
 from evaluate_dolly import run_evaluate_from_checkpoint
 from optimizers.ferret_optimizer import should_aggregate_submuon_m_state
+from optimizers.lora_utils import get_lora_pair_keys, resolve_layer_name_for_model
 from server import Server
 from optimizers.submuon_utils import relative_transport_error
 from utils_data.comm_utils import compute_comm_size
@@ -67,6 +68,121 @@ def add_cuda_mem_metrics(log_items):
     log_items['system/mem_alloc'] = mem_alloc
     log_items['system/mem_reserved'] = mem_reserved
     log_items['system/max_mem_alloc'] = max_mem_alloc
+
+
+def sum_linear_weight_bytes(model, layer_names):
+    if model is None:
+        return 0
+    modules = dict(model.named_modules())
+    total_bytes = 0
+    for layer_name in layer_names:
+        module = modules.get(str(layer_name), None)
+        if module is None or (not hasattr(module, 'weight')):
+            continue
+        weight = module.weight
+        if not isinstance(weight, torch.Tensor):
+            continue
+        total_bytes += int(weight.numel() * weight.element_size())
+    return int(total_bytes)
+
+
+def _seed_comm_bytes(num_seeds):
+    return int(compute_comm_size(0) * int(max(num_seeds, 0)))
+
+
+def _sum_weight_bytes_for_lora_state(model, lora_state):
+    if model is None or (not isinstance(lora_state, dict)) or len(lora_state) == 0:
+        return 0
+    modules = dict(model.named_modules())
+    total_bytes = 0
+    for layer_name in get_lora_pair_keys(lora_state).keys():
+        resolved_layer = resolve_layer_name_for_model(layer_name, model)
+        module = modules.get(resolved_layer, None)
+        if module is None or (not hasattr(module, 'weight')):
+            continue
+        weight = module.weight
+        if not isinstance(weight, torch.Tensor):
+            continue
+        total_bytes += int(weight.numel() * weight.element_size())
+    return int(total_bytes)
+
+
+def compute_fedexlora_formula_down_bytes(server, selected_client):
+    if server is None or len(selected_client) == 0:
+        return 0
+    a_state = getattr(server, 'global_lora_A_state', {})
+    b_state = getattr(server, 'global_lora_B_state', {})
+    if (not isinstance(a_state, dict)) or (not isinstance(b_state, dict)):
+        return 0
+    merged_state = {}
+    merged_state.update(a_state)
+    merged_state.update(b_state)
+    layer_pairs = get_lora_pair_keys(merged_state)
+    per_client_bytes = 0
+    active_clients = int(len(selected_client))
+    for pair in layer_pairs.values():
+        a_key = pair.get('a_key', None)
+        b_key = pair.get('b_key', None)
+        if a_key not in a_state or b_key not in b_state:
+            continue
+        a_tensor = a_state[a_key]
+        b_tensor = b_state[b_key]
+        if (not isinstance(a_tensor, torch.Tensor)) or (not isinstance(b_tensor, torch.Tensor)):
+            continue
+        if a_tensor.ndim != 2 or b_tensor.ndim != 2:
+            continue
+        rank = int(a_tensor.shape[0])
+        in_dim = int(a_tensor.shape[1])
+        out_dim = int(b_tensor.shape[0])
+        bytes_per_scalar = max(int(a_tensor.element_size()), int(b_tensor.element_size()))
+        residual_rank = int(min(active_clients * rank, min(in_dim, out_dim)))
+        per_client_bytes += int((rank + residual_rank) * (in_dim + out_dim) * bytes_per_scalar)
+    return int(per_client_bytes * active_clients)
+
+
+def compute_initial_comm_bytes(server, args):
+    algo = str(getattr(args, 'algo', '')).lower()
+
+    if algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        layer_names = list(getattr(server, 'submuon_layer_dims', {}).keys())
+        weight_bytes = sum_linear_weight_bytes(server.model, layer_names)
+        seed_bytes = _seed_comm_bytes(len(layer_names))
+        return float(weight_bytes + seed_bytes)
+
+    if algo == 'fedkrso':
+        layer_names = list(getattr(server, 'krso_target_layers', []))
+        weight_bytes = sum_linear_weight_bytes(server.model, layer_names)
+        seed_bytes = _seed_comm_bytes(int(getattr(args, 'krso_num_seeds', 0)) * len(layer_names))
+        return float(weight_bytes + seed_bytes)
+
+    if algo in ['fedit', 'flora']:
+        weight_bytes = _sum_weight_bytes_for_lora_state(server.model, getattr(server, 'global_lora_state', {}))
+        return float(weight_bytes)
+
+    if algo == 'federa':
+        lora_state = getattr(server, 'global_lora_state', {})
+        weight_bytes = _sum_weight_bytes_for_lora_state(server.model, lora_state)
+        adapter_bytes = compute_comm_size(lora_state)
+        return float(weight_bytes + adapter_bytes)
+
+    if algo == 'fedexlora':
+        merged_state = {}
+        merged_state.update(getattr(server, 'global_lora_A_state', {}))
+        merged_state.update(getattr(server, 'global_lora_B_state', {}))
+        weight_bytes = _sum_weight_bytes_for_lora_state(server.model, merged_state)
+        return float(weight_bytes)
+
+    if algo == 'fedsalora':
+        weight_bytes = _sum_weight_bytes_for_lora_state(server.model, getattr(server, 'global_lora_A_state', {}))
+        return float(weight_bytes)
+
+    if algo == 'florg':
+        layer_names = list(getattr(server, 'global_florg_basis_state', {}).keys())
+        weight_bytes = sum_linear_weight_bytes(server.model, layer_names)
+        seed_bytes = _seed_comm_bytes(len(layer_names))
+        return float(weight_bytes + seed_bytes)
+
+    return float('nan')
 
 
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
@@ -481,6 +597,10 @@ if __name__ == '__main__':
         rel_err = relative_transport_error(x_old, old_seed, new_seed, out_dim, in_dim, args.rank_r)
         print(f'[debug] transport relative error @ {first_layer}: {rel_err:.6e}')
 
+    initial_comm_bytes = compute_initial_comm_bytes(server, args)
+    if is_finite_scalar(initial_comm_bytes):
+        print(f'[info] initial_comm_bytes={int(float(initial_comm_bytes))}')
+
     init_round = int(resume_round)
     eval_result = server.eval(cur_round=init_round, eval_avg_acc=eval_avg_acc)
     eval_avg_acc.append(eval_result)
@@ -492,6 +612,7 @@ if __name__ == '__main__':
             'train/peak_gpu_mem': float('nan'),
             'train/comm_up_bytes': float('nan'),
             'train/comm_down_bytes': float('nan'),
+            'comm/initial_bytes': float(initial_comm_bytes),
             'eval/loss': float(eval_result),
             'ctrl/no_improve': 0,
             'ctrl/rebase_count': 0,
@@ -500,6 +621,7 @@ if __name__ == '__main__':
         }
         add_cuda_mem_metrics(init_log)
         wandb.log(init_log, step=init_round)
+        wandb_run.summary['comm/initial_bytes'] = float(initial_comm_bytes)
 
     maybe_save_best_ckpt(
         server=server,
@@ -794,14 +916,14 @@ if __name__ == '__main__':
                 if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
                     server.maybe_refresh_submuon_seeds(r)
                 broadcast_state = server.get_submuon_broadcast_state()
-            total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
+            total_comm_down_bytes = compute_comm_size({'x_global': broadcast_state.get('x_global', {})}) * len(selected_client)
 
             client_payloads = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                total_comm_up_bytes += compute_comm_size({k: v for k, v in payload.items() if k in ['x', 'm', 'v']})
+                total_comm_up_bytes += compute_comm_size({'x': payload.get('x', {})})
 
             server.aggregate_submuon(client_payloads, selected_client)
             wall_clock = time.time() - round_start_time
@@ -845,12 +967,7 @@ if __name__ == '__main__':
             # aggregate B against those seeds, then immediately materialize W <- W + sum_k B_k P_k.
             server.refresh_krso_seed_pool(cur_round=r)
             broadcast_state = server.get_fedkrso_broadcast_state()
-            total_comm_down_bytes = compute_comm_size(
-                {
-                    'backbone_state_dict': server.model.state_dict(),
-                    'seed_pool': broadcast_state.get('seed_pool', []),
-                }
-            ) * len(selected_client)
+            total_comm_down_bytes = sum_linear_weight_bytes(server.model, getattr(server, 'krso_target_layers', [])) * len(selected_client)
 
             client_payloads = []
             for client in selected_client:
@@ -861,12 +978,7 @@ if __name__ == '__main__':
                 )
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                total_comm_up_bytes += compute_comm_size(
-                    {
-                        'b': payload.get('b', {}),
-                        'used_seeds': payload.get('used_seeds', []),
-                    }
-                )
+                total_comm_up_bytes += compute_comm_size({'b': payload.get('b', {})})
 
             krso_metrics = server.aggregate_fedkrso(client_payloads, selected_client, cur_round=r)
             wall_clock = time.time() - round_start_time
@@ -916,7 +1028,6 @@ if __name__ == '__main__':
 
         elif args.algo in ['fedit', 'federa', 'flora']:
             broadcast_lora = server.get_fedit_broadcast_state() if args.algo in ['fedit', 'federa'] else None
-            total_comm_down_bytes = compute_comm_size(server.get_broadcast_state()) * len(selected_client)
             client_payloads = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(
@@ -927,6 +1038,10 @@ if __name__ == '__main__':
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
                 total_comm_up_bytes += compute_comm_size(payload.get('lora_state', {}))
+            if args.algo in ['fedit', 'federa']:
+                total_comm_down_bytes = compute_comm_size(getattr(server, 'global_lora_state', {})) * len(selected_client)
+            else:
+                total_comm_down_bytes = int(total_comm_up_bytes * len(selected_client))
 
             server.aggregate_lora(client_payloads, selected_client)
             wall_clock = time.time() - round_start_time
@@ -1061,7 +1176,6 @@ if __name__ == '__main__':
 
         elif args.algo == 'fedexlora':
             broadcast_state = server.get_broadcast_state_fedexlora()
-            total_comm_down_bytes = compute_comm_size(broadcast_state) * len(selected_client)
             broadcast_lora_A = broadcast_state.get('global_lora_A_state', {})
             broadcast_lora_B = broadcast_state.get('global_lora_B_state', {})
             broadcast_classifier = broadcast_state.get('global_classifier_state', {})
@@ -1080,9 +1194,9 @@ if __name__ == '__main__':
                     {
                         'lora_A_state': payload.get('lora_A_state', {}),
                         'lora_B_state': payload.get('lora_B_state', {}),
-                        'classifier_state': payload.get('classifier_state', {}),
                     }
                 )
+            total_comm_down_bytes = compute_fedexlora_formula_down_bytes(server, selected_client)
 
             server.aggregate_fedexlora(client_payloads, selected_client, cur_round=r)
             wall_clock = time.time() - round_start_time

@@ -7,9 +7,9 @@ ranks=(8 4 2)
 
 rounds_for_rank() {
   case "$1" in
-    8) echo 11 ;;
-    4) echo 23 ;;
-    2) echo 47 ;;
+    8) echo 2 ;;
+    4) echo 5 ;;
+    2) echo 11 ;;
     *) echo "[federa qwen4b comm-rank sweep] unsupported rank=$1" >&2; return 1 ;;
   esac
 }

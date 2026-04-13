@@ -7,9 +7,9 @@ ranks=(8 4 2)
 
 rounds_for_rank() {
   case "$1" in
-    8) echo 2 ;;
-    4) echo 4 ;;
-    2) echo 8 ;;
+    8) echo 0 ;;
+    4) echo 1 ;;
+    2) echo 2 ;;
     *) echo "[fedexlora qwen4b comm-rank sweep] unsupported rank=$1" >&2; return 1 ;;
   esac
 }
@@ -17,6 +17,10 @@ rounds_for_rank() {
 for seed in "${seeds[@]}"; do
   for rank in "${ranks[@]}"; do
     rounds="$(rounds_for_rank "${rank}")"
+    if [ "${rounds}" -le 0 ]; then
+      echo "[fedexlora qwen4b comm-rank sweep] skip seed=${seed}, rank=${rank}: communication budget gives rounds=${rounds}"
+      continue
+    fi
     run_name="fedexlora_dolly_Qwen4B_seed${seed}_rank${rank}_rounds${rounds}"
     echo "[fedexlora qwen4b comm-rank sweep] seed=${seed}, rank=${rank}, rounds=${rounds}, run_name=${run_name}"
 

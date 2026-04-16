@@ -15,6 +15,9 @@ from optimizers.muon_utils import build_muon_optimizer
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
+MUON_LOCAL_OPTIMIZER_ALGOS = ['fedit', 'federa', 'flora']
+
+
 def _to_python_int_step(step_value):
     if isinstance(step_value, torch.Tensor):
         if step_value.numel() == 0:
@@ -254,7 +257,7 @@ class FerretFramework(object):
         name = str(getattr(self.args, 'optimizer', 'adamw')).lower()
         if name in ['adamw', 'sgd']:
             return name
-        if name == 'muon' and self.algo == 'fedit':
+        if name == 'muon' and self.algo in MUON_LOCAL_OPTIMIZER_ALGOS:
             return 'muon'
         return 'adamw'
 

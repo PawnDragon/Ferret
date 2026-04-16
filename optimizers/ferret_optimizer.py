@@ -11,6 +11,7 @@ from optimizers.fedmultisub_utils import (
 )
 from optimizers.fedstruct_utils import shape_signature as struct_shape_signature
 from optimizers.fedkrso_utils import make_krso_projection
+from optimizers.muon_utils import build_muon_optimizer
 from optimizers.submuon_utils import make_uv, zeropower_via_newtonschulz5, select_target_linear_layers
 
 
@@ -251,9 +252,11 @@ class FerretFramework(object):
 
     def _resolve_optimizer_name(self):
         name = str(getattr(self.args, 'optimizer', 'adamw')).lower()
-        if name not in ['adamw', 'sgd']:
-            return 'adamw'
-        return name
+        if name in ['adamw', 'sgd']:
+            return name
+        if name == 'muon' and self.algo == 'fedit':
+            return 'muon'
+        return 'adamw'
 
     def _resolve_submuon_optimizer_name(self):
         return resolve_submuon_optimizer_name(self.args, self.algo)
@@ -262,7 +265,16 @@ class FerretFramework(object):
         params = list(params)
         if len(params) == 0:
             return None
-        if self._resolve_optimizer_name() == 'adamw':
+        optimizer_name = self._resolve_optimizer_name()
+        if optimizer_name == 'muon':
+            return build_muon_optimizer(
+                params,
+                lr=self.args.lr,
+                momentum=float(getattr(self.args, 'momentum', 0.95)),
+                weight_decay=float(getattr(self.args, 'weight_decay', 0.0)),
+                ns_steps=int(getattr(self.args, 'ns_steps', 5)),
+            )
+        if optimizer_name == 'adamw':
             return torch.optim.AdamW(
                 params,
                 lr=self.args.lr,

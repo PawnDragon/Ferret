@@ -81,12 +81,12 @@ def apply_publication_style():
             "grid.color": "#d9d9d9",
             "grid.linestyle": "-",
             "grid.linewidth": 0.7,
-            "font.size": 10,
-            "axes.titlesize": 11,
-            "axes.labelsize": 10,
-            "xtick.labelsize": 9,
-            "ytick.labelsize": 9,
-            "legend.fontsize": 9,
+            "font.size": 13,
+            "axes.titlesize": 14,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 13,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -879,7 +879,7 @@ def save_series_plot(series, args, output_pdf, dataset_name):
             )
         inset_ax.set_xlim(*zoom_window["xlim"])
         inset_ax.set_ylim(*zoom_window["ylim"])
-        inset_ax.tick_params(axis="both", which="major", labelsize=8, length=3)
+        inset_ax.tick_params(axis="both", which="major", labelsize=10, length=3)
         try:
             ax.indicate_inset_zoom(inset_ax, edgecolor="#7f7f7f", alpha=0.9)
         except Exception:

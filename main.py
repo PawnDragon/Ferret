@@ -286,8 +286,8 @@ if __name__ == '__main__':
 
     # Training
     parser.add_argument('--lr', type=float, default=0.001, help=r'learning rate \eta')
-    parser.add_argument('--optimizer', type=lambda x: x.lower(), default=None, choices=['muon', 'adamw', 'sgd'], help='local optimizer; fedsubmuon/fedsubmuon_gt default to muon, others keep their existing defaults')
-    parser.add_argument('--momentum', type=float, default=0.9, help=r'momentum for SGD')
+    parser.add_argument('--optimizer', type=lambda x: x.lower(), default=None, choices=['muon', 'adamw', 'sgd'], help='local optimizer; fedit supports muon/adamw/sgd, fedsubmuon/fedsubmuon_gt default to muon, others keep their existing defaults')
+    parser.add_argument('--momentum', type=float, default=0.9, help=r'momentum for SGD/Muon')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay in MeZO')
     parser.add_argument('--adam_beta1', type=float, default=0.9, help='beta1 for AdamW in FedAvg/FedIT')
     parser.add_argument('--adam_beta2', type=float, default=0.999, help='beta2 for AdamW in FedAvg/FedIT')

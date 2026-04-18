@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Sweep 4 seeds for FedIT on Dolly.
-seeds=(494 495 496 497)
+seeds=(494 495)
 
 for seed in "${seeds[@]}"; do
   run_name="fedkrso_dolly_llama1B_seed${seed}"
@@ -12,7 +12,7 @@ for seed in "${seeds[@]}"; do
     --algo fedkrso \
     --model /root/autodl-tmp/llama-3.2-1B/ \
     --dataset dolly \
-    --lr 0.00005 \
+    --lr 0.00001 \
     --log \
     --device 0 \
     --momentum 0.0 \
@@ -29,7 +29,8 @@ for seed in "${seeds[@]}"; do
     --early_stop \
     --early_stop_patience 5 \
     --optimizer adamw \
-    --ni_root /root/autodl-tmp/natural-instructions/ \
     --lora_target_modules q_proj,v_proj \
+    --krso_num_seeds 4 \
+    --krso_interval_len 25 \
     "$@"
 done

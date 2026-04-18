@@ -7,3 +7,4 @@ outputs/
 .vscode/
 wandb_plots/
 scripts/wandb_plot_loss_round.py
+notebooks/

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sweep FedSubMuon-GT data heterogeneity on Dolly with default client count/participation.
+# Sweep FedSubMuon-GT data heterogeneity on Dolly with fixed client count/participation.
 seeds=(494 495)
 iid_values=(dir0.1 dir1.0)
 
@@ -29,7 +29,10 @@ for seed in "${seeds[@]}"; do
       --use_wandb \
       --wandb_project ferret \
       --wandb_run_name "${run_name}" \
-      --batch_or_epoch epoch \
+      --batch_or_epoch batch \
+      --local_step 100 \
+      --num_clients 20 \
+      -m 0.5 \
       --early_stop \
       --early_stop_patience 5 \
       --optimizer adamw \

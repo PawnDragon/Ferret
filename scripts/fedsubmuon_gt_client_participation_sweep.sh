@@ -15,16 +15,15 @@ for seed in "${seeds[@]}"; do
       --algo fedsubmuon_gt \
       --model /root/autodl-tmp/llama-3.2-1B/ \
       --dataset dolly \
-      --lr 0.00005 \
+      --lr 0.005 \
       --log \
       --device 0 \
       --momentum 0.0 \
       --n_accum 4 \
       --equal_weight \
       --seed "${seed}" \
-      --rank_r 8 \
-      --lora_alpha 8 \
-      --rounds 60 \
+      --rank_r 64 \
+      --rounds 30 \
       --use_wandb \
       --wandb_project ferret \
       --wandb_run_name "${run_name}" \
@@ -34,7 +33,10 @@ for seed in "${seeds[@]}"; do
       -m "${m}" \
       --early_stop \
       --early_stop_patience 5 \
-      --optimizer adamw \
+      --seed_refresh_F 5 \
+      --stop_F 20 \
+      --gt_probe_batches 1 \
+      --gt_sub_lr 0.05 \
       --lora_target_modules q_proj,v_proj \
       "$@"
   done

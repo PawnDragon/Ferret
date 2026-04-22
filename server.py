@@ -631,6 +631,24 @@ class Server(object):
             'is_refresh_round': bool(is_refresh_round),
         }
 
+    def select_submuon_gt_probe_clients(self, participating_clients):
+        if self.algo != 'fedsubmuon_gt':
+            return []
+        if not isinstance(participating_clients, (list, tuple)) or len(participating_clients) == 0:
+            return []
+
+        participants = list(participating_clients)
+        requested_count = int(getattr(self.args, 'gt_probe_client_count', 0))
+        if requested_count <= 0:
+            return participants
+
+        q = int(min(requested_count, len(participants)))
+        if q >= len(participants):
+            return participants
+
+        selected_indices = self.seed_rng.choice(len(participants), size=q, replace=False)
+        return [participants[int(idx)] for idx in selected_indices]
+
     def get_broadcast_state(self):
         if self.algo == 'fedsubmuonv2':
             return self.get_submuonv2_broadcast_state()
@@ -1114,6 +1132,7 @@ class Server(object):
 
     def aggregate_submuon_gt(self, client_payloads, selected_client_list, cur_round, is_refresh_round):
         gt_topk = int(getattr(self.args, 'gt_topk', 0))
+        gt_probe_client_count = int(getattr(self.args, 'gt_probe_client_count', 0))
         gt_rank1_approx = bool(getattr(self.args, 'gt_rank1_approx', False))
         gt_target_rel_step = float(getattr(self.args, 'gt_target_rel_step', 0.0))
         if self.algo != 'fedsubmuon_gt':
@@ -1148,6 +1167,9 @@ class Server(object):
                 'gt_v_topk_active': 0.0,
                 'gt_u_topk_score_sum': 0.0,
                 'gt_v_topk_score_sum': 0.0,
+                'gt_probe_client_count': float(gt_probe_client_count),
+                'gt_probe_clients_active': 0.0,
+                'gt_probe_fraction': 0.0,
             }
 
         weight_array = self._get_client_weight_array(selected_client_list)
@@ -1188,6 +1210,9 @@ class Server(object):
             'gt_v_topk_active': 0.0,
             'gt_u_topk_score_sum': 0.0,
             'gt_v_topk_score_sum': 0.0,
+            'gt_probe_client_count': float(gt_probe_client_count),
+            'gt_probe_clients_active': 0.0,
+            'gt_probe_fraction': 0.0,
         }
         if not bool(is_refresh_round):
             self.x_global = new_x
@@ -1202,10 +1227,36 @@ class Server(object):
         metrics['gt_update_mode_code'] = float(mode_to_code.get(update_mode, 0.0))
         metrics['gt_basis_init_mode_code'] = float(basis_init_to_code.get(self._resolve_gt_basis_init_mode(), 0.0))
 
+        probe_client_indices = [
+            int(client_idx)
+            for client_idx, payload in enumerate(client_payloads)
+            if bool(payload.get('is_probe_client', False))
+        ]
+        if len(probe_client_indices) == 0:
+            probe_client_indices = list(range(len(client_payloads)))
+
+        probe_weight_sum = float(sum(float(weight_array[idx]) for idx in probe_client_indices))
+        if (not np.isfinite(probe_weight_sum)) or probe_weight_sum <= 0.0:
+            probe_client_indices = list(range(len(client_payloads)))
+            probe_weight_sum = float(sum(float(weight_array[idx]) for idx in probe_client_indices))
+
+        if probe_weight_sum <= 0.0:
+            raise RuntimeError('[fedsubmuon_gt] invalid probe subset weight sum during refresh aggregation')
+
+        probe_client_ids = []
+        for idx in probe_client_indices:
+            client_obj = selected_client_list[idx] if idx < len(selected_client_list) else None
+            if client_obj is not None and hasattr(client_obj, 'idx'):
+                probe_client_ids.append(int(client_obj.idx))
+        probe_client_ids = sorted(probe_client_ids)
+        metrics['gt_probe_clients_active'] = float(len(probe_client_indices))
+        metrics['gt_probe_fraction'] = float(len(probe_client_indices) / max(len(client_payloads), 1))
+
         h_u_bar = {name: torch.zeros_like(self.u_global[name], dtype=torch.float32) for name in self.u_global.keys()}
         h_v_bar = {name: torch.zeros_like(self.v_basis_global[name], dtype=torch.float32) for name in self.v_basis_global.keys()}
-        for client_idx, payload in enumerate(client_payloads):
-            w = float(weight_array[client_idx])
+        for client_idx in probe_client_indices:
+            payload = client_payloads[client_idx]
+            w = float(weight_array[client_idx]) / probe_weight_sum
             h_u_local = payload.get('h_u', {})
             h_v_local = payload.get('h_v', {})
             if not isinstance(h_u_local, dict):
@@ -1426,6 +1477,8 @@ class Server(object):
                 f'[fedsubmuon_gt][server] refresh_round={int(cur_round)} old_seed={old_seed} new_seed={new_seed} '
                 f'basis_init_mode={self._resolve_gt_basis_init_mode()} '
                 f'gt_update_mode={update_mode} refresh_index={int(refresh_idx)} refresh_side={refresh_side} '
+                f'gt_probe_client_count={gt_probe_client_count} probe_clients_active={len(probe_client_indices)} '
+                f'probe_client_ids={probe_client_ids} '
                 f'gt_topk={int(gt_topk)} '
                 f'gt_rank1={int(gt_rank1_approx)} gt_target_rel_step={float(gt_target_rel_step):.6e} '
                 f'u_eta={metrics["gt_u_effective_step"]:.6e} v_eta={metrics["gt_v_effective_step"]:.6e} '
@@ -2125,6 +2178,7 @@ class Server(object):
                     'stop_F': int(getattr(self.args, 'stop_F', -1)),
                     'aggregate_muon_state': bool(getattr(self.args, 'aggregate_muon_state', False)),
                     'gt_probe_batches': int(getattr(self.args, 'gt_probe_batches', 1)),
+                    'gt_probe_client_count': int(getattr(self.args, 'gt_probe_client_count', 0)),
                     'gt_sub_lr': float(getattr(self.args, 'gt_sub_lr', 0.1)),
                     'gt_topk': int(getattr(self.args, 'gt_topk', 0)),
                     'gt_merge_residual': bool(getattr(self.args, 'gt_merge_residual', False)),

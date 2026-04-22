@@ -382,6 +382,7 @@ class Client(object):
             algo_name = getattr(self.args, 'algo', 'ferret')
             uv_state = None
             is_refresh_round = False
+            is_probe_client = False
             if algo_name == 'fedsubmuonv2':
                 x_state, m_state, seeds = self._prepare_fedsubmuonv2_round_state(submuon_state)
             elif algo_name == 'fedsubmuon_gt':
@@ -397,6 +398,7 @@ class Client(object):
                 if isinstance(u_state, dict) and isinstance(v_state_basis, dict):
                     uv_state = {'u': u_state, 'v': v_state_basis}
                 is_refresh_round = bool(submuon_state.get('is_refresh_round', False))
+                is_probe_client = bool(submuon_state.get('is_probe_client', is_refresh_round))
             else:
                 x_state = submuon_state['x_global']
                 m_state = submuon_state.get('m_global', None)
@@ -450,7 +452,7 @@ class Client(object):
             aggregate_muon_state = should_aggregate_submuon_m_state(self.args, algo_name)
             h_u_local = None
             h_v_local = None
-            if algo_name == 'fedsubmuon_gt' and is_refresh_round:
+            if algo_name == 'fedsubmuon_gt' and is_refresh_round and is_probe_client:
                 h_u_local, h_v_local = self._compute_fedsubmuon_gt_probe(
                     framework=framework,
                     probe_batches=int(getattr(self.args, 'gt_probe_batches', 1)),
@@ -470,6 +472,7 @@ class Client(object):
             if algo_name == 'fedsubmuon' and aggregate_muon_state:
                 payload['m'] = m_local
             if algo_name == 'fedsubmuon_gt' and is_refresh_round:
+                payload['is_probe_client'] = int(bool(is_probe_client))
                 payload['h_u'] = h_u_local if isinstance(h_u_local, dict) else {}
                 payload['h_v'] = h_v_local if isinstance(h_v_local, dict) else {}
             return payload

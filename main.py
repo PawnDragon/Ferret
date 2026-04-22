@@ -318,6 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--krso_num_seeds', type=int, default=10, help='number of active sketch seeds in FedKRSO each round')
     parser.add_argument('--krso_interval_len', type=int, default=20, help='number of mini-batches per interval in FedKRSO local training')
     parser.add_argument('--gt_probe_batches', type=int, default=1, help='number of local mini-batches used to estimate probe gradients on fedsubmuon_gt refresh rounds')
+    parser.add_argument('--gt_probe_client_count', type=int, default=0, help='if >0, only this many participating clients upload H_U/H_V on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_sub_lr', type=float, default=0.1, help='basis update step size for fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_topk', type=int, default=0, help='if >0, only top-k basis columns are updated on fedsubmuon_gt refresh rounds')
     parser.add_argument('--gt_merge_residual', default=False, action='store_true', help='if set, merge projection residual into server backbone after fedsubmuon_gt refresh')
@@ -489,6 +490,8 @@ if __name__ == '__main__':
         print(f'[warn] --gt_rank1_approx is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_rank1_approx')
     if float(getattr(args, 'gt_target_rel_step', 0.0)) > 0.0 and args.algo != 'fedsubmuon_gt':
         print(f'[warn] --gt_target_rel_step is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_target_rel_step')
+    if int(getattr(args, 'gt_probe_client_count', 0)) > 0 and args.algo != 'fedsubmuon_gt':
+        print(f'[warn] --gt_probe_client_count is only used by fedsubmuon_gt, but current algo={args.algo}; ignore gt_probe_client_count')
     if adaptive_rebase_active and args.round_eval_false:
         print('[warn] --adaptive_rebase requires round evaluation; disable adaptive rebase because --round_eval_false is set')
         adaptive_rebase_active = False
@@ -810,6 +813,15 @@ if __name__ == '__main__':
         elif args.algo == 'fedsubmuon_gt':
             is_refresh_round = bool(server.is_submuon_gt_refresh_round(r))
             broadcast_state = server.get_submuon_gt_broadcast_state(is_refresh_round=is_refresh_round)
+            probe_clients = []
+            probe_client_ids = []
+            probe_client_id_set = set()
+            comm_up_core_bytes = 0.0
+            comm_up_probe_bytes = 0.0
+            if is_refresh_round:
+                probe_clients = server.select_submuon_gt_probe_clients(selected_client)
+                probe_client_ids = sorted(int(client.idx) for client in probe_clients)
+                probe_client_id_set = set(probe_client_ids)
             if is_refresh_round:
                 comm_down_state = {
                     'x_global': broadcast_state.get('x_global', {}),
@@ -824,19 +836,31 @@ if __name__ == '__main__':
 
             client_payloads = []
             for client in selected_client:
-                payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
+                client_broadcast_state = broadcast_state
+                if is_refresh_round:
+                    client_broadcast_state = dict(broadcast_state)
+                    client_broadcast_state['is_probe_client'] = bool(int(client.idx) in probe_client_id_set)
+                payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=client_broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
+                core_bytes = float(compute_comm_size({'x': payload.get('x', {})}))
                 if is_refresh_round:
-                    total_comm_up_bytes += compute_comm_size(
-                        {
-                            'x': payload.get('x', {}),
-                            'h_u': payload.get('h_u', {}),
-                            'h_v': payload.get('h_v', {}),
-                        }
-                    )
+                    probe_bytes = 0.0
+                    if bool(payload.get('is_probe_client', False)):
+                        probe_bytes = float(
+                            compute_comm_size(
+                                {
+                                    'h_u': payload.get('h_u', {}),
+                                    'h_v': payload.get('h_v', {}),
+                                }
+                            )
+                        )
+                    comm_up_core_bytes += core_bytes
+                    comm_up_probe_bytes += probe_bytes
+                    total_comm_up_bytes += core_bytes + probe_bytes
                 else:
-                    total_comm_up_bytes += compute_comm_size({'x': payload.get('x', {})})
+                    comm_up_core_bytes += core_bytes
+                    total_comm_up_bytes += core_bytes
 
             gt_refresh_metrics = server.aggregate_submuon_gt(
                 client_payloads=client_payloads,
@@ -872,6 +896,9 @@ if __name__ == '__main__':
                 'train/comm_down_bytes': float(total_comm_down_bytes),
                 'comm/bytes_up': float(total_comm_up_bytes),
                 'comm/bytes_down': float(total_comm_down_bytes),
+                'comm/up_core_bytes': float(comm_up_core_bytes),
+                'comm/up_probe_bytes': float(comm_up_probe_bytes),
+                'comm/up_total_bytes': float(total_comm_up_bytes),
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
@@ -903,6 +930,9 @@ if __name__ == '__main__':
                     'gt_v_topk_active',
                     'gt_u_topk_score_sum',
                     'gt_v_topk_score_sum',
+                    'gt_probe_client_count',
+                    'gt_probe_clients_active',
+                    'gt_probe_fraction',
                 ]:
                     if key in gt_refresh_metrics:
                         log_items[key] = float(gt_refresh_metrics[key])
@@ -1492,6 +1522,7 @@ if __name__ == '__main__':
             'ns_steps': args.ns_steps,
             'stop_F': args.stop_F,
             'gt_probe_batches': args.gt_probe_batches,
+            'gt_probe_client_count': int(getattr(args, 'gt_probe_client_count', 0)),
             'gt_sub_lr': args.gt_sub_lr,
             'gt_topk': args.gt_topk,
             'gt_merge_residual': args.gt_merge_residual,

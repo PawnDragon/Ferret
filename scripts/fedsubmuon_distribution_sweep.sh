@@ -31,7 +31,7 @@ for seed in "${seeds[@]}"; do
       --batch_or_epoch batch \
       --local_step 100 \
       --num_clients 20 \
-      -m 0.5 \
+      -m 0.1 \
       --early_stop \
       --early_stop_patience 5 \
       --seed_refresh_F 5 \

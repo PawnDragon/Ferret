@@ -229,7 +229,7 @@ class FerretFramework(object):
         self.debug_nan_skip_optim = bool(getattr(args, 'debug_nan_skip_optim', False))
         self._local_step_counter = 0
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd', 'fedkrso']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd', 'fedkrso']:
             self._freeze_backbone_for_submuon()
             self.target_linear_layers = select_target_linear_layers(
                 self.model,
@@ -480,7 +480,7 @@ class FerretFramework(object):
         self.submuon_u_basis = {}
         self.submuon_v_basis = {}
         self.subadam_step = 0
-        if self.algo in ['fedsubmuon', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self.optim = None
 
     def clear_krso_state(self):
@@ -570,7 +570,7 @@ class FerretFramework(object):
                 self._flora_delta[layer_name] = delta_scaled
 
     def set_submuon_state(self, x_state, m_state, seeds, trainable=True, v_state=None, uv_state=None):
-        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             return
         self.clear_submuon_state()
 
@@ -592,7 +592,7 @@ class FerretFramework(object):
                 continue
             x_tensor = x_state[layer_name].to(device=device, dtype=torch.float32)
             self.submuon_x[layer_name] = torch.nn.Parameter(x_tensor.clone().detach(), requires_grad=trainable)
-            if self.algo == 'fedsubmuon' and m_state is not None and layer_name in m_state:
+            if self.algo in ['fedsubmuon', 'fedsubmuonv3'] and m_state is not None and layer_name in m_state:
                 self.submuon_m[layer_name] = m_state[layer_name].to(device=device, dtype=torch.float32).clone().detach()
             else:
                 self.submuon_m[layer_name] = torch.zeros_like(self.submuon_x[layer_name], device=device, dtype=torch.float32)

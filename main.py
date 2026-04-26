@@ -143,7 +143,7 @@ def compute_fedexlora_formula_down_bytes(server, selected_client):
 def compute_initial_comm_bytes(server, args):
     algo = str(getattr(args, 'algo', '')).lower()
 
-    if algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+    if algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
         layer_names = list(getattr(server, 'submuon_layer_dims', {}).keys())
         weight_bytes = sum_linear_weight_bytes(server.model, layer_names)
         seed_bytes = _seed_comm_bytes(len(layer_names))
@@ -186,7 +186,7 @@ def compute_initial_comm_bytes(server, args):
 
 
 def maybe_save_best_ckpt(server, args, metric, cur_round, log_dir):
-    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+    if args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
         return server.save_best_submuon_ckpt(metric, cur_round)
     if args.algo == 'fedmultisubmuon':
         return server.save_best_multisub_ckpt(metric, cur_round)
@@ -239,6 +239,7 @@ if __name__ == '__main__':
         'ferret',
         'fedsubmuon',
         'fedsubmuonv2',
+        'fedsubmuonv3',
         'fedsubmuon_gt',
         'fedsubadam',
         'fedsubsgd',
@@ -454,7 +455,7 @@ if __name__ == '__main__':
     if args.optimizer is None:
         if args.algo in ['fedsubmuon', 'fedsubmuon_gt']:
             args.optimizer = 'muon'
-        elif args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedmultisubmuon', 'fedstructmuon']:
+        elif args.algo in ['ferret', 'fedsalora', 'fedsubsgd', 'fedsubmuonv3', 'fedmultisubmuon', 'fedstructmuon']:
             args.optimizer = 'sgd'
         else:
             args.optimizer = 'adamw'
@@ -463,7 +464,7 @@ if __name__ == '__main__':
             f'[warn] --aggregate_muon_state only applies to fedsubmuon with optimizer=muon; '
             f'current algo={args.algo}, optimizer={args.optimizer}. Ignore momentum aggregation.'
         )
-    if args.algo in ['fedsubmuonv2', 'fedmultisubmuon', 'fedstructmuon', 'fedkrso']:
+    if args.algo in ['fedsubmuonv2', 'fedsubmuonv3', 'fedmultisubmuon', 'fedstructmuon', 'fedkrso']:
         print(f'[info] --optimizer={args.optimizer} is ignored for {args.algo} (keeps method-specific update rule).')
 
     eval_avg_acc = []
@@ -938,24 +939,47 @@ if __name__ == '__main__':
                         log_items[key] = float(gt_refresh_metrics[key])
             add_cuda_mem_metrics(log_items)
 
-        elif args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubadam', 'fedsubsgd']:
+        elif args.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubadam', 'fedsubsgd']:
             if args.algo == 'fedsubmuonv2':
                 server.maybe_refresh_submuonv2_seeds(r)
                 broadcast_state = server.get_submuonv2_broadcast_state()
+            elif args.algo == 'fedsubmuonv3':
+                server.maybe_refresh_submuonv3_seeds(r)
+                broadcast_state = server.get_submuonv3_broadcast_state()
             else:
                 if not (adaptive_rebase_active and args.algo == 'fedsubmuon'):
                     server.maybe_refresh_submuon_seeds(r)
                 broadcast_state = server.get_submuon_broadcast_state()
-            total_comm_down_bytes = compute_comm_size({'x_global': broadcast_state.get('x_global', {})}) * len(selected_client)
+            if args.algo == 'fedsubmuonv3':
+                layer_names = list(getattr(server, 'submuon_layer_dims', {}).keys())
+                total_comm_down_bytes = (
+                    sum_linear_weight_bytes(server.model, layer_names)
+                    + compute_comm_size({
+                        'm_global': broadcast_state.get('m_global', {}),
+                        'seeds': broadcast_state.get('seeds', {}),
+                    })
+                ) * len(selected_client)
+            else:
+                total_comm_down_bytes = compute_comm_size({'x_global': broadcast_state.get('x_global', {})}) * len(selected_client)
 
             client_payloads = []
             for client in selected_client:
                 payload = client.local_train_with_seed_pool(server.model, cur_round=r, submuon_state=broadcast_state)
                 client_payloads.append(payload)
                 train_losses.append(payload['loss'])
-                total_comm_up_bytes += compute_comm_size({'x': payload.get('x', {})})
+                if args.algo == 'fedsubmuonv3':
+                    total_comm_up_bytes += compute_comm_size({
+                        'q': payload.get('q', {}),
+                        'g': payload.get('g', {}),
+                    })
+                else:
+                    total_comm_up_bytes += compute_comm_size({'x': payload.get('x', {})})
 
-            server.aggregate_submuon(client_payloads, selected_client)
+            if args.algo == 'fedsubmuonv3':
+                submuonv3_metrics = server.aggregate_submuonv3(client_payloads, selected_client, cur_round=r)
+            else:
+                submuonv3_metrics = {}
+                server.aggregate_submuon(client_payloads, selected_client)
             wall_clock = time.time() - round_start_time
             peak_gpu_mem = float(torch.cuda.max_memory_allocated() / (1024**2)) if torch.cuda.is_available() else 0.0
 
@@ -990,6 +1014,10 @@ if __name__ == '__main__':
                 'eval/loss': float(eval_result),
                 'ckpt/improved': int(improved),
             }
+            if args.algo == 'fedsubmuonv3':
+                for key in ['fedsubmuonv3_delta_norm', 'fedsubmuonv3_h_reset']:
+                    if key in submuonv3_metrics:
+                        log_items[key] = float(submuonv3_metrics[key])
             add_cuda_mem_metrics(log_items)
 
         elif args.algo == 'fedkrso':

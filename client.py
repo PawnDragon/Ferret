@@ -21,6 +21,7 @@ from optimizers.florg_utils import (
     extract_florg_A_state,
     load_florg_A_state,
 )
+from optimizers.submuon_utils import zeropower_via_newtonschulz5
 
 
 class Client(object):
@@ -161,6 +162,44 @@ class Client(object):
         if not isinstance(x_global, dict) or not isinstance(seeds, dict):
             raise RuntimeError('[fedsubmuonv2] invalid x_global or seeds type')
         return x_global, None, seeds
+
+    def _prepare_fedsubmuonv3_round_state(self, submuon_state):
+        if not isinstance(submuon_state, dict):
+            raise RuntimeError('[fedsubmuonv3] missing submuon_state in client local train')
+        if 'x_global' not in submuon_state or 'm_global' not in submuon_state or 'seeds' not in submuon_state:
+            raise RuntimeError('[fedsubmuonv3] submuon_state must contain x_global, m_global and seeds')
+        x_global = submuon_state['x_global']
+        m_global = submuon_state['m_global']
+        seeds = submuon_state['seeds']
+        if not isinstance(x_global, dict) or not isinstance(m_global, dict) or not isinstance(seeds, dict):
+            raise RuntimeError('[fedsubmuonv3] invalid x_global, m_global or seeds type')
+        return x_global, m_global, seeds
+
+    def _export_fedsubmuonv3_payload(self, framework, h_state, grad_scale):
+        q_local = {}
+        g_local = {}
+        beta = float(getattr(self.args, 'beta', 0.95))
+        ns_steps = int(getattr(self.args, 'ns_steps', 5))
+        denom = float(max(int(grad_scale), 1))
+
+        for layer_name, x_param in framework.submuon_x.items():
+            grad = x_param.grad
+            if grad is None:
+                grad_f32 = torch.zeros_like(x_param.detach(), dtype=torch.float32)
+            else:
+                grad_f32 = grad.detach().to(dtype=torch.float32) / denom
+
+            h_tensor = h_state.get(layer_name, None) if isinstance(h_state, dict) else None
+            if isinstance(h_tensor, torch.Tensor):
+                h_f32 = h_tensor.to(device=grad_f32.device, dtype=torch.float32)
+            else:
+                h_f32 = torch.zeros_like(grad_f32)
+
+            mixed = (1.0 - beta) * h_f32 + beta * grad_f32
+            q_local[layer_name] = zeropower_via_newtonschulz5(mixed.float(), ns_steps).detach().cpu().float()
+            g_local[layer_name] = grad_f32.detach().cpu().float()
+
+        return q_local, g_local
 
     def _compute_fedsubmuon_gt_probe(self, framework, probe_batches):
         probe_batches = int(max(probe_batches, 0))
@@ -376,7 +415,7 @@ class Client(object):
                 'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
             }
 
-        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if getattr(self.args, 'algo', 'ferret') in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self._set_runtime_debug_context(cur_round)
             framework = FerretFramework(self.model, args=self.args, lr=self.args.lr, candidate_seeds=self.candidate_seeds)
             algo_name = getattr(self.args, 'algo', 'ferret')
@@ -385,6 +424,8 @@ class Client(object):
             is_probe_client = False
             if algo_name == 'fedsubmuonv2':
                 x_state, m_state, seeds = self._prepare_fedsubmuonv2_round_state(submuon_state)
+            elif algo_name == 'fedsubmuonv3':
+                x_state, m_state, seeds = self._prepare_fedsubmuonv3_round_state(submuon_state)
             elif algo_name == 'fedsubmuon_gt':
                 if not isinstance(submuon_state, dict):
                     raise RuntimeError('[fedsubmuon_gt] missing submuon_state in client local train')
@@ -415,6 +456,59 @@ class Client(object):
 
             loss_total_train = 0.0
             num_trained = 0
+
+            if algo_name == 'fedsubmuonv3':
+                grad_batches = 0
+                for x_param in framework.submuon_x.values():
+                    x_param.grad = None
+
+                if self.args.batch_or_epoch == 'epoch':
+                    iter_steps = len(self.train_loader)
+                    progress_bar = tqdm(range(iter_steps))
+                    for cur_step, batch in enumerate(self.train_loader):
+                        batch = {
+                            'input_ids': batch['input_ids'].to(self.device),
+                            'labels': batch['labels'].to(self.device),
+                            'attention_mask': batch['attention_mask'].to(self.device),
+                        }
+                        _, loss = framework.forward(batch)
+                        loss.backward()
+                        grad_batches += 1
+                        progress_bar.update(1)
+                        if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
+                            loss_total_train += loss.detach()
+                            num_trained += len(batch['input_ids'])
+                        progress_bar.set_description(
+                            f'client {self.idx} train at epoch {cur_round}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                        )
+                else:
+                    iter_steps = max(int(self.args.local_step), 1)
+                    progress_bar = tqdm(range(iter_steps))
+                    for cur_step in range(iter_steps):
+                        batch = self._next_batch()
+                        _, loss = framework.forward(batch)
+                        loss.backward()
+                        grad_batches += 1
+                        progress_bar.update(1)
+                        if torch.isfinite(loss) and (self.args.grad_clip <= 0 or loss != 0.0):
+                            loss_total_train += loss.detach()
+                            num_trained += len(batch['input_ids'])
+                        progress_bar.set_description(
+                            f'client {self.idx} train at step {cur_step}, loss: {loss_total_train / num_trained if num_trained != 0 else 0.0}'
+                        )
+
+                q_local, g_local = self._export_fedsubmuonv3_payload(
+                    framework=framework,
+                    h_state=m_state,
+                    grad_scale=grad_batches,
+                )
+                framework.clear_submuon_state()
+                self.model = None
+                return {
+                    'q': q_local,
+                    'g': g_local,
+                    'loss': float((loss_total_train / num_trained).item()) if num_trained != 0 else 0.0,
+                }
 
             if self.args.batch_or_epoch == 'epoch':
                 iter_steps = len(self.train_loader)

@@ -179,6 +179,8 @@ def load_checkpoint_into_model(model, ckpt_path):
             ckpt_type = "ferret_best"
         elif saved_algo == "fedsubmuonv2":
             ckpt_type = "fedsubmuonv2_best"
+        elif saved_algo == "fedsubmuonv3":
+            ckpt_type = "fedsubmuonv3_best"
         elif saved_algo == "fedsubmuon_gt" or (
             x_global is not None
             and seeds is not None
@@ -330,6 +332,7 @@ def build_parser():
             "ferret",
             "fedsubmuon",
             "fedsubmuonv2",
+            "fedsubmuonv3",
             "fedsubmuon_gt",
             "fedsubadam",
             "fedsubsgd",
@@ -584,6 +587,7 @@ def run_evaluate(args, eval_metric_explicit=False):
             "ferret",
             "fedsubmuon",
             "fedsubmuonv2",
+            "fedsubmuonv3",
             "fedsubmuon_gt",
             "fedsubadam",
             "fedsubsgd",
@@ -653,7 +657,7 @@ def run_evaluate(args, eval_metric_explicit=False):
     eval_model = model
 
     framework = None
-    if eval_algo in ["fedsubmuon", "fedsubmuonv2", "fedsubmuon_gt", "fedsubadam", "fedsubsgd"]:
+    if eval_algo in ["fedsubmuon", "fedsubmuonv2", "fedsubmuonv3", "fedsubmuon_gt", "fedsubadam", "fedsubsgd"]:
         if x_global is None or seeds is None:
             raise ValueError("FedSub eval requires checkpoint with x_global and seeds")
         if eval_algo == "fedsubmuon_gt":

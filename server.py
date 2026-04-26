@@ -278,14 +278,16 @@ class Server(object):
         self.krso_layer_dims = {}
         self.krso_target_layers = []
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             self.x_global, self.m_global, self.seeds = init_submuon_state(
                 self.model,
                 self.args.rank_r,
                 self.args.seed,
                 raw_target_modules=getattr(self.args, 'lora_target_modules', None),
             )
-            if self.algo != 'fedsubmuon' or resolve_submuon_optimizer_name(self.args, self.algo) != 'muon':
+            if self.algo not in ['fedsubmuon', 'fedsubmuonv3'] or (
+                self.algo == 'fedsubmuon' and resolve_submuon_optimizer_name(self.args, self.algo) != 'muon'
+            ):
                 self.m_global = {}
                 self.v_global = {}
             name_to_module = dict(self.model.named_modules())
@@ -609,6 +611,14 @@ class Server(object):
             'seeds': dict(self.seeds),
         }
 
+    def get_submuonv3_broadcast_state(self):
+        return {
+            'x_global': {k: torch.zeros_like(v) for k, v in self.x_global.items()},
+            'm_global': {k: v.clone() for k, v in self.m_global.items()},
+            'v_global': None,
+            'seeds': dict(self.seeds),
+        }
+
     def is_submuon_gt_refresh_round(self, cur_round, force=False):
         if self.algo != 'fedsubmuon_gt':
             return False
@@ -652,6 +662,8 @@ class Server(object):
     def get_broadcast_state(self):
         if self.algo == 'fedsubmuonv2':
             return self.get_submuonv2_broadcast_state()
+        if self.algo == 'fedsubmuonv3':
+            return self.get_submuonv3_broadcast_state()
         if self.algo == 'fedsubmuon_gt':
             return self.get_submuon_gt_broadcast_state(is_refresh_round=False)
         if self.algo in ['fedsubmuon', 'fedsubadam', 'fedsubsgd']:
@@ -965,6 +977,35 @@ class Server(object):
                 f'delta_norm={float(fold_stats["delta_norm"]):.6e}'
             )
             self._submuonv2_fold_logged = True
+        return True
+
+    def is_submuonv3_refresh_round(self, cur_round, force=False):
+        if self.algo != 'fedsubmuonv3':
+            return False
+        if force:
+            return True
+        refresh_f = int(getattr(self.args, 'seed_refresh_F', 0))
+        if refresh_f <= 0:
+            return False
+        if getattr(self.args, 'stop_F', -1) > 0 and int(cur_round) >= int(self.args.stop_F):
+            return False
+        # Main training rounds are 1-indexed; round 1 corresponds to t=0 in Algorithm FedSubMuon.
+        if int(cur_round) <= 1:
+            return False
+        return ((int(cur_round) - 1) % refresh_f) == 0
+
+    def maybe_refresh_submuonv3_seeds(self, cur_round, force=False):
+        if self.algo != 'fedsubmuonv3':
+            return False
+        if not self.is_submuonv3_refresh_round(cur_round, force=force):
+            return False
+
+        new_seeds = {}
+        for layer_name in self.seeds.keys():
+            new_seeds[layer_name] = int(self.seed_rng.randint(1, 2**31 - 1))
+        self.seeds = new_seeds
+        self.x_global = {name: torch.zeros_like(tensor) for name, tensor in self.x_global.items()}
+        self.m_global = {name: torch.zeros_like(tensor) for name, tensor in self.m_global.items()}
         return True
 
     def _orthonormalize_columns(self, mat):
@@ -1511,6 +1552,83 @@ class Server(object):
         self.x_global = new_x
         if aggregate_muon_state:
             self.m_global = new_m
+
+    def aggregate_submuonv3(self, client_payloads, selected_client_list, cur_round):
+        if self.algo != 'fedsubmuonv3' or len(client_payloads) == 0:
+            return {}
+
+        weight_array = self._get_client_weight_array(selected_client_list)
+        q_bar = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
+        g_bar = {name: torch.zeros_like(val) for name, val in self.x_global.items()}
+
+        for client_idx, payload in enumerate(client_payloads):
+            w = float(weight_array[client_idx])
+            q_payload = payload.get('q', {})
+            g_payload = payload.get('g', {})
+            for name in q_bar.keys():
+                if name not in q_payload or name not in g_payload:
+                    raise RuntimeError(f'[fedsubmuonv3] missing q/g payload for layer={name}')
+                q_bar[name] += q_payload[name].to(dtype=q_bar[name].dtype) * w
+                g_bar[name] += g_payload[name].to(dtype=g_bar[name].dtype) * w
+
+        name_to_module = dict(self.model.named_modules())
+        total_delta_norm = 0.0
+        with torch.no_grad():
+            for layer_name, q_tensor in q_bar.items():
+                if layer_name not in name_to_module:
+                    raise RuntimeError(f'[fedsubmuonv3] layer not found in model: {layer_name}')
+                if layer_name not in self.seeds:
+                    raise RuntimeError(f'[fedsubmuonv3] missing seed for layer={layer_name}')
+                module = name_to_module[layer_name]
+                if not isinstance(module, torch.nn.Linear):
+                    raise RuntimeError(f'[fedsubmuonv3] layer={layer_name} is not nn.Linear')
+                if layer_name in self.submuon_layer_dims:
+                    out_dim, in_dim = self.submuon_layer_dims[layer_name]
+                else:
+                    out_dim, in_dim = int(module.out_features), int(module.in_features)
+                U, V = make_uv(
+                    seed=self.seeds[layer_name],
+                    out_dim=int(out_dim),
+                    in_dim=int(in_dim),
+                    r=int(self.args.rank_r),
+                    device=module.weight.device,
+                    dtype=torch.float32,
+                )
+                q_local = q_tensor.to(device=module.weight.device, dtype=torch.float32)
+                expected_q_shape = (int(U.shape[1]), int(V.shape[1]))
+                if tuple(q_local.shape) != expected_q_shape:
+                    raise RuntimeError(
+                        f'[fedsubmuonv3] Q shape mismatch @ {layer_name}: '
+                        f'got={tuple(q_local.shape)}, expected={expected_q_shape}'
+                    )
+                delta = U @ q_local @ V.t()
+                if tuple(delta.shape) != tuple(module.weight.shape):
+                    raise RuntimeError(
+                        f'[fedsubmuonv3] UQV^T shape mismatch @ {layer_name}: '
+                        f'got={tuple(delta.shape)}, expected={tuple(module.weight.shape)}'
+                    )
+                module.weight.data.add_(
+                    delta.to(device=module.weight.device, dtype=module.weight.dtype),
+                    alpha=-float(self.args.lr),
+                )
+                total_delta_norm += float(torch.linalg.norm(delta.float()).item())
+
+        self.x_global = {name: torch.zeros_like(tensor) for name, tensor in self.x_global.items()}
+        if self.is_submuonv3_refresh_round(int(cur_round) + 1):
+            self.m_global = {name: torch.zeros_like(tensor) for name, tensor in self.m_global.items()}
+            h_reset = 1
+        else:
+            beta = float(getattr(self.args, 'beta', 0.95))
+            self.m_global = {
+                name: (1.0 - beta) * self.m_global[name].to(dtype=g_bar[name].dtype) + beta * g_bar[name]
+                for name in self.m_global.keys()
+            }
+            h_reset = 0
+
+        return {
+            'fedsubmuonv3_delta_norm': float(total_delta_norm),
+            'fedsubmuonv3_h_reset': int(h_reset),
+        }
 
     def aggregate_fedmultisubmuon(self, client_payloads, selected_client_list, cur_round=1):
         if self.algo != 'fedmultisubmuon' or len(client_payloads) == 0:
@@ -2144,7 +2262,7 @@ class Server(object):
         self.model.to('cpu')
 
     def save_best_submuon_ckpt(self, metric, cur_round):
-        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
+        if self.algo not in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd'] or not self.args.save:
             return False
 
         improved = (metric < self.best_metric) if self.args.eval_metric == 'loss' else (metric > self.best_metric)
@@ -2157,7 +2275,7 @@ class Server(object):
             {
                 'backbone_state_dict': self.model.state_dict(),
                 'x_global': {k: v.cpu() for k, v in self.x_global.items()},
-                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if should_aggregate_submuon_m_state(self.args, self.algo) else None,
+                'm_global': {k: v.cpu() for k, v in self.m_global.items()} if (self.algo == 'fedsubmuonv3' or should_aggregate_submuon_m_state(self.args, self.algo)) else None,
                 'v_global': None,
                 'seeds': dict(self.seeds),
                 'u_global': {k: v.cpu() for k, v in self.u_global.items()} if self.algo == 'fedsubmuon_gt' else None,
@@ -2556,7 +2674,7 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             uv_state = None
             if self.algo == 'fedsubmuon_gt':
                 uv_state = {'u': self.u_global, 'v': self.v_basis_global}
@@ -2676,7 +2794,7 @@ class Server(object):
             self.model.eval()
             eval_model = self.model
 
-        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
+        if self.algo in ['fedsubmuon', 'fedsubmuonv2', 'fedsubmuonv3', 'fedsubmuon_gt', 'fedsubadam', 'fedsubsgd']:
             uv_state = None
             if self.algo == 'fedsubmuon_gt':
                 uv_state = {'u': self.u_global, 'v': self.v_basis_global}
